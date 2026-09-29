@@ -1,0 +1,8 @@
+/dist/
+/openvibe-node
+*.exe
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+/build/
