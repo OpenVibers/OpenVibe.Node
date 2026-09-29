@@ -55,7 +55,8 @@ class DryRun(Plugin):
         if cmd.kind == "drive":
             if "x" in v or "y" in v:
                 self.state["throttle"] = clamp(v.get("x", 0), -1, 1)
-                self.state["steer"] = clamp(v.get("rotation", 0), -1, 1)
+                # rotation is counter-clockwise positive; steer is right positive.
+                self.state["steer"] = -clamp(v.get("rotation", 0), -1, 1)
             else:
                 self.state["throttle"] = clamp(v.get("throttle", 0), -1, 1)
                 self.state["steer"] = clamp(v.get("steer", 0), -1, 1)

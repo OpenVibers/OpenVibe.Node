@@ -66,7 +66,6 @@ const (
 	FaultEstopped      = "estopped"       // the remote e-stop is latched
 	FaultLocalStop     = "local_stop"     // the local kill switch (`openvibe-node stop`) is latched
 	FaultNoHeartbeat   = "no_heartbeat"   // a plugin lost the core's heartbeat
-	FaultExpired       = "expired"        // the deadline had already passed on arrival
 	FaultNotReady      = "not_ready"      // the driver is starting or restarting
 	FaultPluginDown    = "plugin_down"    // the driver process is not running
 	FaultPluginTimeout = "plugin_timeout" // the driver did not answer in time
