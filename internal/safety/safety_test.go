@@ -152,3 +152,25 @@ func TestDedup(t *testing.T) {
 		t.Fatal("ttl not enforced")
 	}
 }
+
+// A stop must never be undone by a concurrent reload of the (older) file.
+func TestReloadNeverUndoesConcurrentStop(t *testing.T) {
+	for i := 0; i < 300; i++ {
+		p := filepath.Join(t.TempDir(), "latch.json")
+		l, _ := OpenLatch(p)
+		l.Resume()
+		done := make(chan struct{})
+		go func() { l.Reload(); close(done) }()
+		l.SetLocal()
+		<-done
+		l.Reload()
+		if !l.State().Local {
+			t.Fatalf("iteration %d: local stop undone by a reload", i)
+		}
+		l.SetRemote("x")
+		l2, _ := OpenLatch(p)
+		if !l2.State().Local {
+			t.Fatalf("iteration %d: local stop lost on disk", i)
+		}
+	}
+}

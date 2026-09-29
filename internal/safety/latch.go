@@ -37,6 +37,9 @@ type Latch struct {
 	state    LatchState
 	lastRaw  []byte
 	onChange []func(LatchState)
+	// cbMu runs change callbacks one at a time, each with the state current when it runs, so a slow callback can
+	// never apply an older state after a newer one.
+	cbMu sync.Mutex
 }
 
 // OpenLatch reads the latch file (missing = clear). A corrupt file is treated as latched: failing safe.
@@ -73,7 +76,8 @@ func (l *Latch) State() LatchState {
 	return l.state
 }
 
-// OnChange registers a callback run (outside the lock) after every change.
+// OnChange registers a callback run (outside the state lock, one at a time, with the current state) after every
+// change.
 func (l *Latch) OnChange(f func(LatchState)) {
 	l.mu.Lock()
 	l.onChange = append(l.onChange, f)
@@ -86,14 +90,23 @@ func (l *Latch) update(f func(*LatchState)) (LatchState, error) {
 	f(&l.state)
 	st := l.state
 	err := l.persistLocked()
-	cbs := append([]func(LatchState){}, l.onChange...)
 	l.mu.Unlock()
 	if before != st {
-		for _, cb := range cbs {
-			cb(st)
-		}
+		l.notify()
 	}
 	return st, err
+}
+
+func (l *Latch) notify() {
+	l.cbMu.Lock()
+	defer l.cbMu.Unlock()
+	l.mu.Lock()
+	st := l.state
+	cbs := append([]func(LatchState){}, l.onChange...)
+	l.mu.Unlock()
+	for _, cb := range cbs {
+		cb(st)
+	}
 }
 
 func (l *Latch) persistLocked() error {
@@ -148,8 +161,9 @@ func (l *Latch) Resume() (LatchState, error) {
 // Reload adopts the file's state if another process (the CLI, when the Node's socket was unreachable) changed it.
 // It reports whether anything changed.
 func (l *Latch) Reload() (bool, error) {
-	st, raw, err := readLatch(l.path)
+	// Read under the lock: an update between our read and our adoption would otherwise be overwritten by stale bytes.
 	l.mu.Lock()
+	st, raw, err := readLatch(l.path)
 	if err != nil {
 		if raw == nil || string(raw) == string(l.lastRaw) {
 			l.mu.Unlock()
@@ -163,12 +177,9 @@ func (l *Latch) Reload() (bool, error) {
 	}
 	changed := st != l.state
 	l.state, l.lastRaw = st, raw
-	cbs := append([]func(LatchState){}, l.onChange...)
 	l.mu.Unlock()
 	if changed {
-		for _, cb := range cbs {
-			cb(st)
-		}
+		l.notify()
 	}
 	return changed, err
 }

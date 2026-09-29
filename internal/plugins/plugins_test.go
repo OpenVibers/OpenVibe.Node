@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -300,4 +301,46 @@ func TestConcurrentCommands(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// A plugin that dies while a child still holds its stdout is noticed at once, and the child is killed.
+func TestCrashWithChildHoldingStdout(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	script := `sleep 30 & echo $! > ` + pidFile + `
+echo '{"op":"describe","driver":"sh","capabilities":{}}'
+echo '{"op":"ready"}'
+read line
+exit 1`
+	m := NewManager([]Spec{{Name: "sh", Argv: []string{"/bin/sh", "-c", script}}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); m.Wait() }()
+	go func() {
+		for range m.Output() {
+		}
+	}()
+	m.Start(ctx)
+	deadline := time.Now().Add(3 * time.Second)
+	for m.Get("sh").Info().Restarts < 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("crash not noticed: %+v", m.Get("sh").Info())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(pidFile)
+	var pid int
+	fmt.Sscan(string(b), &pid)
+	if pid > 0 {
+		time.Sleep(100 * time.Millisecond)
+		if p, err := os.FindProcess(pid); err == nil && p.Signal(syscall.Signal(0)) == nil {
+			// Zombie children of the killed shell are reaped by init; a live one is a failure.
+			stat, _ := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+			if !strings.Contains(string(stat), ") Z ") && len(stat) > 0 {
+				t.Fatalf("child %d still running", pid)
+			}
+		}
+	}
 }

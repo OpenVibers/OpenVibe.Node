@@ -298,7 +298,7 @@ func (p *Publisher) post(ctx context.Context, sdp string) (answer, resource stri
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("whip: HTTP %d %s", resp.StatusCode, bytes.TrimSpace(body[:min(len(body), 200)]))
+		return "", "", fmt.Errorf("whip: HTTP %d %s", resp.StatusCode, scrub(string(bytes.TrimSpace(body[:min(len(body), 200)])), p.opt.PublishKey))
 	}
 	loc := resp.Header.Get("Location")
 	if loc != "" {
@@ -321,12 +321,19 @@ func (p *Publisher) delete(resource string) {
 	if err != nil {
 		return
 	}
-	if !p.opt.PublishKey.IsZero() {
+	// The publish key goes only to the WHIP endpoint's own origin, whatever Location the server returned.
+	if !p.opt.PublishKey.IsZero() && sameOrigin(resource, p.opt.WHIPURL) {
 		req.Header.Set("Authorization", "Bearer "+p.opt.PublishKey.Reveal())
 	}
 	if resp, err := p.opt.HTTPClient.Do(req); err == nil {
 		resp.Body.Close()
 	}
+}
+
+func sameOrigin(a, b string) bool {
+	ua, err1 := url.Parse(a)
+	ub, err2 := url.Parse(b)
+	return err1 == nil && err2 == nil && ua.Scheme == ub.Scheme && strings.EqualFold(ua.Host, ub.Host)
 }
 
 func redactURL(s string) string {

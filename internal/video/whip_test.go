@@ -72,3 +72,11 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+func TestSameOrigin(t *testing.T) {
+	if !sameOrigin("https://re.example/whip/a/s1", "https://re.example/whip/a") ||
+		sameOrigin("https://evil.example/x", "https://re.example/whip/a") ||
+		sameOrigin("http://re.example/x", "https://re.example/whip/a") {
+		t.Fatal("sameOrigin wrong")
+	}
+}

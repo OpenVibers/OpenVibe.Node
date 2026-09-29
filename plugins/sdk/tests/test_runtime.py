@@ -107,6 +107,18 @@ class RuntimeTest(unittest.TestCase):
         rt.tick()
         self.assertFalse(p.moving)
 
+    def test_backlog_counts_from_arrival(self):
+        # A command that waited in the inbox while a handler blocked keeps its arrival-based deadline.
+        rt, p, out, clock = make()
+        self.hello(rt)
+        arrived = clock.t
+        clock.t += 0.5  # the handler was stuck for 500 ms
+        rt.feed_line(json.dumps({"op": "heartbeat", "t": 1}), arrived)
+        rt.feed_line(json.dumps({"op": "command", "id": "old", "kind": "drive", "deadline_ms": 300}), arrived)
+        rt.tick()
+        self.assertFalse(p.moving)
+        self.assertIn("deadline", rt.stop_reasons)
+
     def test_heartbeat_loss_stops_and_refuses(self):
         rt, p, out, clock = make()
         self.hello(rt)

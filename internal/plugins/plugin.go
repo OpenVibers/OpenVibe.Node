@@ -383,10 +383,24 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 		_ = p.send(map[string]any{"op": "estop"})
 	}
 
+	// Watch the plugin process itself, not its stdout: a child it started (speech, a camera helper) can hold stdout
+	// open after the plugin died. When the plugin exits, its whole process group is killed, which also frees any
+	// motor bus or serial port a child still holds, and ends the stdout reader.
 	exited := make(chan error, 1)
 	go func() {
+		ps, err := cmd.Process.Wait()
+		kill()
+		select {
+		case <-readerDone:
+		case <-time.After(2 * time.Second):
+		}
+		stdout.Close()
+		stderr.Close()
 		<-readerDone
-		exited <- cmd.Wait()
+		if err == nil && ps != nil && !ps.Success() {
+			err = errors.New(ps.String())
+		}
+		exited <- err
 	}()
 
 	hb := time.NewTicker(HeartbeatInterval)

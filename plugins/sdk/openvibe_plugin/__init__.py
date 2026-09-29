@@ -195,16 +195,19 @@ class Runtime:
                 self.send(dict(op="telemetry", **t))
 
     # Input.
-    def dispatch(self, msg):
+    def dispatch(self, msg, at=None):
+        """Handle one message. at is when the line arrived (defaults to now): deadlines and heartbeats count from
+        arrival, so a backlog after a slow handler cannot make stale commands or heartbeats look fresh."""
+        at = self.clock() if at is None else at
         op = msg.get("op")
         if op == "hello":
             self.on_hello(msg)
         elif op == "heartbeat":
-            self.last_heartbeat = self.clock()
+            self.last_heartbeat = max(self.last_heartbeat or at, at)
             if self.heartbeat_lost:
                 self.heartbeat_lost = False
         elif op == "command":
-            self.on_command(msg)
+            self.on_command(msg, at)
         elif op == "stop":
             self.safe_stop("stop")
         elif op == "estop":
@@ -240,10 +243,10 @@ class Runtime:
         except Exception as e:
             self.send({"op": "fault", "fault_code": "hardware", "message": str(e)})
 
-    def on_command(self, msg):
+    def on_command(self, msg, now=None):
         cid = msg.get("id")
         kind = msg.get("kind")
-        now = self.clock()
+        now = self.clock() if now is None else now
         try:
             dl = int(msg.get("deadline_ms") or DEFAULT_DEADLINE_MS)
         except (TypeError, ValueError):
@@ -279,7 +282,7 @@ class Runtime:
             self.safe_stop("handler_error")
             self.send({"op": "nack", "id": cid, "fault_code": "hardware", "message": str(e)})
 
-    def feed_line(self, line):
+    def feed_line(self, line, at=None):
         line = line.strip()
         if not line:
             return
@@ -289,7 +292,7 @@ class Runtime:
             self.plugin.log("bad json from core: %r", line[:200])
             return
         if isinstance(msg, dict):
-            self.dispatch(msg)
+            self.dispatch(msg, at)
 
     def shutdown(self, reason="eof"):
         if self.closed:
@@ -305,7 +308,7 @@ class Runtime:
     def _reader(self):
         try:
             for line in self.infile:
-                self.inbox.put(line)
+                self.inbox.put((line, self.clock()))
         except Exception:
             pass
         self.inbox.put(None)
@@ -316,13 +319,14 @@ class Runtime:
         try:
             while True:
                 try:
-                    line = self.inbox.get(timeout=0.02)
+                    item = self.inbox.get(timeout=0.02)
                 except queue.Empty:
-                    line = ""
-                if line is None:
+                    item = ("", None)
+                if item is None:
                     break
+                line, at = item
                 if line:
-                    self.feed_line(line)
+                    self.feed_line(line, at)
                 self.tick()
         finally:
             self.shutdown("eof")
