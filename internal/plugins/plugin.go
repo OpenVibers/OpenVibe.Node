@@ -199,48 +199,60 @@ func (p *Plugin) Resume() {
 
 // Command sends a command and waits for the plugin's ack or nack.
 func (p *Plugin) Command(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int) Reply {
+	return p.Begin(ctx, id, kind, value, deadlineMS)()
+}
+
+// Begin queues a command for the plugin at once (so commands reach it in arrival order) and returns a function that
+// waits for its ack or nack. A plugin that does not answer in max(deadline, MinReplyTimeout) is told to stop and the
+// command fails with plugin_timeout.
+func (p *Plugin) Begin(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int) func() Reply {
+	now := func(r Reply) func() Reply { return func() Reply { return r } }
 	p.mu.Lock()
 	if p.state != StateReady && kind != protocol.KindHalt {
 		st, fault := p.state, p.fault
 		p.mu.Unlock()
 		if st == StateFaulted && fault != nil {
-			return Reply{FaultCode: fault.Code, Message: fault.Message}
+			return now(Reply{FaultCode: fault.Code, Message: fault.Message})
 		}
 		if st == StateDown || st == StateStopped {
-			return Reply{FaultCode: protocol.FaultPluginDown}
+			return now(Reply{FaultCode: protocol.FaultPluginDown})
 		}
-		return Reply{FaultCode: protocol.FaultNotReady}
+		return now(Reply{FaultCode: protocol.FaultNotReady})
 	}
 	ch := make(chan Reply, 1)
 	p.pending[id] = ch
 	p.mu.Unlock()
-	defer func() {
+	done := func() {
 		p.mu.Lock()
 		delete(p.pending, id)
 		p.mu.Unlock()
-	}()
+	}
 	msg := map[string]any{"op": "command", "id": id, "kind": kind, "deadline_ms": deadlineMS}
 	if len(value) > 0 {
 		msg["value"] = value
 	}
 	if err := p.send(msg); err != nil {
-		return Reply{FaultCode: protocol.FaultPluginDown}
+		done()
+		return now(Reply{FaultCode: protocol.FaultPluginDown})
 	}
-	wait := time.Duration(deadlineMS) * time.Millisecond
-	if wait < MinReplyTimeout {
-		wait = MinReplyTimeout
-	}
-	t := time.NewTimer(wait)
-	defer t.Stop()
-	select {
-	case r := <-ch:
-		return r
-	case <-t.C:
-		p.Stop()
-		return Reply{FaultCode: protocol.FaultPluginTimeout}
-	case <-ctx.Done():
-		p.Stop()
-		return Reply{FaultCode: protocol.FaultShuttingDown}
+	return func() Reply {
+		defer done()
+		wait := time.Duration(deadlineMS) * time.Millisecond
+		if wait < MinReplyTimeout {
+			wait = MinReplyTimeout
+		}
+		t := time.NewTimer(wait)
+		defer t.Stop()
+		select {
+		case r := <-ch:
+			return r
+		case <-t.C:
+			p.Stop()
+			return Reply{FaultCode: protocol.FaultPluginTimeout}
+		case <-ctx.Done():
+			p.Stop()
+			return Reply{FaultCode: protocol.FaultShuttingDown}
+		}
 	}
 }
 
