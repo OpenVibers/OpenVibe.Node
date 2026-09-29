@@ -81,7 +81,7 @@ func TestPair(t *testing.T) {
 		t.Fatalf("output: %s %s", out, errOut)
 	}
 	st, _ := os.Stat(filepath.Join(home, "credential.json"))
-	if st.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode %o", st.Mode().Perm())
 	}
 	if _, err := os.Stat(filepath.Join(home, "config.json")); err != nil {
