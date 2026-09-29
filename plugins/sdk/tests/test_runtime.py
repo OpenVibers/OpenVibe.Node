@@ -162,12 +162,13 @@ class ProcessTest(unittest.TestCase):
     """The real thing: a child process whose stdin closes must stop and exit."""
 
     def test_child_exits_on_eof(self):
-        code = ("import sys; sys.path.insert(0, %r)\n"
+        code = ("import os, sys; sys.path.insert(0, %r)\n"
                 "from openvibe_plugin import Plugin, run\n"
                 "class P(Plugin):\n"
                 "    driver='t'\n"
                 "    def handle(self, cmd): pass\n"
                 "    def stop(self): sys.stderr.write('STOPPED\\n'); sys.stderr.flush()\n"
+                "    def setup(self, config): print('library noise on stdout'); os.write(1, b'C noise\\n')\n"
                 "sys.exit(run(P()))\n") % os.path.dirname(HERE)
         proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
@@ -182,6 +183,11 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn('"op":"ack"', out)
         self.assertIn("STOPPED", err)
+        # Everything on stdout is protocol; library prints went to stderr.
+        for line in out.splitlines():
+            json.loads(line)
+        self.assertIn("library noise on stdout", err)
+        self.assertIn("C noise", err)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ See docs/plugins.md for the wire format.
 """
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -328,10 +329,20 @@ class Runtime:
         return 0
 
 
+def protocol_stdout():
+    """Reserve stdout for the protocol.
+
+    Hardware libraries print to stdout (Adafruit Blinka warns about the board there), which would corrupt the JSON
+    lines. Keep a private duplicate of file descriptor 1 for the protocol, then point descriptor 1 and sys.stdout at
+    stderr, so every other print, from Python or from C, lands in the Node's log instead.
+    """
+    sys.stdout.flush()
+    proto = os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    return proto
+
+
 def run(plugin):
     """Entry point for a plugin's __main__."""
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except AttributeError:
-        pass
-    return Runtime(plugin).run()
+    return Runtime(plugin, outfile=protocol_stdout()).run()
