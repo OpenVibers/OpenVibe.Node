@@ -92,8 +92,8 @@ func TestTestPatternRuns(t *testing.T) {
 // the pixels: the strongest evidence the bitstream is valid H.264.
 func TestDecodesWithFFmpegLibraries(t *testing.T) {
 	py, err := exec.LookPath("python3")
-	if err != nil || exec.Command(py, "-c", "import av").Run() != nil {
-		t.Skip("python3 with PyAV (pip install av) not available")
+	if err != nil || exec.Command(py, "-c", "import av, numpy").Run() != nil {
+		t.Skip("python3 with PyAV and numpy (pip install av numpy) not available")
 	}
 	enc, _ := NewPCMEncoder(320, 240)
 	var stream []byte

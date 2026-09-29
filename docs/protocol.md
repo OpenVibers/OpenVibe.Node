@@ -2,8 +2,9 @@
 
 This is the wire format the Node speaks today, from ADR-043 decisions 1, 2, 4, 5 and 6. OpenVibe.Bot's own
 `docs/protocol.md` is the source of truth; every field name below lives in one Go package, `internal/protocol/`, so
-aligning with it is a change to that package only. Points still to be confirmed with the service are marked **(to
-align)**.
+aligning with it is a change to that package only. The ADR-043 text mirrored in this repo is updated to match (pairing
+field `code`, relative `deadline_ms`, plugin events in `telemetry.events`). Points still to be confirmed with the
+service are marked **(to align)**.
 
 ## 1. Pairing
 
@@ -23,8 +24,7 @@ Content-Type: application/json
 
 `device_kind` is `onboard` (the Node runs on the robot) or `bridge` (it drives the robot over the robot's own link, as
 with Cozmo). `capabilities` is keyed by plugin name and holds each plugin's `describe` capabilities
-([plugins.md](plugins.md)). ADR-043 writes the code field as `pair`; the Node sends `code` as the handoff brief says
-**(to align)**.
+([plugins.md](plugins.md)). The code field is `code`, as in Bot's `docs/protocol.md`.
 
 Answer `2xx`:
 
@@ -91,8 +91,8 @@ Unknown `type`s are ignored (a newer server may send more). Frames are at most 1
 
 `status` and `estop_state` are sent on every connect and whenever a plugin changes state, faults or the latch changes.
 Plugin events (`cliff`, `picked_up`, `low_battery`, `heartbeat_lost`, …) travel in `telemetry.events` and are sent
-within 100 ms; sensor telemetry is sent at most every `telemetry_ms` (default 500 ms, so ≤ 2 Hz) **(to align: a
-separate `event` type?)**.
+within 100 ms; sensor telemetry is sent at most every `telemetry_ms` (default 500 ms, so ≤ 2 Hz). There is no
+separate `event` message type.
 
 ### Commands
 
@@ -111,8 +111,7 @@ servo in their config to make the hardware match).
 
 `deadline_ms` is **relative to receipt** (milliseconds the command stays valid), not an absolute timestamp: a device's
 clock may be minutes off, and a relative deadline cannot be stretched by clock skew. Default 300 ms; capped at
-`max_command_ms` (default 1000). A held control is re-sent by the panel every 150 ms, each with a new `id`
-**(to align: ADR-043 says "absolute deadline")**.
+`max_command_ms` (default 1000). A held control is re-sent by the panel every 150 ms, each with a new `id`.
 
 What the Node does with a command, in order:
 

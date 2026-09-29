@@ -35,7 +35,9 @@ func TestMain(m *testing.M) {
 func fakePlugin(logPath string, in io.Reader, out io.Writer) {
 	f, _ := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	defer f.Close()
-	rec := func(s string) { fmt.Fprintln(f, s); f.Sync() }
+	// No fsync: the tests read the log through the OS, and fsync per line takes tens of ms on Windows, enough to push
+	// replies to 50 concurrent commands past MinReplyTimeout.
+	rec := func(s string) { fmt.Fprintln(f, s) }
 	w := json.NewEncoder(out)
 	sc := bufio.NewScanner(in)
 	mode := os.Getenv("OPENVIBE_FAKE_MODE")
