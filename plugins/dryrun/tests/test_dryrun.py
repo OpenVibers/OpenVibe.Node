@@ -72,6 +72,18 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(d["driver"], "dryrun")
         self.assertEqual(d["capabilities"]["camera"]["source"], "test_pattern")
 
+    def test_record(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "rec.jsonl")
+        p = DryRun()
+        p.log = lambda *a: None
+        rt = Runtime(p, infile=io.StringIO(""), outfile=io.StringIO(), clock=self.clock)
+        rt.feed_line(json.dumps({"op": "hello", "config": {"record": path}}))
+        rt.feed_line(json.dumps({"op": "command", "id": "r", "kind": "drive", "value": {"throttle": 0.5}}))
+        rt.feed_line(json.dumps({"op": "estop"}))
+        whats = [json.loads(x)["what"] for x in open(path)]
+        self.assertEqual(whats, ["setup", "stop", "command", "stop"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -166,6 +167,7 @@ func (p *Publisher) newAPI() (*webrtc.API, error) {
 		return nil, err
 	}
 	se := webrtc.SettingEngine{}
+	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	if p.opt.IncludeLoopback {
 		se.SetIncludeLoopbackCandidate(true)
 	}

@@ -23,6 +23,7 @@ class DryRun(Plugin):
         self.battery = 100.0
         self.started = time.monotonic()
         self.log_commands = True
+        self.record_path = None
 
     def describe(self, config):
         return {
@@ -36,8 +37,17 @@ class DryRun(Plugin):
             "camera": {"source": "test_pattern"},
         }
 
+    def record(self, what, **fields):
+        """Append one JSON line to config["record"] (if set): what the pretend robot was told, for end-to-end tests."""
+        if not self.record_path:
+            return
+        with open(self.record_path, "a") as f:
+            f.write(json.dumps(dict(t=round(time.time(), 3), what=what, **fields), sort_keys=True) + "\n")
+
     def setup(self, config):
         self.log_commands = bool(config.get("log_commands", True))
+        self.record_path = config.get("record")
+        self.record("setup")
         self.log("dryrun: ready (no hardware)")
 
     def handle(self, cmd):
@@ -65,10 +75,12 @@ class DryRun(Plugin):
             raise Fault("unsupported", "kind %s" % cmd.kind)
         if self.log_commands:
             self.log("dryrun: %s %s (deadline %d ms)", cmd.kind, json.dumps(v, sort_keys=True), cmd.deadline_ms)
+        self.record("command", id=cmd.id, kind=cmd.kind, value=v, deadline_ms=cmd.deadline_ms)
 
     def stop(self):
         if self.state["throttle"] or self.state["steer"]:
             self.log("dryrun: stop")
+        self.record("stop", was_moving=bool(self.state["throttle"] or self.state["steer"]))
         self.state["throttle"] = 0.0
         self.state["steer"] = 0.0
 

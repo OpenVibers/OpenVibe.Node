@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -57,6 +58,7 @@ func (w *WHIPReceiver) post(rw http.ResponseWriter, r *http.Request) {
 	m := &webrtc.MediaEngine{}
 	_ = m.RegisterDefaultCodecs()
 	se := webrtc.SettingEngine{}
+	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	se.SetIncludeLoopbackCandidate(true)
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
