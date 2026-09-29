@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openvibe-cozmo"
+version = "0.1.0"
+description = "OpenVibe Node bridge plugin for Anki/DDL Cozmo (via PyCozmo)"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = ["openvibe-plugin", "pillow"]
+
+[project.optional-dependencies]
+robot = ["pycozmo>=0.8.0,<0.9"]
+
+[tool.setuptools]
+packages = ["openvibe_cozmo"]
