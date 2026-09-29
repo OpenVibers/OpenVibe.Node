@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"time"
 
@@ -73,7 +74,7 @@ type Options struct {
 }
 
 func config(opt Options) *ks.Config {
-	return &ks.Config{
+	c := &ks.Config{
 		Name: Name, DisplayName: DisplayName, Description: Description, Arguments: opt.Arguments, UserName: opt.UserName,
 		Option: ks.KeyValue{
 			"Restart":                "always", // systemd
@@ -85,6 +86,11 @@ func config(opt Options) *ks.Config {
 			"DelayedAutoStart":       false,
 		},
 	}
+	if runtime.GOOS == "darwin" {
+		// launchd has no journal: write /usr/local/var/log/openvibe-node.{out,err}.log. systemd keeps journald.
+		c.Option["LogOutput"] = true
+	}
+	return c
 }
 
 // Run runs program under the service manager, or in the foreground when started from a terminal.

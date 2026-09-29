@@ -128,7 +128,8 @@ internet (Ethernet, or a second Wi-Fi adapter). Install with `--robot cozmo`; th
 
 - `openvibe-node status` shows the last link error. "the server refused the device credential" means it was revoked:
   `sudo openvibe-node pair --force <NEW-CODE>`.
-- Logs: `journalctl -u openvibe-node -f` (Linux), `/var/log/openvibe-node.*.log` (macOS), Event Viewer (Windows).
+- Logs: `journalctl -u openvibe-node -f` (Linux), `/usr/local/var/log/openvibe-node.err.log` (macOS). On Windows the
+  service's log is not kept yet; stop the service and run `openvibe-node run` in a terminal to watch it.
 - A plugin in `faulted` state says why in `status` (missing library, not a Raspberry Pi, robot not reachable, firmware).
 - `openvibe-node plugins` works without the service running: it asks each plugin to describe itself without touching
   hardware.

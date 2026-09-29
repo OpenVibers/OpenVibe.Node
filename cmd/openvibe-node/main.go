@@ -331,6 +331,7 @@ func cmdStop(g *globals, stdout io.Writer) error {
 	if ferr := safety.WriteLocalFile(g.paths.LatchFile(), true); ferr != nil {
 		return fmt.Errorf("could not reach the node (%v) nor write %s (%v); run with sudo", err, g.paths.LatchFile(), ferr)
 	}
+	chownLikeDir(g.paths.LatchFile(), g.paths.StateDir) // the service account must be able to read it
 	fmt.Fprintln(stdout, "The node did not answer; the stop is latched in", g.paths.LatchFile())
 	fmt.Fprintln(stdout, "A running node obeys it within a quarter second; a starting node starts stopped. Release with `openvibe-node resume`.")
 	return nil
@@ -342,6 +343,7 @@ func cmdResume(g *globals, stdout io.Writer) error {
 		if ferr := safety.WriteLocalFile(g.paths.LatchFile(), false); ferr != nil {
 			return fmt.Errorf("could not reach the node (%v) nor write %s (%v); run with sudo", err, g.paths.LatchFile(), ferr)
 		}
+		chownLikeDir(g.paths.LatchFile(), g.paths.StateDir)
 	}
 	fmt.Fprintln(stdout, "Resumed: the local stop and any server e-stop are released. Operators can drive again.")
 	return nil
