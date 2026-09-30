@@ -32,7 +32,7 @@ a Cozmo-based robot).
    stream key. Stream keys stop being robot credentials.
 2. **Pairing is a one-time code.** The owner adds a robot; Bot shows an 8-character code (Crockford base32, `XXXX-XXXX`,
    10-minute lifetime, single use, 5 wrong tries end it) as text, as a QR code and inside the one-line installer command.
-   The agent sends `{pair: code, agent_version, device_kind, drivers, capabilities}` and receives its device id,
+   The agent sends `{code, agent_version, device_kind, drivers, capabilities}` and receives its device id,
    credential, publish key and the robot's profile. The owner sees the device appear and confirms it.
 3. **Three kinds of device connection, one agent.** **On-board**: the agent runs on the robot's own computer (Raspberry
    Pi; ESP32 through a small library speaking the same protocol). **Bridge**: the agent runs on a computer next to the
@@ -49,9 +49,10 @@ a Cozmo-based robot).
 5. **One message set** (JSON, fields `v`, `seq`, `ts` on every frame): server→device `hello`, `config` (limits, heartbeat,
    the operator's allowed commands), `command` (`id` as an idempotency key, `kind` drive/actuator/ptz/say/display/halt,
    `value`, `deadline_ms`, operator and role), `estop`, `heartbeat_ack`; device→server `status`, `telemetry` (≤ 2 Hz),
-   `ack`/`nack` (with a fault code), `heartbeat`, `estop_state`. Commands are never queued for an offline device and
+   `ack`/`nack` (with a fault code), `heartbeat`, `estop_state`; robot events (cliff, picked up, low battery) travel in
+   `telemetry.events`, not as a separate message type. Commands are never queued for an offline device and
    never replayed after a reconnect.
-6. **Safety is not optional.** Every motion command carries an absolute deadline (default 300 ms, at most the robot's
+6. **Safety is not optional.** Every motion command carries a deadline relative to receipt (`deadline_ms`, default 300 ms, at most the robot's
    `max_command_ms`); a held control re-sends every 150 ms; the **device** stops the motors at the deadline, on a lost
    heartbeat (1 s interval, stop after 2 missed) and on every disconnect or crash path, without asking the network. The
    e-stop is latched on the device and in Bot and only the owner clears it. Speed, turn and range limits and time windows

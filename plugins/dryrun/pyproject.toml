@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openvibe-dryrun"
+version = "0.1.0"
+description = "OpenVibe Node dry-run plugin: accepts every command, logs it, reports simulated telemetry"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = ["openvibe-plugin"]
+
+[tool.setuptools]
+packages = ["openvibe_dryrun"]

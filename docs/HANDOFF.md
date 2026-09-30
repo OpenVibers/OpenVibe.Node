@@ -52,7 +52,7 @@ mode 0600 and its contents never appear in logs, errors or `status`.
 
 ## Safety (ADR-043 decision 6; not optional)
 
-- Every motion command carries an absolute deadline (default 300 ms, capped by the profile's `max_command_ms`); the
+- Every motion command carries a deadline relative to receipt (`deadline_ms`, default 300 ms, capped by the profile's `max_command_ms`); the
   plugin stops at the deadline unless a newer command arrived. Held controls are re-sent by the operator every 150 ms.
 - Stop all actuators on: 2 missed heartbeats, link loss, core shutdown, plugin crash (the core restarts it with backoff
   and it starts stopped), `openvibe-node stop`, an `estop`.
