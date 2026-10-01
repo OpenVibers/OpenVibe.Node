@@ -2,7 +2,7 @@
 // socket. Every path that should stop the motors ends in Manager.StopAll or EstopAll:
 //
 //	link lost (disconnect, deadman)       → StopAll
-//	server estop                          → latch (persisted) → EstopAll
+//	server estop / config.estop_latched   → latch (persisted) → EstopAll
 //	`openvibe-node stop` (socket or file) → latch (persisted) → EstopAll
 //	core shutdown                         → StopAll, then each plugin's stdin is closed (plugins stop on EOF)
 //	plugin crash                          → restarted stopped, estop re-sent if latched
@@ -71,6 +71,14 @@ type Node struct {
 	videoSrc  string
 	lastTelem time.Time
 	started   time.Time
+
+	// Per connection: status and estop_state wait for hello and config (until then the server may still be checking
+	// the credential), and motion waits for config (its estop_latched must be applied first).
+	helloOK     bool
+	configOK    bool
+	ready       bool
+	clockOffset time.Duration // server clock − local clock, from hello.server_time
+	robotIDs    []string
 }
 
 // New builds a Node. Run starts it.
@@ -176,59 +184,124 @@ func (n *Node) Run(ctx context.Context) error {
 
 // ---- link.Handler ----
 
+// Connected sends nothing: status and estop_state go out once hello and config have arrived (markReady).
 func (n *Node) Connected() {
-	n.sendStatus()
-	n.sendEstopState()
+	n.resetSession()
 }
 
 func (n *Node) Disconnected(err error) {
-	n.log.Warn("link lost: stopping every actuator", "err", err)
+	n.resetSession()
+	if link.IsCredentialError(err) {
+		n.log.Error("link lost: the credential was refused; re-pair or update the credential", "err", err)
+	} else {
+		n.log.Warn("link lost: stopping every actuator", "err", err)
+	}
 	n.mgr.StopAll()
+}
+
+func (n *Node) resetSession() {
+	n.mu.Lock()
+	n.helloOK, n.configOK, n.ready = false, false, false
+	n.mu.Unlock()
+}
+
+// markReady records hello or config; when both have arrived on this connection it sends the first status and
+// estop_state.
+func (n *Node) markReady(hello, config bool) {
+	n.mu.Lock()
+	n.helloOK = n.helloOK || hello
+	n.configOK = n.configOK || config
+	first := n.helloOK && n.configOK && !n.ready
+	if first {
+		n.ready = true
+	}
+	n.mu.Unlock()
+	if first {
+		n.sendStatus()
+		n.sendEstopState()
+	}
+}
+
+func (n *Node) isReady() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.ready
 }
 
 func (n *Node) Frame(f protocol.Frame) {
 	switch m := f.Msg.(type) {
 	case protocol.Hello:
-		n.log.Info("server hello", "device", m.DeviceID)
+		n.hello(m, time.Now())
 	case protocol.Config:
 		n.applyConfig(m)
 	case protocol.Command:
 		n.command(m, time.Now())
 	case protocol.Estop:
-		n.log.Warn("e-stop from the server", "reason", m.Reason, "by", m.By)
-		n.mgr.EstopAll() // at once, before the disk write
-		if _, err := n.latch.SetRemote(m.Reason); err != nil {
+		n.remoteEstop(m.Latched, m.By)
+	case protocol.Error:
+		n.log.Warn("the server refused a frame", "code", m.Code, "detail", m.Detail)
+	}
+}
+
+func (n *Node) hello(h protocol.Hello, received time.Time) {
+	var offset time.Duration
+	if t, ok := h.Time(); ok {
+		offset = t.Sub(received)
+	}
+	n.mu.Lock()
+	n.clockOffset, n.robotIDs = offset, h.RobotIDs
+	n.mu.Unlock()
+	n.log.Info("server hello", "device", h.DeviceID, "session", h.SessionID, "robots", strings.Join(h.RobotIDs, ","),
+		"clock_offset", offset.Round(time.Millisecond))
+	n.markReady(true, false)
+}
+
+// remoteEstop applies the server's e-stop: latched:true latches (motors stop at once, before the disk write);
+// latched:false is the owner's clear. The local kill switch is never touched from here.
+func (n *Node) remoteEstop(latched bool, by string) {
+	if latched {
+		reason := "e-stop latched on the server"
+		if by != "" {
+			reason += " by " + by
+		}
+		n.log.Warn("e-stop from the server", "by", by)
+		n.mgr.EstopAll()
+		if _, err := n.latch.SetRemote(reason); err != nil {
 			n.log.Error("could not persist the e-stop (it is held in memory)", "err", err)
 		}
-		n.sendEstopState()
-	case protocol.EstopClear:
-		n.log.Warn("e-stop cleared by the server", "by", m.By)
-		if _, err := n.latch.ClearRemote(); err != nil {
-			n.log.Error("could not persist the e-stop clear", "err", err)
-		}
-		n.sendEstopState()
+		return
+	}
+	if !n.latch.State().Remote {
+		return
+	}
+	n.log.Warn("e-stop cleared by the server", "by", by)
+	if _, err := n.latch.ClearRemote(); err != nil {
+		n.log.Error("could not persist the e-stop clear", "err", err)
 	}
 }
 
 func (n *Node) applyConfig(c protocol.Config) {
+	// The robot's e-stop first, so no command on this connection can move a latched robot.
+	if c.EstopLatched != nil {
+		n.remoteEstop(*c.EstopLatched, "")
+	}
 	l := safety.Merge(c.Limits, n.opt.Config.Limits.MaxSpeed, n.opt.Config.Limits.MaxTurn, n.opt.Config.Limits.MaxCommandMS)
 	n.mu.Lock()
 	n.limits = l
 	n.allowed = nil
-	if len(c.Allowed) > 0 {
+	if c.AllowedCommands != nil {
 		n.allowed = map[string]bool{protocol.KindHalt: true}
-		for _, k := range c.Allowed {
+		for _, k := range c.AllowedCommands {
 			n.allowed[k] = true
 		}
 	}
-	if c.TelemetryMS >= 500 {
-		n.telemMS = c.TelemetryMS
-	}
 	n.mu.Unlock()
 	if n.link != nil {
-		n.link.SetTiming(c.HeartbeatMS, c.DeadmanMS)
+		n.link.SetTiming(c.HeartbeatMS)
 	}
-	n.log.Info("config", "max_speed", l.MaxSpeed, "max_turn", l.MaxTurn, "max_command_ms", l.MaxCommandMS)
+	n.log.Info("config", "max_speed", l.MaxSpeed, "max_turn", l.MaxTurn, "max_command_ms", l.MaxCommandMS,
+		"allowed_commands", strings.Join(c.AllowedCommands, ","))
+	n.markReady(false, true)
 }
 
 // command validates and routes one command. The synchronous part (checks, clamping, queueing to the plugin) keeps
@@ -263,7 +336,7 @@ func (n *Node) command(c protocol.Command, received time.Time) {
 		return
 	}
 	n.mu.Lock()
-	limits, allowed := n.limits, n.allowed
+	limits, allowed, configured, offset := n.limits, n.allowed, n.configOK, n.clockOffset
 	n.mu.Unlock()
 	if c.Kind == protocol.KindHalt {
 		n.mgr.StopAll()
@@ -272,8 +345,18 @@ func (n *Node) command(c protocol.Command, received time.Time) {
 		n.send(r)
 		return
 	}
+	if !configured {
+		nack(protocol.FaultNotReady, "the server's config has not arrived")
+		return
+	}
 	if allowed != nil && !allowed[c.Kind] {
-		nack(protocol.FaultNotAllowed, "")
+		nack(protocol.FaultNotAllowed, c.Kind+" is not in allowed_commands")
+		return
+	}
+	// deadline_ms is an instant on the server's clock: a command that arrives after it never reaches a plugin.
+	remaining, expired := limits.Remaining(c.DeadlineMS, received.Add(offset).UnixMilli())
+	if expired {
+		nack(protocol.FaultExpired, "the deadline had passed when the command arrived")
 		return
 	}
 	if protocol.GuardedKinds[c.Kind] {
@@ -310,8 +393,7 @@ func (n *Node) command(c protocol.Command, received time.Time) {
 		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind)
 		return
 	}
-	deadline := limits.Deadline(c.DeadlineMS)
-	wait := p.Begin(n.ctx, c.ID, c.Kind, value, deadline)
+	wait := p.Begin(n.ctx, c.ID, c.Kind, value, remaining)
 	go func() {
 		r := wait()
 		var msg protocol.Message
@@ -363,10 +445,26 @@ func (n *Node) pollLatch(ctx context.Context) {
 	}
 }
 
+// sendEstopState reports the device's own latch. Bot sets the robot's e-stop to whatever estop_state says, so the
+// server's latch is never echoed back: latched:true is the local kill switch, latched:false goes out only when nothing
+// is latched (after `openvibe-node resume`, or as a confirmation the server ignores).
 func (n *Node) sendEstopState() {
+	if !n.isReady() {
+		return
+	}
 	st := n.latch.State()
-	n.send(protocol.EstopState{Latched: st.Remote, LocalStop: st.Local, Reason: st.RemoteReason})
+	if st.Remote && !st.Local {
+		return
+	}
+	at := time.Now()
+	if st.Local && !st.LocalAt.IsZero() {
+		at = st.LocalAt
+	}
+	n.send(protocol.EstopState{Latched: st.Local, By: "device", At: at.UTC().Format(isoMillis)})
 }
+
+// isoMillis is the server's timestamp format, e.g. 2026-09-29T19:20:01.200Z.
+const isoMillis = "2006-01-02T15:04:05.000Z07:00"
 
 // ---- plugin output ----
 
@@ -422,8 +520,12 @@ func (n *Node) output(o plugins.Output) {
 }
 
 // flushTelemetry sends at most one telemetry frame per telemetry interval (≥ 500 ms: ≤ 2 Hz). Events go out at the
-// next 100 ms tick even inside the interval, so a cliff is not held back by the rate limit of sensor data.
+// next 100 ms tick even inside the interval, so a cliff is not held back by the rate limit of sensor data. Nothing goes
+// out before hello and config (Bot refuses it as bot.not_paired); telemetry and events stay buffered until then.
 func (n *Node) flushTelemetry(eventsOnly bool) {
+	if !n.isReady() {
+		return
+	}
 	n.mu.Lock()
 	due := time.Since(n.lastTelem) >= time.Duration(n.telemMS)*time.Millisecond
 	if !due && len(n.events) == 0 {
@@ -441,7 +543,7 @@ func (n *Node) flushTelemetry(eventsOnly bool) {
 		n.lastTelem = time.Now()
 	}
 	n.mu.Unlock()
-	if t.Battery == nil && len(t.Sensors) == 0 && t.RSSI == nil && len(t.Events) == 0 {
+	if t.Battery == nil && t.Voltage == nil && len(t.Sensors) == 0 && t.RSSI == nil && len(t.Events) == 0 {
 		return
 	}
 	n.send(t)
@@ -456,8 +558,13 @@ func mergeTelemetry(per map[string]map[string]any, events []protocol.Event) prot
 	sort.Strings(names)
 	for _, name := range names {
 		d := per[name]
-		if b, ok := d["battery"].(map[string]any); ok && t.Battery == nil {
-			t.Battery = &protocol.Battery{Volts: num(b["volts"]), Percent: num(b["percent"])}
+		// Plugins report battery {volts, percent 0..100}; Bot reads a scalar charge 0..1 and the voltage.
+		if b, ok := d["battery"].(map[string]any); ok && t.Battery == nil && t.Voltage == nil {
+			if p := num(b["percent"]); p != nil {
+				f := *p / 100
+				t.Battery = &f
+			}
+			t.Voltage = num(b["volts"])
 		}
 		if r := num(d["rssi"]); r != nil && t.RSSI == nil {
 			v := int(*r)
@@ -650,13 +757,22 @@ func (n *Node) Status() Status {
 }
 
 func (n *Node) sendStatus() {
+	if !n.isReady() {
+		return
+	}
 	st := n.latch.State()
-	s := protocol.Status{AgentVersion: n.opt.Version, DeviceKind: n.opt.Config.DeviceKind, OS: runtime.GOOS, Arch: runtime.GOARCH,
-		EstopLatched: st.Remote, LocalStop: st.Local, Drivers: []protocol.DriverStatus{}, Faults: []protocol.Fault{}}
+	s := protocol.Status{Firmware: "openvibe-node-" + n.opt.Version, Capabilities: map[string]any{},
+		AgentVersion: n.opt.Version, DeviceKind: n.opt.Config.DeviceKind, OS: runtime.GOOS, Arch: runtime.GOARCH,
+		EstopLatched: st.Stopped(), LocalStop: st.Local, Drivers: []protocol.DriverStatus{}, Faults: []protocol.Fault{}}
 	for _, i := range n.mgr.Infos() {
 		d := protocol.DriverStatus{Name: i.Name, State: i.State}
 		if i.Describe != nil {
 			d.Driver, d.Version, d.Capabilities = i.Describe.Driver, i.Describe.Version, i.Describe.Capabilities
+			for k, v := range i.Describe.Capabilities { // the first driver with a capability serves it
+				if _, taken := s.Capabilities[k]; !taken {
+					s.Capabilities[k] = v
+				}
+			}
 		}
 		s.Drivers = append(s.Drivers, d)
 		if i.Fault != nil {

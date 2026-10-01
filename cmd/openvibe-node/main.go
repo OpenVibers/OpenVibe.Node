@@ -43,7 +43,8 @@ var version = "dev"
 const usage = `openvibe-node %s: connect this device to OpenVibe.
 
 Usage:
-  openvibe-node pair <CODE> [--server URL] [--kind onboard|bridge] [--force]
+  openvibe-node pair <CODE> [--robot rob_…] [--name NAME] [--server URL] [--kind onboard|bridge] [--force]
+  openvibe-node credential set   read a rotated credential (or the rotate answer's JSON) from stdin
   openvibe-node run [--dry-run]
   openvibe-node install [--user NAME]
   openvibe-node uninstall
@@ -83,6 +84,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var (
 		server  = fs.String("server", "", "OpenVibe.Bot origin (pair)")
 		kind    = fs.String("kind", "", "onboard or bridge (pair)")
+		robot   = fs.String("robot", "", "the robot (rob_…) the pairing code belongs to (pair)")
+		name    = fs.String("name", "", "the name the owner sees for this device; default: the hostname (pair)")
 		force   = fs.Bool("force", false, "pair again even if already paired")
 		dryRun  = fs.Bool("dry-run", false, "run only the dry-run plugin and the test pattern (run)")
 		asJSON  = fs.Bool("json", false, "print JSON (status, plugins)")
@@ -110,7 +113,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "usage: openvibe-node pair <CODE>")
 			return 2
 		}
-		err = cmdPair(g, positional[0], *server, *kind, *force, stdout)
+		err = cmdPair(g, pairArgs{code: positional[0], robot: *robot, name: *name, server: *server, kind: *kind, force: *force}, stdout)
+	case "credential":
+		if len(positional) != 1 || positional[0] != "set" {
+			fmt.Fprintln(stderr, "usage: openvibe-node credential set < credential")
+			return 2
+		}
+		err = cmdCredentialSet(g, stdin, stdout)
 	case "run":
 		err = cmdRun(g, *dryRun)
 	case "install":
@@ -190,11 +199,20 @@ func probeAll(cfg *config.Config, paths config.Paths, log *slog.Logger) (map[str
 	return out, failed
 }
 
-func cmdPair(g *globals, code, server, kind string, force bool, stdout io.Writer) error {
-	code, err := link.NormalizeCode(code)
+type pairArgs struct {
+	code, robot, name, server, kind string
+	force                           bool
+}
+
+func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
+	code, err := link.NormalizeCode(a.code)
 	if err != nil {
 		return err
 	}
+	if a.robot != "" && !strings.HasPrefix(a.robot, "rob_") {
+		return fmt.Errorf("--robot takes the robot's id from openvibe.bot (rob_…), not %q", a.robot)
+	}
+	server, kind, force := a.server, a.kind, a.force
 	if err := g.paths.Ensure(); err != nil {
 		return fmt.Errorf("cannot create %s (run with sudo, or use --home): %w", g.paths.ConfigDir, err)
 	}
@@ -217,8 +235,10 @@ func cmdPair(g *globals, code, server, kind string, force bool, stdout io.Writer
 	}
 	descs, _ := probeAll(cfg, g.paths, g.log)
 	req := protocol.PairRequest{Code: code, AgentVersion: version, DeviceKind: cfg.DeviceKind, Drivers: []string{},
-		Capabilities: map[string]any{}, OS: runtime.GOOS, Arch: runtime.GOARCH}
-	req.Hostname, _ = os.Hostname()
+		Capabilities: map[string]any{}, OS: runtime.GOOS, Arch: runtime.GOARCH, Robot: a.robot, Name: a.name}
+	if req.Name == "" {
+		req.Name, _ = os.Hostname()
+	}
 	names := make([]string, 0, len(descs))
 	for n := range descs {
 		names = append(names, n)
@@ -246,6 +266,63 @@ func cmdPair(g *globals, code, server, kind string, force bool, stdout io.Writer
 	}
 	fmt.Fprintf(stdout, "Paired as %s. Credential saved to %s (mode 600).\n", creds.DeviceID, g.paths.CredentialFile())
 	fmt.Fprintln(stdout, "Confirm the device on openvibe.bot, then start it: `openvibe-node run` or `sudo openvibe-node install`.")
+	if service.Status(serviceOptions(g, "")) == "running" {
+		_ = service.Control(serviceOptions(g, ""), "restart")
+		fmt.Fprintln(stdout, "The service was running and has been restarted with the new credential.")
+	}
+	return nil
+}
+
+// stdin is where `credential set` reads the secret; tests replace it.
+var stdin io.Reader = os.Stdin
+
+// cmdCredentialSet stores a rotated credential in credential.json (mode 600) without ever printing it. The input is
+// the credential alone, or the JSON answer of POST /api/v1/devices/<id>/rotate ({device, credential, publish_key}).
+func cmdCredentialSet(g *globals, in io.Reader, stdout io.Writer) error {
+	creds, err := credentials.Load(g.paths.CredentialFile(), nil)
+	if err != nil {
+		return fmt.Errorf("not paired yet (pair first with `openvibe-node pair <CODE>`): %w", err)
+	}
+	raw, err := io.ReadAll(io.LimitReader(in, 64<<10))
+	if err != nil {
+		return fmt.Errorf("read stdin: %w", err)
+	}
+	text := strings.TrimSpace(string(raw))
+	var cred, publishKey string
+	if strings.HasPrefix(text, "{") {
+		var r struct {
+			Device struct {
+				ID string `json:"id"`
+			} `json:"device"`
+			Credential string `json:"credential"`
+			PublishKey string `json:"publish_key"`
+		}
+		if err := json.Unmarshal([]byte(text), &r); err != nil {
+			return errors.New("stdin looks like JSON but does not parse; paste the rotate answer or the credential alone")
+		}
+		if r.Device.ID != "" && r.Device.ID != creds.DeviceID {
+			return fmt.Errorf("that credential is for %s, but this device is %s", r.Device.ID, creds.DeviceID)
+		}
+		cred, publishKey = strings.TrimSpace(r.Credential), strings.TrimSpace(r.PublishKey)
+	} else if fields := strings.Fields(text); len(fields) == 1 {
+		cred = fields[0]
+	}
+	if cred == "" {
+		return errors.New("no credential on stdin: pipe in the credential alone, or the rotate answer's JSON")
+	}
+	creds.Credential = credentials.NewSecret(cred)
+	if publishKey != "" {
+		creds.PublishKey = credentials.NewSecret(publishKey)
+	}
+	if err := credentials.Save(g.paths.CredentialFile(), creds); err != nil {
+		return err
+	}
+	chownLikeDir(g.paths.CredentialFile(), g.paths.ConfigDir)
+	what := "Credential"
+	if publishKey != "" {
+		what = "Credential and publish key"
+	}
+	fmt.Fprintf(stdout, "%s updated for %s in %s (mode 600).\n", what, creds.DeviceID, g.paths.CredentialFile())
 	if service.Status(serviceOptions(g, "")) == "running" {
 		_ = service.Control(serviceOptions(g, ""), "restart")
 		fmt.Fprintln(stdout, "The service was running and has been restarted with the new credential.")
@@ -396,8 +473,8 @@ func cmdStatus(g *globals, asJSON bool, stdout io.Writer) error {
 		}
 		fmt.Fprintln(stdout)
 	}
-	if b := s.Telemetry.Battery; b != nil && b.Percent != nil {
-		fmt.Fprintf(stdout, "Battery:  %.0f%%\n", *b.Percent)
+	if b := s.Telemetry.Battery; b != nil {
+		fmt.Fprintf(stdout, "Battery:  %.0f%%\n", *b*100)
 	}
 	return nil
 }

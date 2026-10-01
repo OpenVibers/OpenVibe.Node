@@ -32,8 +32,6 @@ func init() {
 	plugins.BackoffMin = 50 * time.Millisecond
 }
 
-func f64(v float64) *float64 { return &v }
-
 type env struct {
 	t      *testing.T
 	srv    *fakebot.Server
@@ -67,16 +65,19 @@ func start(t *testing.T) *env {
 
 	srv := fakebot.New()
 	t.Cleanup(srv.Close)
-	srv.Config = protocol.Config{HeartbeatMS: 100, Limits: protocol.Limits{MaxSpeed: f64(0.5), MaxTurn: f64(0.4), MaxCommandMS: 1000}}
-	srv.AddCode("TEST2345")
-	creds, err := link.Pair(context.Background(), nil, srv.URL(), protocol.PairRequest{Code: "TEST2345", AgentVersion: "test",
-		DeviceKind: "onboard", Drivers: []string{"dryrun"}})
+	srv.SetConfig(100, map[string]any{"max_speed": 0.5, "max_turn": 0.4, "max_command_ms": 1000}, nil)
+	// Bot looks the credential up after the upgrade: anything the Node sent before hello would be refused.
+	srv.SetHelloDelay(100 * time.Millisecond)
+	whip := &video.WHIPReceiver{}
+	srv.SetWHIP(whip) // so the pairing answer carries a whip_url (Bot does not send one yet)
+	t.Cleanup(whip.Close)
+	srv.AddRobotCode(fakebot.RobotID, "TEST2345")
+	creds, err := link.Pair(context.Background(), nil, srv.URL(), protocol.PairRequest{Robot: fakebot.RobotID, Code: "TEST2345",
+		AgentVersion: "test", DeviceKind: "onboard", Drivers: []string{"dryrun"}, Name: "rover"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	whip := &video.WHIPReceiver{PublishKey: creds.PublishKey.Reveal()}
-	srv.SetWHIP(whip)
-	t.Cleanup(whip.Close)
+	whip.PublishKey = creds.PublishKey.Reveal()
 
 	record := filepath.Join(home, "record.jsonl")
 	cfg := config.Default()
@@ -132,6 +133,7 @@ func (e *env) waitReady() {
 
 var seq int
 
+// cmd sends a command as Bot does, with its deadline deadline ms from now (0 = none), and returns the reply.
 func (e *env) cmd(kind, value string, deadline int) protocol.Message {
 	e.t.Helper()
 	seq++
@@ -141,7 +143,11 @@ func (e *env) cmd(kind, value string, deadline int) protocol.Message {
 
 func (e *env) cmdID(id, kind, value string, deadline int) protocol.Message {
 	e.t.Helper()
-	if err := e.conn.Send(protocol.Command{ID: id, Kind: kind, Value: json.RawMessage(value), DeadlineMS: deadline, Operator: "usr_1", Role: "operator"}); err != nil {
+	var at time.Time
+	if deadline != 0 {
+		at = time.Now().Add(time.Duration(deadline) * time.Millisecond)
+	}
+	if _, err := e.conn.Command(fakebot.Cmd{ID: id, Kind: kind, Value: json.RawMessage(value), Deadline: at}); err != nil {
 		e.t.Fatal(err)
 	}
 	r, err := e.conn.Reply(id, 5*time.Second)
@@ -207,20 +213,33 @@ func nackCode(m protocol.Message) string {
 func TestPairConnectAndStatus(t *testing.T) {
 	e := start(t)
 	reqs := e.srv.PairRequests()
-	if len(reqs) != 1 || reqs[0].Code != "TEST2345" {
+	if len(reqs) != 1 || reqs[0].Code != "TEST2345" || reqs[0].Robot != fakebot.RobotID || reqs[0].Name != "rover" {
 		t.Fatalf("%+v", reqs)
 	}
-	var sawEstopState bool
+	// status and estop_state wait for hello and config: nothing reached the server while it was checking the credential.
+	if n := e.conn.NotPaired(); n != 0 {
+		t.Fatalf("%d frames before hello", n)
+	}
+	var sawEstopState, sawStatus bool
 	for _, f := range e.conn.Frames() {
-		if f.Type == protocol.TypeEstopState {
+		switch m := f.Msg.(type) {
+		case protocol.EstopState:
 			sawEstopState = true
-			if f.Msg.(protocol.EstopState).Latched {
-				t.Fatal("latched on a fresh device")
+			if m.Latched || m.By != "device" {
+				t.Fatalf("estop_state %+v on a fresh device", m)
+			}
+		case protocol.Status:
+			sawStatus = true
+			if !strings.HasPrefix(m.Firmware, "openvibe-node-") || m.EstopLatched || m.Faults == nil {
+				t.Fatalf("status %+v", m)
 			}
 		}
 	}
-	if !sawEstopState {
-		t.Fatal("no estop_state after connect")
+	if !sawEstopState || !sawStatus {
+		t.Fatal("no estop_state or status after hello and config")
+	}
+	if on, _ := e.srv.RobotEstop(); on {
+		t.Fatal("the device latched the robot")
 	}
 	if e.srv.CredentialSeenInURL() {
 		t.Fatal("credential in URL")
@@ -263,8 +282,9 @@ func TestCommandsClampedAndIdempotent(t *testing.T) {
 	if v["throttle"] != 0.5 || v["steer"] != -0.4 {
 		t.Fatalf("not clamped to the owner limits: %s", drives[0].Value)
 	}
-	if drives[0].DeadlineMS != 300 {
-		t.Fatalf("deadline %d", drives[0].DeadlineMS)
+	// The plugin gets what is left of the absolute deadline (a few ms of slack: the clock offset is read from hello).
+	if d := drives[0].DeadlineMS; d > 310 || d < 200 {
+		t.Fatalf("deadline %d", d)
 	}
 	// Deadlines are capped at max_command_ms.
 	e.cmd("drive", `{"throttle":0.1}`, 60000)
@@ -280,6 +300,39 @@ func TestCommandsClampedAndIdempotent(t *testing.T) {
 	}
 	if r := e.cmd("say", `{"text":"hello"}`, 300); !isAck(r) {
 		t.Fatalf("%+v", r)
+	}
+}
+
+// TestExpiredNeverReachesPlugin: Bot's deadline_ms is an instant; a drive that arrives after it is refused.
+func TestExpiredNeverReachesPlugin(t *testing.T) {
+	e := start(t)
+	id := "expired-1"
+	if c := nackCode(e.cmdID(id, "drive", `{"throttle":0.3}`, -100)); c != protocol.FaultExpired {
+		t.Fatalf("%q", c)
+	}
+	if c := nackCode(e.cmdID("expired-2", "drive", `{"throttle":0.3}`, -60000)); c != protocol.FaultExpired {
+		t.Fatalf("%q", c)
+	}
+	time.Sleep(200 * time.Millisecond)
+	for _, r := range e.records() {
+		if r.What == "command" && strings.HasPrefix(r.ID, "expired-") {
+			t.Fatalf("an expired command reached the plugin: %+v", r)
+		}
+	}
+}
+
+// TestAllowedCommands: a kind missing from config.allowed_commands is refused; halt never is.
+func TestAllowedCommands(t *testing.T) {
+	e := start(t)
+	e.srv.SetConfig(0, nil, []string{"say"})
+	e.conn.Close()
+	e.conn = e.nextConn()
+	e.waitReady()
+	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultNotAllowed {
+		t.Fatalf("%q", c)
+	}
+	if !isAck(e.cmd("say", `{"text":"hi"}`, 0)) || !isAck(e.cmd("halt", `{}`, 0)) {
+		t.Fatal("an allowed kind or halt was refused")
 	}
 }
 
@@ -320,9 +373,12 @@ func TestEstopLatchedUntilOwnerClears(t *testing.T) {
 	e := start(t)
 	n := len(e.records())
 	e.cmd("drive", `{"throttle":0.3}`, 1000)
-	e.conn.Send(protocol.Estop{Reason: "owner", By: "usr_owner"})
+	e.conn.Estop(true, "usr_owner")
 	e.waitStop(n, time.Second)
-	if _, err := e.conn.Expect(protocol.TypeEstopState, 2*time.Second, func(m protocol.Message) bool { return m.(protocol.EstopState).Latched }); err != nil {
+	latched := func(want bool) func(protocol.Message) bool {
+		return func(m protocol.Message) bool { return m.(protocol.Status).EstopLatched == want }
+	}
+	if _, err := e.conn.Expect(protocol.TypeStatus, 2*time.Second, latched(true)); err != nil {
 		t.Fatal(err)
 	}
 	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultEstopped {
@@ -336,18 +392,53 @@ func TestEstopLatchedUntilOwnerClears(t *testing.T) {
 	if !l.State().Remote {
 		t.Fatal("e-stop not persisted")
 	}
-	// Survives a reconnect.
+	// Survives a reconnect (config.estop_latched is true too); the device never echoes the server's latch back.
 	e.conn.Close()
 	e.conn = e.nextConn()
-	if _, err := e.conn.Expect(protocol.TypeEstopState, 5*time.Second, func(m protocol.Message) bool { return m.(protocol.EstopState).Latched }); err != nil {
+	if _, err := e.conn.Expect(protocol.TypeStatus, 5*time.Second, latched(true)); err != nil {
 		t.Fatal(err)
 	}
-	e.conn.Send(protocol.EstopClear{By: "usr_owner"})
-	if _, err := e.conn.Expect(protocol.TypeEstopState, 2*time.Second, func(m protocol.Message) bool { return !m.(protocol.EstopState).Latched }); err != nil {
+	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultEstopped {
+		t.Fatalf("after reconnect: %q", c)
+	}
+	for _, f := range e.conn.Frames() {
+		if st, ok := f.Msg.(protocol.EstopState); ok && st.Latched {
+			t.Fatalf("remote latch echoed: %+v", st)
+		}
+	}
+	// The owner's clear is estop {latched:false}.
+	e.conn.Estop(false, "usr_owner")
+	if _, err := e.conn.Expect(protocol.TypeStatus, 2*time.Second, latched(false)); err != nil {
 		t.Fatal(err)
 	}
 	if r := e.cmd("drive", `{"throttle":0.3}`, 300); !isAck(r) {
 		t.Fatalf("after clear: %+v", r)
+	}
+	if l, _ := safety.OpenLatch(e.paths.LatchFile()); l.State().Remote {
+		t.Fatal("clear not persisted")
+	}
+}
+
+// TestConfigEstopOnReconnect: an e-stop set or cleared on the server while the device was away arrives in config and
+// is applied before any command.
+func TestConfigEstopOnReconnect(t *testing.T) {
+	e := start(t)
+	e.srv.SetRobotEstop(true, "usr_owner")
+	e.conn.Close()
+	e.conn = e.nextConn()
+	e.waitReady()
+	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultEstopped {
+		t.Fatalf("latched in config: %q", c)
+	}
+	if l, _ := safety.OpenLatch(e.paths.LatchFile()); !l.State().Remote {
+		t.Fatal("config latch not persisted")
+	}
+	e.srv.SetRobotEstop(false, "usr_owner")
+	e.conn.Close()
+	e.conn = e.nextConn()
+	e.waitReady()
+	if r := e.cmd("drive", `{"throttle":0.3}`, 300); !isAck(r) {
+		t.Fatalf("cleared in config: %+v", r)
 	}
 }
 
@@ -362,8 +453,13 @@ func TestLocalKillSwitch(t *testing.T) {
 	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultLocalStop {
 		t.Fatalf("%q", c)
 	}
-	// The owner's estop_clear does not clear the local kill switch.
-	e.conn.Send(protocol.EstopClear{By: "usr_owner"})
+	// The device reports its own latch (estop_state), so the robot shows e-stopped.
+	e.waitRobotEstop(true)
+	if _, by := e.srv.RobotEstop(); by != "device" {
+		t.Fatalf("robot e-stop by %q", by)
+	}
+	// The owner's clear does not clear the local kill switch.
+	e.conn.Estop(false, "usr_owner")
 	time.Sleep(100 * time.Millisecond)
 	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultLocalStop {
 		t.Fatalf("after server clear: %q", c)
@@ -373,6 +469,22 @@ func TestLocalKillSwitch(t *testing.T) {
 	}
 	if r := e.cmd("drive", `{"throttle":0.3}`, 300); !isAck(r) {
 		t.Fatalf("after resume: %+v", r)
+	}
+	e.waitRobotEstop(false) // resume reported with estop_state latched:false
+}
+
+// waitRobotEstop waits until the robot's e-stop on the server is want.
+func (e *env) waitRobotEstop(want bool) {
+	e.t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if on, _ := e.srv.RobotEstop(); on == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("robot e-stop never became %v", want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -442,7 +554,7 @@ func TestVideoAndTelemetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tl := f.Msg.(protocol.Telemetry); tl.Battery.Percent == nil || tl.Sensors["distance_cm"] == nil {
+	if tl := f.Msg.(protocol.Telemetry); *tl.Battery < 0 || *tl.Battery > 1 || tl.Voltage == nil || tl.Sensors["distance_cm"] == nil {
 		t.Fatalf("%+v", tl)
 	}
 	// ≤ 2 Hz.

@@ -63,13 +63,16 @@ func pythonPath(t *testing.T) string {
 func TestPair(t *testing.T) {
 	srv := fakebot.New()
 	defer srv.Close()
-	srv.AddCode("ABCD2345")
+	srv.AddRobotCode(fakebot.RobotID, "ABCD2345")
 	home := shortHome(t)
 	t.Setenv("PYTHONPATH", pythonPath(t))
 	if _, errOut, code := cli(t, "pair", "nope", "--home", home); code == 0 || !strings.Contains(errOut, "8 letters") {
 		t.Fatalf("bad code accepted: %s", errOut)
 	}
-	out, errOut, code := cli(t, "pair", "abcd-2345", "--home", home, "--server", srv.URL())
+	if _, errOut, code := cli(t, "pair", "abcd-2345", "--robot", "adeept", "--home", home); code == 0 || !strings.Contains(errOut, "rob_") {
+		t.Fatalf("kit name taken as a robot id: %s", errOut)
+	}
+	out, errOut, code := cli(t, "pair", "abcd-2345", "--home", home, "--server", srv.URL(), "--robot", fakebot.RobotID, "--name", "Rover")
 	if code != 0 {
 		t.Fatalf("pair failed: %s", errOut)
 	}
@@ -88,7 +91,7 @@ func TestPair(t *testing.T) {
 		t.Fatal("config not written")
 	}
 	reqs := srv.PairRequests()
-	if len(reqs) != 1 || reqs[0].Code != "ABCD2345" || reqs[0].AgentVersion != version {
+	if len(reqs) != 1 || reqs[0].Code != "ABCD2345" || reqs[0].AgentVersion != version || reqs[0].Robot != fakebot.RobotID || reqs[0].Name != "Rover" {
 		t.Fatalf("%+v", reqs)
 	}
 	if _, err := exec.LookPath("python3"); err == nil && len(reqs[0].Drivers) != 1 {
@@ -101,6 +104,62 @@ func TestPair(t *testing.T) {
 	out, _, code = cli(t, "status", "--home", home)
 	if code != 0 || !strings.Contains(out, "not running") || !strings.Contains(out, c.DeviceID) || strings.Contains(out, c.Credential.Reveal()) {
 		t.Fatalf("%d %s", code, out)
+	}
+}
+
+// TestCredentialSet stores a rotated credential from stdin without printing it.
+func TestCredentialSet(t *testing.T) {
+	srv := fakebot.New()
+	defer srv.Close()
+	srv.AddCode("ROTA2345")
+	home := shortHome(t)
+	t.Setenv("PYTHONPATH", pythonPath(t))
+	if _, errOut, code := cli(t, "pair", "ROTA-2345", "--home", home, "--server", srv.URL()); code != 0 {
+		t.Fatal(errOut)
+	}
+	if reqs := srv.PairRequests(); len(reqs) != 1 || reqs[0].Name == "" {
+		t.Fatalf("no default name (the hostname): %+v", reqs)
+	}
+	file := filepath.Join(home, "credential.json")
+	old, _ := credentials.Load(file, nil)
+	set := func(in string) (string, string, int) {
+		t.Helper()
+		stdin = strings.NewReader(in)
+		defer func() { stdin = os.Stdin }()
+		return cli(t, "credential", "set", "--home", home)
+	}
+	// The rotate answer as Bot returns it: both secrets are replaced.
+	body := srv.Rotate(old.Credential.Reveal(), time.Minute)
+	var rot struct {
+		Credential string `json:"credential"`
+		PublishKey string `json:"publish_key"`
+	}
+	if err := json.Unmarshal(body, &rot); err != nil {
+		t.Fatal(err)
+	}
+	out, errOut, code := set(string(body))
+	c, _ := credentials.Load(file, nil)
+	if code != 0 || c.Credential.Reveal() != rot.Credential || c.PublishKey.Reveal() != rot.PublishKey || c.DeviceID != old.DeviceID {
+		t.Fatalf("%d %s %s", code, out, errOut)
+	}
+	if strings.Contains(out+errOut, rot.Credential) || strings.Contains(out+errOut, rot.PublishKey) {
+		t.Fatal("a secret was printed")
+	}
+	if st, _ := os.Stat(file); runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %o", st.Mode().Perm())
+	}
+	// The credential alone keeps the publish key.
+	if _, errOut, code := set("plain-credential-0123456789\n"); code != 0 {
+		t.Fatal(errOut)
+	}
+	if c, _ := credentials.Load(file, nil); c.Credential.Reveal() != "plain-credential-0123456789" || c.PublishKey.Reveal() != rot.PublishKey {
+		t.Fatal("plain credential not stored")
+	}
+	if _, errOut, code := set(`{"device":{"id":"dev_other"},"credential":"x"}`); code == 0 || !strings.Contains(errOut, "dev_other") {
+		t.Fatalf("another device's credential accepted: %s", errOut)
+	}
+	if _, errOut, code := set("  \n"); code == 0 || !strings.Contains(errOut, "no credential") {
+		t.Fatalf("empty input accepted: %s", errOut)
 	}
 }
 
@@ -132,15 +191,16 @@ func TestRunDryRun(t *testing.T) {
 	srv := fakebot.New()
 	defer srv.Close()
 	srv.AddCode("WXYZ6789")
+	whip := &video.WHIPReceiver{}
+	srv.SetWHIP(whip) // so the pairing answer carries a whip_url (Bot does not send one yet)
+	defer whip.Close()
 	home := shortHome(t)
 	t.Setenv("PYTHONPATH", pythonPath(t))
 	if _, errOut, code := cli(t, "pair", "WXYZ-6789", "--home", home, "--server", srv.URL()); code != 0 {
 		t.Fatal(errOut)
 	}
 	c, _ := credentials.Load(filepath.Join(home, "credential.json"), nil)
-	whip := &video.WHIPReceiver{PublishKey: c.PublishKey.Reveal()}
-	srv.SetWHIP(whip)
-	defer whip.Close()
+	whip.PublishKey = c.PublishKey.Reveal()
 
 	exe, _ := os.Executable()
 	cmd := exec.Command(exe, "run", "--dry-run", "--home", home)
@@ -170,7 +230,7 @@ func TestRunDryRun(t *testing.T) {
 	}
 	send := func(id, kind, value string) protocol.Message {
 		t.Helper()
-		conn.Send(protocol.Command{ID: id, Kind: kind, Value: json.RawMessage(value), DeadlineMS: 300})
+		conn.Command(fakebot.Cmd{ID: id, Kind: kind, Value: json.RawMessage(value), Deadline: time.Now().Add(300 * time.Millisecond)})
 		r, err := conn.Reply(id, 5*time.Second)
 		if err != nil {
 			t.Fatal(err)

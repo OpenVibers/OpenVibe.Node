@@ -1,8 +1,9 @@
 // Package protocol holds every wire detail of the link between the Node and OpenVibe.Bot: the pairing request, the
-// device WebSocket's frame envelope, each message type, fault codes and the endpoint paths. Nothing outside this
-// package knows a JSON field name, so aligning with the service's docs/protocol.md is a change to this package only.
+// device WebSocket's frame envelope, each message type, fault codes, close codes and the endpoint paths. Nothing
+// outside this package knows a JSON field name, so aligning with the service's docs/protocol.md is a change to this
+// package only.
 //
-// Source of truth: ADR-043 decisions 1, 2, 4, 5 and 6 (bot.device-message@1).
+// Source of truth: OpenVibe.Bot docs/protocol.md and server/realtime.js (ADR-043 decisions 1, 2, 4, 5 and 6).
 package protocol
 
 import (
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Version is the envelope version, the `v` field of every frame.
@@ -27,8 +29,8 @@ const (
 	TypeConfig       = "config"
 	TypeCommand      = "command"
 	TypeEstop        = "estop"
-	TypeEstopClear   = "estop_clear"
 	TypeHeartbeatAck = "heartbeat_ack"
+	TypeError        = "error"
 )
 
 // Device → server message types.
@@ -39,6 +41,13 @@ const (
 	TypeNack       = "nack"
 	TypeHeartbeat  = "heartbeat"
 	TypeEstopState = "estop_state"
+)
+
+// WebSocket close codes the server uses on /device.
+const (
+	CloseReplaced      = 4000 // a newer connection of this device replaced this one
+	CloseBadCredential = 4002 // the credential is unknown (or the rotated one's grace period is over)
+	CloseRevoked       = 4003 // the owner revoked the device
 )
 
 // Command kinds.
@@ -54,7 +63,8 @@ const (
 // Kinds lists every command kind the Node understands.
 var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt}
 
-// GuardedKinds move something and are refused while an e-stop or the local kill switch is latched.
+// GuardedKinds move something: they carry a deadline and are refused while an e-stop or the local kill switch is
+// latched.
 var GuardedKinds = map[string]bool{KindDrive: true, KindActuator: true, KindPTZ: true}
 
 // Fault codes carried in nack.fault_code and status.faults[].code.
@@ -62,11 +72,12 @@ const (
 	FaultBadFrame      = "bad_frame"      // the command could not be parsed
 	FaultBadValue      = "bad_value"      // a value is missing, not a number, or out of shape
 	FaultUnsupported   = "unsupported"    // no driver on this device handles the kind or the actuator
-	FaultNotAllowed    = "not_allowed"    // the kind is not in config.allowed
+	FaultNotAllowed    = "not_allowed"    // the kind is not in config.allowed_commands
+	FaultExpired       = "expired"        // the command's deadline had passed when it arrived; it never ran
 	FaultEstopped      = "estopped"       // the remote e-stop is latched
 	FaultLocalStop     = "local_stop"     // the local kill switch (`openvibe-node stop`) is latched
 	FaultNoHeartbeat   = "no_heartbeat"   // a plugin lost the core's heartbeat
-	FaultNotReady      = "not_ready"      // the driver is starting or restarting
+	FaultNotReady      = "not_ready"      // the driver is starting or restarting, or the server's config has not arrived
 	FaultPluginDown    = "plugin_down"    // the driver process is not running
 	FaultPluginTimeout = "plugin_timeout" // the driver did not answer in time
 	FaultHardware      = "hardware"       // the driver reported a hardware error
@@ -104,11 +115,18 @@ type Frame struct {
 
 // ---- server → device ----
 
+// Hello opens every authenticated connection.
 type Hello struct {
-	DeviceID   string `json:"device_id,omitempty"`
-	RobotID    string `json:"robot_id,omitempty"`
-	Session    string `json:"session,omitempty"`
-	ServerTime int64  `json:"server_time,omitempty"`
+	SessionID  string   `json:"session_id,omitempty"`
+	DeviceID   string   `json:"device_id,omitempty"`
+	RobotIDs   []string `json:"robot_ids,omitempty"`
+	ServerTime string   `json:"server_time,omitempty"` // ISO-8601, e.g. 2026-09-29T19:20:00.000Z
+}
+
+// Time parses ServerTime; ok is false when it is absent or malformed.
+func (h Hello) Time() (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339Nano, h.ServerTime)
+	return t, err == nil && h.ServerTime != ""
 }
 
 type Limits struct {
@@ -118,35 +136,52 @@ type Limits struct {
 	MaxCommandMS int      `json:"max_command_ms,omitempty"`
 }
 
+// Config follows hello.
 type Config struct {
-	Limits      Limits   `json:"limits"`
-	HeartbeatMS int      `json:"heartbeat_ms,omitempty"`
-	DeadmanMS   int      `json:"deadman_ms,omitempty"`
-	TelemetryMS int      `json:"telemetry_ms,omitempty"`
-	Allowed     []string `json:"allowed,omitempty"` // command kinds the current operator may send; empty = all
+	HeartbeatMS int    `json:"heartbeat_ms,omitempty"`
+	Limits      Limits `json:"limits"`
+	// AllowedCommands lists the kinds the robot accepts. Absent (nil) = no restriction; present = only these (halt is
+	// always accepted: stopping is never refused).
+	AllowedCommands []string `json:"allowed_commands"`
+	// EstopLatched is the robot's e-stop on the server. Absent = unchanged.
+	EstopLatched *bool `json:"estop_latched,omitempty"`
+}
+
+// Operator is who sent a command.
+type Operator struct {
+	Subject string `json:"subject,omitempty"`
+	Role    string `json:"role,omitempty"`
 }
 
 type Command struct {
-	ID         string          `json:"id"`
+	ID         string          `json:"id"` // server-minted; the idempotency key on the device
+	Ref        string          `json:"ref,omitempty"`
 	Kind       string          `json:"kind"`
 	Value      json.RawMessage `json:"value,omitempty"`
-	DeadlineMS int             `json:"deadline_ms,omitempty"` // milliseconds from receipt; see docs/protocol.md
-	Operator   string          `json:"operator,omitempty"`
-	Role       string          `json:"role,omitempty"`
+	DeadlineMS int64           `json:"deadline_ms,omitempty"` // absolute epoch ms; motion kinds only
+	Operator   *Operator       `json:"operator,omitempty"`
+	RobotID    string          `json:"robot_id,omitempty"`
 	Target     string          `json:"target,omitempty"` // optional driver name; default: the first driver with the capability
 }
 
+// Estop is the server's e-stop: latched:true latches; latched:false is the owner's clear.
 type Estop struct {
-	Reason string `json:"reason,omitempty"`
-	By     string `json:"by,omitempty"`
+	Latched bool   `json:"latched"`
+	By      string `json:"by,omitempty"`
+	At      string `json:"at,omitempty"`
 }
 
-type EstopClear struct {
-	By string `json:"by,omitempty"`
-}
-
+// HeartbeatAck answers a heartbeat. Bot echoes the heartbeat's seq in the envelope seq field (overwriting its own);
+// Echo carries it instead once the server sends a separate correlation field.
 type HeartbeatAck struct {
-	T int64 `json:"t"`
+	Echo       *uint64 `json:"echo,omitempty"`
+	ServerTime string  `json:"server_time,omitempty"`
+}
+
+// Error is a frame the server refused.
+type Error struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // ---- device → server ----
@@ -165,21 +200,20 @@ type Fault struct {
 	Message string `json:"message,omitempty"`
 }
 
+// Status is sent once hello and config have arrived, and on every change. Bot reads firmware, capabilities, faults
+// and estop_latched and shows the frame as it is; the other fields are for people reading it.
 type Status struct {
+	Firmware     string         `json:"firmware"`
+	Capabilities map[string]any `json:"capabilities"`
+	Faults       []Fault        `json:"faults"`
+	EstopLatched bool           `json:"estop_latched"` // anything latched on the device (remote or local)
+	LocalStop    bool           `json:"local_stop"`
 	AgentVersion string         `json:"agent_version"`
 	DeviceKind   string         `json:"device_kind,omitempty"`
 	OS           string         `json:"os,omitempty"`
 	Arch         string         `json:"arch,omitempty"`
 	Drivers      []DriverStatus `json:"drivers"`
-	Faults       []Fault        `json:"faults"`
-	EstopLatched bool           `json:"estop_latched"`
-	LocalStop    bool           `json:"local_stop"`
 	Video        string         `json:"video,omitempty"`
-}
-
-type Battery struct {
-	Volts   *float64 `json:"volts,omitempty"`
-	Percent *float64 `json:"percent,omitempty"`
 }
 
 type Event struct {
@@ -189,8 +223,11 @@ type Event struct {
 	Fields map[string]any `json:"fields,omitempty"`
 }
 
+// Telemetry is at most 2 Hz (the server drops faster frames). Battery is the charge as a fraction 0..1 and Voltage
+// the pack voltage, as Bot's robot_state shows them.
 type Telemetry struct {
-	Battery *Battery       `json:"battery,omitempty"`
+	Battery *float64       `json:"battery,omitempty"`
+	Voltage *float64       `json:"voltage,omitempty"`
 	RSSI    *int           `json:"rssi,omitempty"`
 	Sensors map[string]any `json:"sensors,omitempty"`
 	Events  []Event        `json:"events,omitempty"`
@@ -207,22 +244,26 @@ type Nack struct {
 	Message   string `json:"message,omitempty"`
 }
 
+// Heartbeat is sent every heartbeat_ms; RTTMS is the round trip measured on the previous one.
 type Heartbeat struct {
-	T int64 `json:"t"`
+	RTTMS *int64 `json:"rtt_ms,omitempty"`
 }
 
+// EstopState reports a latch held on the device (the local kill switch). Bot sets the robot's e-stop to Latched, so
+// latched:false is only sent to lift a latch this device reported; see node.reportLatch.
 type EstopState struct {
-	Latched   bool   `json:"latched"`
-	LocalStop bool   `json:"local_stop"`
-	Reason    string `json:"reason,omitempty"`
+	Latched bool   `json:"latched"`
+	By      string `json:"by,omitempty"`
+	At      string `json:"at,omitempty"`
+	RobotID string `json:"robot_id,omitempty"`
 }
 
 func (Hello) MessageType() string        { return TypeHello }
 func (Config) MessageType() string       { return TypeConfig }
 func (Command) MessageType() string      { return TypeCommand }
 func (Estop) MessageType() string        { return TypeEstop }
-func (EstopClear) MessageType() string   { return TypeEstopClear }
 func (HeartbeatAck) MessageType() string { return TypeHeartbeatAck }
+func (Error) MessageType() string        { return TypeError }
 func (Status) MessageType() string       { return TypeStatus }
 func (Telemetry) MessageType() string    { return TypeTelemetry }
 func (Ack) MessageType() string          { return TypeAck }
@@ -235,8 +276,8 @@ var registry = map[string]func() Message{
 	TypeConfig:       func() Message { return &Config{} },
 	TypeCommand:      func() Message { return &Command{} },
 	TypeEstop:        func() Message { return &Estop{} },
-	TypeEstopClear:   func() Message { return &EstopClear{} },
 	TypeHeartbeatAck: func() Message { return &HeartbeatAck{} },
+	TypeError:        func() Message { return &Error{} },
 	TypeStatus:       func() Message { return &Status{} },
 	TypeTelemetry:    func() Message { return &Telemetry{} },
 	TypeAck:          func() Message { return &Ack{} },
@@ -305,9 +346,9 @@ func derefMessage(m Message) Message {
 		return *v
 	case *Estop:
 		return *v
-	case *EstopClear:
-		return *v
 	case *HeartbeatAck:
+		return *v
+	case *Error:
 		return *v
 	case *Status:
 		return *v
@@ -334,14 +375,16 @@ const (
 )
 
 type PairRequest struct {
+	// Robot (rob_…, from the installer command or QR) charges a wrong code to that robot's live code (5 tries end it).
+	Robot        string         `json:"robot,omitempty"`
 	Code         string         `json:"code"`
 	AgentVersion string         `json:"agent_version"`
 	DeviceKind   string         `json:"device_kind"`
 	Drivers      []string       `json:"drivers"`
 	Capabilities map[string]any `json:"capabilities"`
+	Name         string         `json:"name,omitempty"` // shown to the owner; default: the hostname
 	OS           string         `json:"os,omitempty"`
 	Arch         string         `json:"arch,omitempty"`
-	Hostname     string         `json:"hostname,omitempty"`
 }
 
 type ICEServer struct {
@@ -354,14 +397,30 @@ type PairResponse struct {
 	DeviceID   string          `json:"device_id"`
 	Credential string          `json:"credential"`
 	PublishKey string          `json:"publish_key"`
+	RobotID    string          `json:"robot_id,omitempty"`
 	Profile    json.RawMessage `json:"profile,omitempty"`
-	WHIPURL    string          `json:"whip_url,omitempty"`
+	WHIPURL    string          `json:"whip_url,omitempty"`   // not sent by Bot yet; video starts only when present
 	DeviceURL  string          `json:"device_url,omitempty"` // optional override of wss://<origin>/device
 	ICEServers []ICEServer     `json:"ice_servers,omitempty"`
 }
 
-// PairError is the body of a non-2xx pairing answer.
-type PairError struct {
-	Error   string `json:"error"`
-	Message string `json:"message,omitempty"`
+// Problem is an RFC 9457 problem+json body, Bot's shape for every HTTP error.
+type Problem struct {
+	Type   string `json:"type,omitempty"`
+	Title  string `json:"title,omitempty"`
+	Status int    `json:"status,omitempty"`
+	Code   string `json:"code,omitempty"`
+	Detail string `json:"detail,omitempty"`
+	Error  string `json:"error,omitempty"` // Bot repeats detail here for older clients
 }
+
+// Pairing problem codes (Bot domain/index.js redeem and the pair rate limit).
+const (
+	ProblemCodeShape   = "bot.invalid_pairing_code" // 422: not 8 characters
+	ProblemNoCode      = "bot.no_pairing_code"      // 404: the robot has no live code
+	ProblemCodeInvalid = "bot.pairing_code_invalid" // 403: wrong code (a try is charged when robot is sent)
+	ProblemCodeLocked  = "bot.pairing_code_locked"  // 403: five wrong tries
+	ProblemCodeUsed    = "bot.pairing_code_used"    // 403
+	ProblemCodeExpired = "bot.pairing_code_expired" // 403: older than 10 minutes
+	ProblemRateLimited = "rate_limited"             // 429
+)
