@@ -111,10 +111,10 @@ func TestPair(t *testing.T) {
 func TestCredentialSet(t *testing.T) {
 	srv := fakebot.New()
 	defer srv.Close()
-	srv.AddCode("ROTA2345")
+	srv.AddCode("RQTA2345")
 	home := shortHome(t)
 	t.Setenv("PYTHONPATH", pythonPath(t))
-	if _, errOut, code := cli(t, "pair", "ROTA-2345", "--home", home, "--server", srv.URL()); code != 0 {
+	if _, errOut, code := cli(t, "pair", "RQTA-2345", "--home", home, "--server", srv.URL()); code != 0 {
 		t.Fatal(errOut)
 	}
 	if reqs := srv.PairRequests(); len(reqs) != 1 || reqs[0].Name == "" {

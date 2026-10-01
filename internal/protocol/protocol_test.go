@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func i64(v int64) *int64 { return &v }
+func i64(v int64) *int64     { return &v }
 func f64(v float64) *float64 { return &v }
 
 func TestEncodeDecodeRoundTrip(t *testing.T) {
