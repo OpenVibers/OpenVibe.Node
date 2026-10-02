@@ -137,8 +137,8 @@ type VideoConfig struct {
 	FPS     int      `json:"fps,omitempty"`
 	Width   int      `json:"width,omitempty"`
 	Height  int      `json:"height,omitempty"`
-	// WHIPURL is where the camera publishes (with the pairing's publish key). OpenVibe.Bot does not hand one out,
-	// so video stays off until it is set here.
+	// WHIPURL is where the camera publishes (with the pairing's publish key). The pair response carries it (Bot
+	// mints one per device); when it is empty, video stays off until it is set here.
 	WHIPURL string `json:"whip_url,omitempty"`
 }
 

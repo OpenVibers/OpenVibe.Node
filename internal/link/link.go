@@ -73,7 +73,6 @@ type Link struct {
 	mu        sync.Mutex
 	out       chan []byte
 	seq       uint64
-	hbSent    map[uint64]time.Time // heartbeat seq → send time, for the RTT
 	heartbeat time.Duration
 	deadman   time.Duration
 
@@ -196,19 +195,15 @@ func (l *Link) Send(m protocol.Message) error {
 	l.seq++
 	now := time.Now()
 	if hb, ok := m.(protocol.Heartbeat); ok {
-		// The body seq equals the envelope seq, so heartbeat_ack's echo is the same whichever the server reads.
+		// The body seq still mirrors the envelope's (older servers echo it); t is the send time Bot echoes back as
+		// heartbeat_ack.t/echo, and rtt_ms is the last measured round trip, once there is one on this connection.
 		hb.Seq = l.seq
+		hb.T = now.UnixMilli()
 		if rtt := l.lastRTT.Load(); rtt > 0 {
 			ms := time.Duration(rtt).Milliseconds()
 			hb.RTTMS = &ms
 		}
 		m = hb
-		for s := range l.hbSent {
-			if s+8 < l.seq {
-				delete(l.hbSent, s)
-			}
-		}
-		l.hbSent[l.seq] = now
 	}
 	b, err := protocol.Encode(l.seq, now.UnixMilli(), m)
 	if err != nil {
@@ -326,8 +321,10 @@ func (l *Link) session(ctx context.Context) error {
 	// Nothing is sent until the server's hello: until then the socket is not authenticated.
 	out := make(chan []byte, 256)
 	l.mu.Lock()
-	l.out, l.seq, l.hbSent, l.hasSkew = nil, 0, map[uint64]time.Time{}, false
+	l.out, l.seq, l.hasSkew = nil, 0, false
 	l.mu.Unlock()
+	// A fresh connection has no measured round trip: the first heartbeat must not claim one.
+	l.lastRTT.Store(0)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	var endErr error
@@ -427,13 +424,16 @@ func (l *Link) session(ctx context.Context) error {
 		l.observe(f.TS, rx)
 		switch m := f.Msg.(type) {
 		case protocol.HeartbeatAck:
-			l.mu.Lock()
-			sent, ok := l.hbSent[m.Seq]
-			delete(l.hbSent, m.Seq)
-			l.mu.Unlock()
-			if ok {
+			// Bot's envelope seq is its own counter, so the round trip is measured from the device send time it
+			// echoes back as t (and, on newer Bot, echo: the same value, or null). Nothing to measure when neither
+			// is present.
+			echo := m.T
+			if echo == 0 && m.Echo != nil {
+				echo = *m.Echo
+			}
+			if rtt := time.Now().UnixMilli() - echo; echo > 0 && rtt >= 0 {
 				// A coarse clock (Windows) can read 0 on a fast loopback; 0 means "not measured yet", so floor at 1 ns.
-				l.lastRTT.Store(int64(max(time.Since(sent), 1)))
+				l.lastRTT.Store(int64(max(time.Duration(rtt)*time.Millisecond, 1)))
 			}
 			continue
 		case protocol.Error:
