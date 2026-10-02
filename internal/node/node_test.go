@@ -122,6 +122,14 @@ func (e *env) nextConn() *fakebot.Conn {
 
 func (e *env) waitReady() {
 	e.t.Helper()
+	e.waitStatus()
+	e.waitEstopState()
+}
+
+// waitStatus waits for the ready status frame on the current connection (markReady sends it once hello and config
+// have both arrived, so it also means the server's config has been applied).
+func (e *env) waitStatus() {
+	e.t.Helper()
 	_, err := e.conn.Expect(protocol.TypeStatus, 20*time.Second, func(m protocol.Message) bool {
 		s := m.(protocol.Status)
 		return len(s.Drivers) == 1 && s.Drivers[0].State == plugins.StateReady
@@ -129,10 +137,16 @@ func (e *env) waitReady() {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	// markReady sends status then estop_state on every connection, and the fake server mirrors the device's estop_state
-	// onto the robot. Waiting for the frame keeps a test from setting the robot's e-stop while the first connection's
-	// estop_state {latched:false} is still in flight and would clear it again. Frames, not Expect: the estop_state may
-	// precede the ready status, and Expect above would have skipped it.
+}
+
+// waitEstopState waits for the device's own estop_state on the current connection. The fake server mirrors it onto
+// the robot, so waiting keeps a test from setting the robot's e-stop while an earlier estop_state {latched:false} is
+// still in flight and would clear it again. Frames, not Expect: the estop_state may precede the ready status, and an
+// Expect would have skipped it. The device sends no estop_state while the server's latch is set and its own kill
+// switch is not — it must never echo the server's latch back, because Bot would take that as a clear — so a test
+// reconnecting to a robot the server has latched waits for the status only.
+func (e *env) waitEstopState() {
+	e.t.Helper()
 	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		for _, f := range e.conn.Frames() {
 			if f.Type == protocol.TypeEstopState {
@@ -444,7 +458,9 @@ func TestConfigEstopOnReconnect(t *testing.T) {
 	e.srv.SetRobotEstop(true, "usr_owner")
 	e.conn.Close()
 	e.conn = e.nextConn()
-	e.waitReady()
+	// The server latched the robot: config carries estop_latched and the device sends no estop_state for it (it never
+	// echoes the server's latch back), so wait for the ready status, not for that frame.
+	e.waitStatus()
 	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultEstopped {
 		t.Fatalf("latched in config: %q", c)
 	}

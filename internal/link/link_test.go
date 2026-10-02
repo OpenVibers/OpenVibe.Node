@@ -147,9 +147,18 @@ func TestConnectHelloConfigHeartbeat(t *testing.T) {
 	if l.Stats().RTT <= 0 {
 		t.Fatal("no RTT measured")
 	}
-	// The measured round trip goes back to the server as rtt_ms on the next heartbeat.
-	if rtt, ok := c.RTT(); !ok || rtt < 0 {
-		t.Fatalf("server saw no rtt_ms (%d %v)", rtt, ok)
+	// The measured round trip goes back to the server as rtt_ms on a later heartbeat. The ack that sets the RTT
+	// above and the heartbeat carrying it are separate frames, so poll rather than assuming the next one has
+	// already been read; on a slow runner the ack can land just as the check above runs.
+	var rtt int64
+	var ok bool
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if rtt, ok = c.RTT(); ok && rtt >= 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server saw no rtt_ms within 5s (%d %v)", rtt, ok)
+		}
 	}
 	if c.NotPaired() != 0 {
 		t.Fatalf("%d frames sent before hello", c.NotPaired())
