@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tests install.sh's handling of the Adeept kit's stock-server autostart: crontab (root's and the invoking
 # user's, including @reboot lines) and /etc/rc.local. The OPENVIBE_* test overrides point the checks at files in
-# a temp dir, so this needs no root and touches no real crontab or /etc/rc.local.
+# a temp dir, so this needs no root and touches no real crontab, rc.local, service or process.
 set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -95,5 +95,38 @@ printf '%s\n' "$out3"
 if printf '%s\n' "$out3" | grep -q "stock server"; then fail "reported changes on a host without the kit"; fi
 grep -qx '0 5 \* \* \* /usr/bin/echo hello' "$none/cron" || fail "unrelated cron line changed without the kit"
 grep -qx '#!/bin/sh' "$none/rc" || fail "unrelated rc.local changed without the kit"
+
+# Without SUDO_USER, the normal install path must still scan the logged-in user's crontab. Mock the system commands
+# so this checks user selection without touching any real crontab, even when CI runs as root.
+mock_bin="$tmp/mock-bin"
+mkdir -p "$mock_bin"
+cat > "$mock_bin/id" <<'EOF'
+#!/bin/sh
+case "$1" in
+	-un) printf '%s\n' invoking_user ;;
+	pi) exit 1 ;;
+	*) exit 1 ;;
+esac
+EOF
+cat > "$mock_bin/crontab" <<'EOF'
+#!/bin/sh
+[ "$1" = -u ] && [ "$2" = invoking_user ] || exit 1
+case "$3" in
+	-l) cat "$MOCK_USER_CRON" ;;
+	*) cp "$3" "$MOCK_USER_CRON" ;;
+esac
+EOF
+chmod +x "$mock_bin/id" "$mock_bin/crontab"
+fallback_cron="$tmp/fallback-crontab"
+printf '%s\n' '@reboot python3 /home/pi/adeept_awr/Server/Server_OrdinaryWheels/WebServer.py' > "$fallback_cron"
+out4="$(
+	unset SUDO_USER
+	PATH="$mock_bin:$PATH" MOCK_USER_CRON="$fallback_cron" OPENVIBE_INSTALL_STOCK_ONLY=1 \
+		OPENVIBE_CRONTAB_ROOT="$root_cron" OPENVIBE_CRONTAB_USER='' OPENVIBE_RC_LOCAL="$rc_local" sh "$installer"
+)"
+printf '%s\n' "$out4" | grep -q 'stock server autostart in the crontab of invoking_user' ||
+	fail "logged-in user's crontab was not scanned without SUDO_USER"
+grep -q '^#openvibe-node-disabled: @reboot python3 /home/pi/adeept_awr/Server/Server_OrdinaryWheels/WebServer\.py$' \
+	"$fallback_cron" || fail "logged-in user's stock line was not commented out"
 
 printf 'ok: install.sh stock-server crontab/rc.local handling\n'

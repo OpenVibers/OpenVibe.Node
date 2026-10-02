@@ -84,7 +84,10 @@ SUDO=""
 # (marked, never deleted) so they cannot start it again.
 STOCK_SERVER_RE='Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py'
 STOCK_SERVER_MARKER='#openvibe-node-disabled:'
+# Root's crontab is always scanned. Scan the invoking user's crontab on the normal install path or through sudo.
+# From a plain root shell (sudo -i, root login), use the kit's usual owner pi when that account exists.
 CRON_USER="${SUDO_USER:-$(id -un 2>/dev/null || printf '%s' root)}"
+if [ "$CRON_USER" = root ] && id pi >/dev/null 2>&1; then CRON_USER=pi; fi
 
 # Comment out the stock-server lines in one crontab-like file: read $1, write $2, print one line per disabled
 # entry. A line whose first non-blank character is "#" is left alone, so our marker makes a second run a no-op.
@@ -137,16 +140,20 @@ disable_stock_rc_local() {
 }
 
 disable_stock_server() {
-	if command -v systemctl >/dev/null 2>&1; then
-		unit=Adeept_Robot.service
-		if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
-			say "disabling the Adeept kit's stock server ($unit): it listens on 0.0.0.0:8888 with a fixed password"
-			$SUDO systemctl disable --now "$unit" || true
+	# The OPENVIBE_* file overrides are test-only: when any is set they point the crontab/rc.local checks at temp
+	# files, so skip the real systemd and running-process branches too (a test must touch no service or process).
+	if [ -z "${OPENVIBE_CRONTAB_ROOT:-}${OPENVIBE_CRONTAB_USER:-}${OPENVIBE_RC_LOCAL:-}" ]; then
+		if command -v systemctl >/dev/null 2>&1; then
+			unit=Adeept_Robot.service
+			if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
+				say "disabling the Adeept kit's stock server ($unit): it listens on 0.0.0.0:8888 with a fixed password"
+				$SUDO systemctl disable --now "$unit" || true
+			fi
 		fi
-	fi
-	if command -v pgrep >/dev/null 2>&1 && pgrep -f "$STOCK_SERVER_RE" >/dev/null 2>&1; then
-		say "stopping a running Adeept stock server process"
-		$SUDO pkill -f "$STOCK_SERVER_RE" || true
+		if command -v pgrep >/dev/null 2>&1 && pgrep -f "$STOCK_SERVER_RE" >/dev/null 2>&1; then
+			say "stopping a running Adeept stock server process"
+			$SUDO pkill -f "$STOCK_SERVER_RE" || true
+		fi
 	fi
 	# Autostart: root's crontab and the invoking user's, then rc.local. OPENVIBE_CRONTAB_* / OPENVIBE_RC_LOCAL
 	# are test-only file overrides so the checks can run without root and without touching the real system.
@@ -156,8 +163,8 @@ disable_stock_server() {
 		disable_stock_crontab root
 	fi
 	if [ -n "${OPENVIBE_CRONTAB_USER:-}" ]; then
-		disable_stock_file "$OPENVIBE_CRONTAB_USER" "the crontab of $CRON_USER"
-	elif [ "$CRON_USER" != root ]; then
+		disable_stock_file "$OPENVIBE_CRONTAB_USER" "the crontab of ${CRON_USER:-$(id -un 2>/dev/null || printf '%s' root)}"
+	elif [ -n "$CRON_USER" ] && [ "$CRON_USER" != root ]; then
 		disable_stock_crontab "$CRON_USER"
 	fi
 	if [ -n "${OPENVIBE_RC_LOCAL:-}" ]; then
