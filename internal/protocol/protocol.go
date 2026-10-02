@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 )
 
 // Version is the envelope version, the `v` field of every frame.
@@ -53,6 +54,59 @@ const (
 	TypeNack       = "nack"
 	TypeHeartbeat  = "heartbeat"
 	TypeEstopState = "estop_state"
+)
+
+// Job frames (OpenVibe.Contracts platform.job-frame@1). Server → device: job, job_cancel, job_exit_ack. Device →
+// server: job_started, job_stdout, job_usage, job_exit. A job is accepted or refused with ack/nack keyed by its id.
+const (
+	TypeJob        = "job"
+	TypeJobCancel  = "job_cancel"
+	TypeJobExitAck = "job_exit_ack"
+	TypeJobStarted = "job_started"
+	TypeJobStdout  = "job_stdout"
+	TypeJobUsage   = "job_usage"
+	TypeJobExit    = "job_exit"
+)
+
+// Runtime classes (platform.runtime-class@1).
+const (
+	ClassFunction = "function"
+	ClassCode     = "code"
+	ClassBrowser  = "browser"
+	ClassLinux    = "linux"
+	ClassDesktop  = "desktop"
+	ClassGPU      = "gpu"
+)
+
+// RuntimeClasses lists every class the contract names; a worker runs only those it advertises.
+var RuntimeClasses = []string{ClassFunction, ClassCode, ClassBrowser, ClassLinux, ClassDesktop, ClassGPU}
+
+// NetDeny is the only job network policy (and the default when net is absent).
+const NetDeny = "deny"
+
+// CapWorker is the status.capabilities key a worker advertises its runtime classes under (WorkerCapabilities). It is
+// present only when the Node runs at least one class.
+const CapWorker = "worker"
+
+// Job refusal reasons, carried in nack.message (nack.fault_code is bad_value, bad_frame or unsupported).
+const (
+	JobBadID          = "missing or malformed job id"
+	JobBadFrame       = "malformed job"
+	JobUnknownClass   = "unknown class"
+	JobNoArtifact     = "function job needs an artifact with an exact version"
+	JobNetUnsupported = "net policy not supported"
+	JobBadLimits      = "missing or invalid args, ttl_ms or limits"
+	JobNotAvailable   = "class not available"
+)
+
+// job_exit reasons.
+const (
+	ExitExited    = "exited"
+	ExitCancelled = "cancelled"
+	ExitTTL       = "ttl"
+	ExitLimit     = "limit"
+	ExitStopped   = "stopped"
+	ExitFailed    = "failed"
 )
 
 // Command kinds.
@@ -185,7 +239,159 @@ type Error struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+// JobLimits are the caps the worker enforces on a running job.
+type JobLimits struct {
+	WallMS   int64 `json:"wall_ms"`
+	CPUMS    int64 `json:"cpu_ms"`
+	MemBytes int64 `json:"mem_bytes"`
+}
+
+// Artifact is the pre-registered artifact a function job runs, at one exact version.
+type Artifact struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+// Job is platform.job@1.
+type Job struct {
+	ID       string          `json:"id"` // job_<ULID>, minted by the dispatcher: the idempotency and ack key
+	Class    string          `json:"class"`
+	Artifact *Artifact       `json:"artifact,omitempty"`
+	Args     json.RawMessage `json:"args"`
+	TTLMS    int64           `json:"ttl_ms"`
+	Limits   JobLimits       `json:"limits"`
+	Net      string          `json:"net,omitempty"` // absent means deny
+}
+
+// JobRequest is the `job` frame: run Job. A body that does not decode still yields the frame, with Err set and the
+// id when it is a string, so the Node can nack it rather than drop it (the server resends a job until it is answered).
+type JobRequest struct {
+	Job Job   `json:"job"`
+	Err error `json:"-"`
+}
+
+func (r *JobRequest) UnmarshalJSON(b []byte) error {
+	var outer struct {
+		Job json.RawMessage `json:"job"`
+	}
+	if err := json.Unmarshal(b, &outer); err != nil {
+		return err
+	}
+	*r = JobRequest{}
+	if len(outer.Job) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(outer.Job, &r.Job); err != nil {
+		var id struct {
+			ID any `json:"id"`
+		}
+		_ = json.Unmarshal(outer.Job, &id)
+		s, _ := id.ID.(string)
+		r.Job, r.Err = Job{ID: s}, err
+	}
+	return nil
+}
+
+var (
+	jobIDRe       = regexp.MustCompile(`^job_[0-9A-HJKMNP-TV-Z]{26}$`)
+	artifactRe    = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	artifactVerRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$`)
+)
+
+// ValidJobID reports whether id is a job_<ULID>.
+func ValidJobID(id string) bool { return jobIDRe.MatchString(id) }
+
+// Check returns the fault code and reason to nack this job with, or two empty strings when a worker running the
+// classes in available takes it. The checks run in this order, so the reason names the first problem.
+func (r JobRequest) Check(available []string) (fault, reason string) {
+	j := r.Job
+	switch {
+	case !ValidJobID(j.ID):
+		return FaultBadValue, JobBadID
+	case r.Err != nil:
+		return FaultBadFrame, JobBadFrame
+	case !contains(RuntimeClasses, j.Class):
+		return FaultUnsupported, JobUnknownClass
+	case j.Class == ClassFunction && (j.Artifact == nil || !artifactRe.MatchString(j.Artifact.Name) || !artifactVerRe.MatchString(j.Artifact.Version)):
+		return FaultBadValue, JobNoArtifact
+	case j.Net != "" && j.Net != NetDeny:
+		return FaultUnsupported, JobNetUnsupported
+	case !isObject(j.Args) || j.TTLMS < 1 || j.Limits.WallMS < 1 || j.Limits.CPUMS < 1 || j.Limits.MemBytes < 1:
+		return FaultBadValue, JobBadLimits
+	case !contains(available, j.Class):
+		return FaultUnsupported, JobNotAvailable
+	}
+	return "", ""
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func isObject(b json.RawMessage) bool {
+	b = bytes.TrimSpace(b)
+	return len(b) >= 2 && b[0] == '{'
+}
+
+// JobCancel stops a job; an unknown or ended id is ignored.
+type JobCancel struct {
+	ID string `json:"id"`
+}
+
+// JobExitAck tells the worker every usage reading of the job is recorded, so it stops resending job_exit.
+type JobExitAck struct {
+	ID string `json:"id"`
+}
+
 // ---- device → server ----
+
+// JobStarted: the job's process started at StartedMS (worker wall clock, Unix ms), which anchors every usage second.
+type JobStarted struct {
+	ID        string `json:"id"`
+	StartedMS int64  `json:"started_ms"`
+}
+
+// JobStdout is a chunk of the job's stdout. ChunkSeq is the job's own counter from 1 (the envelope owns seq).
+type JobStdout struct {
+	ID       string `json:"id"`
+	ChunkSeq uint64 `json:"chunk_seq"`
+	Chunk    string `json:"chunk"`
+}
+
+// JobUsage: wall-clock second Second (from 0 at StartedMS) of the job has fully elapsed. CPUMS is informational.
+type JobUsage struct {
+	ID        string `json:"id"`
+	StartedMS int64  `json:"started_ms"`
+	Second    int64  `json:"second"`
+	CPUMS     *int64 `json:"cpu_ms,omitempty"`
+}
+
+// JobExitUsage is a job_exit's authoritative usage; StartedMS is set whenever WallMS > 0.
+type JobExitUsage struct {
+	StartedMS    *int64 `json:"started_ms,omitempty"`
+	WallMS       int64  `json:"wall_ms"`
+	CPUMS        *int64 `json:"cpu_ms,omitempty"`
+	MemPeakBytes *int64 `json:"mem_peak_bytes,omitempty"`
+}
+
+// JobExit: the job ended. Code is null when the process was killed or never ran; Result is null unless it exited 0.
+type JobExit struct {
+	ID     string          `json:"id"`
+	Reason string          `json:"reason"`
+	Code   *int            `json:"code"`
+	Result json.RawMessage `json:"result"`
+	Usage  JobExitUsage    `json:"usage"`
+}
+
+// WorkerCapabilities is status.capabilities[CapWorker]: the runtime classes this Node runs.
+type WorkerCapabilities struct {
+	RuntimeClasses []string `json:"runtime_classes"`
+}
 
 type DriverStatus struct {
 	Name         string         `json:"name"`
@@ -271,6 +477,13 @@ func (Ack) MessageType() string          { return TypeAck }
 func (Nack) MessageType() string         { return TypeNack }
 func (Heartbeat) MessageType() string    { return TypeHeartbeat }
 func (EstopState) MessageType() string   { return TypeEstopState }
+func (JobRequest) MessageType() string   { return TypeJob }
+func (JobCancel) MessageType() string    { return TypeJobCancel }
+func (JobExitAck) MessageType() string   { return TypeJobExitAck }
+func (JobStarted) MessageType() string   { return TypeJobStarted }
+func (JobStdout) MessageType() string    { return TypeJobStdout }
+func (JobUsage) MessageType() string     { return TypeJobUsage }
+func (JobExit) MessageType() string      { return TypeJobExit }
 
 var registry = map[string]func() Message{
 	TypeHello:        func() Message { return &Hello{} },
@@ -285,6 +498,13 @@ var registry = map[string]func() Message{
 	TypeNack:         func() Message { return &Nack{} },
 	TypeHeartbeat:    func() Message { return &Heartbeat{} },
 	TypeEstopState:   func() Message { return &EstopState{} },
+	TypeJob:          func() Message { return &JobRequest{} },
+	TypeJobCancel:    func() Message { return &JobCancel{} },
+	TypeJobExitAck:   func() Message { return &JobExitAck{} },
+	TypeJobStarted:   func() Message { return &JobStarted{} },
+	TypeJobStdout:    func() Message { return &JobStdout{} },
+	TypeJobUsage:     func() Message { return &JobUsage{} },
+	TypeJobExit:      func() Message { return &JobExit{} },
 }
 
 // ErrUnknownType is returned (wrapped) by Decode for a frame whose type is not in this version's message set.
@@ -362,6 +582,20 @@ func derefMessage(m Message) Message {
 	case *Heartbeat:
 		return *v
 	case *EstopState:
+		return *v
+	case *JobRequest:
+		return *v
+	case *JobCancel:
+		return *v
+	case *JobExitAck:
+		return *v
+	case *JobStarted:
+		return *v
+	case *JobStdout:
+		return *v
+	case *JobUsage:
+		return *v
+	case *JobExit:
 		return *v
 	}
 	return m

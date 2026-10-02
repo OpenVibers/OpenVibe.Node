@@ -42,6 +42,10 @@ type Options struct {
 	Log     *slog.Logger
 	Version string
 
+	// RuntimeClasses are the job classes this Node runs and advertises in status.capabilities.worker. None yet:
+	// every job is refused "class not available" until the worker that executes jobs fills this in.
+	RuntimeClasses []string
+
 	// For tests.
 	HeartbeatInterval time.Duration
 	LinkBackoffMin    time.Duration
@@ -55,6 +59,7 @@ type Node struct {
 	log   *slog.Logger
 	latch *safety.Latch
 	dedup *safety.Dedup
+	jobs  *jobs
 	mgr   *plugins.Manager
 	link  *link.Link
 	pub   *video.Publisher
@@ -93,7 +98,7 @@ func New(opt Options) (*Node, error) {
 		opt.Log.Error("latch", "err", err)
 	}
 	n := &Node{opt: opt, log: opt.Log, latch: latch, dedup: safety.NewDedup(4096, 10*time.Minute),
-		telemetry: map[string]map[string]any{}, telemMS: 500}
+		jobs: newJobs(opt.RuntimeClasses), telemetry: map[string]map[string]any{}, telemMS: 500}
 	n.limits = safety.Merge(protocol.Limits{}, opt.Config.Limits.MaxSpeed, opt.Config.Limits.MaxTurn, opt.Config.Limits.MaxCommandMS)
 
 	var specs []plugins.Spec
@@ -226,6 +231,13 @@ func (n *Node) Frame(f protocol.Frame) {
 			n.remoteClear(m.By)
 		}
 		n.sendEstopState()
+	case protocol.JobRequest:
+		n.job(m)
+	case protocol.JobCancel:
+		n.jobCancel(m)
+	case protocol.JobExitAck:
+		// No job runs yet, so no job_exit is ever waiting for this.
+		n.log.Debug("job_exit_ack ignored", "id", m.ID)
 	}
 }
 
@@ -771,6 +783,9 @@ func (n *Node) sendStatus() {
 		if i.Fault != nil {
 			s.Faults = append(s.Faults, *i.Fault)
 		}
+	}
+	if c := n.jobs.runtimeClasses(); len(c) > 0 {
+		s.Capabilities[protocol.CapWorker] = protocol.WorkerCapabilities{RuntimeClasses: c}
 	}
 	if n.pub != nil {
 		s.Video = n.pub.State()

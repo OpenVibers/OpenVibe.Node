@@ -364,6 +364,15 @@ func (c *Conn) SendError(code, detail string) error {
 	return c.Send(protocol.Error{Code: code, Detail: detail})
 }
 
+// Job sends a job frame; the device answers ack or nack keyed by j.ID (see Reply).
+func (c *Conn) Job(j protocol.Job) error { return c.Send(protocol.JobRequest{Job: j}) }
+
+// JobCancel asks the device to stop job id.
+func (c *Conn) JobCancel(id string) error { return c.Send(protocol.JobCancel{ID: id}) }
+
+// JobExitAck tells the device job id's job_exit is recorded.
+func (c *Conn) JobExitAck(id string) error { return c.Send(protocol.JobExitAck{ID: id}) }
+
 // setEstop records the robot's latch: Bot keeps it from the estop frames it sends and the latched:true estop_state
 // frames it receives.
 func (c *Conn) setEstop(latched bool) {

@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "seq": 7,
+  "ts": 1790935200000,
+  "type": "job",
+  "job": {
+    "id": "job_01JAB2C3D4E5F6G7H8J9K0MNPQ",
+    "class": "function",
+    "artifact": {
+      "name": "thumbnail",
+      "version": "1.2.0"
+    },
+    "args": {
+      "width": 320
+    },
+    "ttl_ms": 60000,
+    "limits": {
+      "wall_ms": 30000,
+      "cpu_ms": 30000,
+      "mem_bytes": 268435456
+    }
+  }
+}

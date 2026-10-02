@@ -178,6 +178,41 @@ What the Node does with a command, in order:
 
 Commands are never queued while offline and never replayed after a reconnect.
 
+### Jobs
+
+The job frames of OpenVibe.Contracts `platform.job-frame@1` (plan T14 Run) ride the same link and envelope.
+**Running jobs is not implemented yet:** the Node advertises no runtime class, so it refuses every well-formed job
+with `class not available`, and nothing executes.
+
+| direction        | type           | fields                                                                                    |
+|------------------|----------------|-------------------------------------------------------------------------------------------|
+| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`, the default)} |
+| server → device  | `job_cancel`   | `id`                                                                                      |
+| server → device  | `job_exit_ack` | `id`                                                                                      |
+| device → server  | `job_started`  | `id`, `started_ms`                                                                        |
+| device → server  | `job_stdout`   | `id`, `chunk_seq` (the job's own counter from 1; the envelope owns `seq`), `chunk`        |
+| device → server  | `job_usage`    | `id`, `started_ms`, `second`, `cpu_ms`                                                    |
+| device → server  | `job_exit`     | `id`, `reason` (`exited`, `cancelled`, `ttl`, `limit`, `stopped`, `failed`), `code`, `result`, `usage` {`started_ms`, `wall_ms`, `cpu_ms`, `mem_peak_bytes`} |
+
+A `job` is answered `ack` (accepted) or `nack` keyed by the job id. A nack's `message` names the first problem found,
+checked in this order:
+
+| `message`                                    | `fault_code`  | when                                                        |
+|----------------------------------------------|---------------|-------------------------------------------------------------|
+| `missing or malformed job id`                | `bad_value`   | `id` is not `job_` + 26 ULID characters (the nack echoes it) |
+| `malformed job`                              | `bad_frame`   | the `job` object does not decode (a field of the wrong type) |
+| `unknown class`                              | `unsupported` | `class` is not one of `function`, `code`, `browser`, `linux`, `desktop`, `gpu` |
+| `function job needs an artifact with an exact version` | `bad_value` | a `function` job without `artifact`, or a name or version outside the contract's pattern (a range) |
+| `net policy not supported`                   | `unsupported` | `net` is present and not `deny`                             |
+| `missing or invalid args, ttl_ms or limits`  | `bad_value`   | `args` is not an object, or `ttl_ms` or a limit is missing or below 1 |
+| `class not available`                        | `unsupported` | the class is valid but this Node does not run it (today: every class) |
+
+A resent `job` with an id already answered gets the same answer again, never a second acceptance; the Node
+remembers the last 1024 well-formed ids. `job_cancel` for an id that is not running (unknown, refused or ended) and
+`job_exit_ack` for an unknown id are ignored, with no answer: an `ack` keyed by a job id means the job was accepted.
+A Node that runs jobs lists its classes in `status.capabilities.worker` as `{"runtime_classes": ["function"]}`; the
+key is absent while it runs none, and `worker` is reserved as a plugin name.
+
 ### Fault codes
 
 `bad_frame`, `bad_value`, `unsupported`, `not_allowed`, `estopped`, `local_stop`, `expired`, `no_heartbeat`,

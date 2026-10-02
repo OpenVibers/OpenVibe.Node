@@ -212,6 +212,9 @@ func (c *Config) Validate() error {
 		if p.Name == "" || strings.ContainsAny(p.Name, " /\\") {
 			return fmt.Errorf("config: plugin name %q is empty or has spaces or slashes", p.Name)
 		}
+		if p.Name == "worker" { // status.capabilities.worker holds the job runtime classes
+			return fmt.Errorf("config: plugin name %q is reserved", p.Name)
+		}
 		if seen[p.Name] {
 			return fmt.Errorf("config: plugin %q listed twice", p.Name)
 		}

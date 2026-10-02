@@ -65,3 +65,12 @@ func TestPluginCommand(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 }
+
+// TestWorkerNameReserved: status.capabilities.worker holds the job runtime classes, so no plugin may be named worker.
+func TestWorkerNameReserved(t *testing.T) {
+	c := Default()
+	c.Plugins = append(c.Plugins, PluginConfig{Name: "worker", Command: []string{"/bin/true"}})
+	if err := c.Validate(); err == nil {
+		t.Fatal("a plugin named worker was accepted")
+	}
+}

@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "seq": 15,
+  "ts": 1790935202600,
+  "type": "job_exit",
+  "id": "job_01JAB2C3D4E5F6G7H8J9K0MNPQ",
+  "reason": "exited",
+  "code": 0,
+  "result": {
+    "url": "media:object-7"
+  },
+  "usage": {
+    "started_ms": 1790935200250,
+    "wall_ms": 2350,
+    "cpu_ms": 1800,
+    "mem_peak_bytes": 41943040
+  }
+}

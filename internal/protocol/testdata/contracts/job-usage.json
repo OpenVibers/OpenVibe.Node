@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "seq": 12,
+  "ts": 1790935201250,
+  "type": "job_usage",
+  "id": "job_01JAB2C3D4E5F6G7H8J9K0MNPQ",
+  "started_ms": 1790935200250,
+  "second": 0,
+  "cpu_ms": 640
+}
