@@ -135,8 +135,8 @@ type Limits struct {
 }
 
 type Config struct {
-	HeartbeatMS     int      `json:"heartbeat_ms"`
-	Limits          Limits   `json:"limits"`
+	HeartbeatMS int    `json:"heartbeat_ms"`
+	Limits      Limits `json:"limits"`
 	// AllowedCommands are the kinds the robot takes (Bot always includes halt). Absent (nil) allows every kind; an
 	// empty list allows only halt.
 	AllowedCommands []string `json:"allowed_commands"`

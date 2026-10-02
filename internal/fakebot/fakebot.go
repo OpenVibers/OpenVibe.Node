@@ -360,7 +360,9 @@ func (c *Conn) SendLate(m protocol.Message, late time.Duration) error {
 }
 
 // SendError sends Bot's error frame.
-func (c *Conn) SendError(code, detail string) error { return c.Send(protocol.Error{Code: code, Detail: detail}) }
+func (c *Conn) SendError(code, detail string) error {
+	return c.Send(protocol.Error{Code: code, Detail: detail})
+}
 
 // setEstop records the robot's latch: Bot keeps it from the estop frames it sends and the latched:true estop_state
 // frames it receives.
