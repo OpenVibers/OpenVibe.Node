@@ -26,7 +26,8 @@ type WHIPReceiver struct {
 	n   int
 }
 
-// SetPublishKey sets the bearer key the receiver demands. It is safe to call while the server is serving.
+// SetPublishKey changes the bearer key the receiver demands. It is safe to call while the receiver is serving; set
+// PublishKey directly only before then.
 func (w *WHIPReceiver) SetPublishKey(k string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -35,9 +36,9 @@ func (w *WHIPReceiver) SetPublishKey(k string) {
 
 func (w *WHIPReceiver) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	w.mu.Lock()
-	publishKey := w.PublishKey
+	key := w.PublishKey
 	w.mu.Unlock()
-	if r.Header.Get("Authorization") != "Bearer "+publishKey {
+	if r.Header.Get("Authorization") != "Bearer "+key {
 		w.BadAuth.Add(1)
 		http.Error(rw, "unauthorized", http.StatusUnauthorized)
 		return

@@ -126,7 +126,7 @@ applied the Node runs nothing but `halt` (`nack not_ready`), so that latch is in
 | `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack)                                               |
 | `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
 | `heartbeat`   | `t` (send time, Unix ms), `rtt_ms` (the last measured round trip, once there is one; 0 is a real measurement) |
-| `estop_state` | `latched` (the device is stopped: remote e-stop or local kill switch), `by` (`device`), `at`, `robot_id` (when the device serves one robot); Node extras: `local_stop` (local kill switch), `reason` |
+| `estop_state` | `latched` (the device is stopped: remote e-stop or local kill switch), `by` (`device`), `at`; Node extras: `robot_id` (when `hello` named exactly one robot), `local_stop` (local kill switch), `reason` |
 
 The first `status` and `estop_state` go out once the connection's `config` has been applied, never right after the
 upgrade or `hello`; then `status` whenever a plugin changes state or faults and `estop_state` after every `config`,
@@ -186,7 +186,9 @@ Commands are never queued while offline and never replayed after a reconnect.
 
 ### Heartbeat, deadman, reconnect
 
-- The device sends `heartbeat` every `config.heartbeat_ms` (default 1000). The server answers `heartbeat_ack`.
+- The device sends `heartbeat` every `config.heartbeat_ms` (default 1000), starting once `hello` has arrived. The
+  server answers `heartbeat_ack`. Until `hello`, a new connection may stay silent for up to 10 s (Bot may still be
+  checking the credential); the deadman below applies from `hello` on.
 - If nothing at all arrives from the server for 2 × `heartbeat_ms` (two missed heartbeats), the Node closes the link.
   Every close stops every actuator at once. (Bot marks the device offline after `heartbeat_ms × 2 + 3000 ms`.)
 - Reconnect: exponential backoff from 0.5 s to 30 s with full jitter; see the close-code table for `4000`, `4002` and

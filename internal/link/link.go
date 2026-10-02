@@ -1,9 +1,10 @@
 // Package link keeps the Node's one outbound control connection to OpenVibe.Bot: a WebSocket to wss://<origin>/device
 // authenticated with the device credential in the Authorization header of the upgrade (never in the URL). It sends a
-// heartbeat every interval, declares the link lost when nothing has arrived for the deadman interval (two heartbeats
-// by default), and reconnects with exponential backoff and full jitter. Nothing is queued while offline: Send fails
-// and the caller decides. The connection counts as up only once the server's hello arrives: OpenVibe.Bot
-// authenticates after the upgrade and answers anything sent earlier with error bot.not_paired.
+// heartbeat every interval from the server's hello on, declares the link lost when nothing has arrived for the deadman
+// interval (two heartbeats by default; HelloAllowance before hello), and reconnects with exponential backoff and full
+// jitter. Nothing is queued while offline: Send fails and the caller decides. The connection counts as up only once
+// the server's hello arrives: OpenVibe.Bot authenticates after the upgrade and answers anything sent earlier with
+// error bot.not_paired.
 //
 // Close codes: 4000 (another connection with this credential replaced this one) reconnects with the normal backoff;
 // 4002 (credential refused) and 4003 (revoked) keep retrying, never sooner than CredentialRetryMin, and log what to
@@ -63,6 +64,10 @@ type Options struct {
 // CredentialRetryMin is the least a refused or revoked credential (close 4002 / 4003, HTTP 401 / 403) waits before
 // the next try; jitter only ever adds to it.
 const CredentialRetryMin = 10 * time.Second
+
+// HelloAllowance is how long a new connection may stay silent before the server's hello when the deadman is shorter:
+// Bot authenticates after the upgrade, and heartbeats (and so the deadman) only start once hello has arrived.
+const HelloAllowance = 10 * time.Second
 
 // hbSend is one heartbeat the link sent: its monotonic send time and the t it carried, so an ack can be matched
 // back either by the echoed t (Bot) or by the body seq (older servers).
@@ -365,6 +370,7 @@ func (l *Link) session(ctx context.Context) error {
 		end(ctx.Err())
 	}()
 
+	var up atomic.Bool // the server's hello has arrived
 	var lastRx atomic.Int64
 	lastRx.Store(time.Now().UnixNano())
 
@@ -399,6 +405,13 @@ func (l *Link) session(ctx context.Context) error {
 				if hbNow != hb {
 					hb, next = hbNow, now
 				}
+				if !up.Load() {
+					if now.Sub(time.Unix(0, lastRx.Load())) > max(deadman, HelloAllowance) {
+						end(fmt.Errorf("no hello from the server within %s", max(deadman, HelloAllowance)))
+						return
+					}
+					continue
+				}
 				if !now.Before(next) {
 					next = now.Add(hb)
 					_ = l.Send(protocol.Heartbeat{})
@@ -411,7 +424,6 @@ func (l *Link) session(ctx context.Context) error {
 		}
 	}()
 
-	up := false
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -479,8 +491,8 @@ func (l *Link) session(ctx context.Context) error {
 			}
 			continue
 		case protocol.Hello:
-			if !up {
-				up = true
+			if !up.Load() {
+				up.Store(true)
 				l.mu.Lock()
 				l.out = out
 				l.mu.Unlock()
@@ -490,7 +502,7 @@ func (l *Link) session(ctx context.Context) error {
 				l.handler.Connected()
 			}
 		}
-		if !up {
+		if !up.Load() {
 			l.log.Warn("ignoring a frame before hello", "type", f.Type)
 			continue
 		}

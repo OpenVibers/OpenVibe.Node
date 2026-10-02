@@ -77,8 +77,7 @@ type Node struct {
 	// while the link was down is applied before any motion.
 	configured bool
 
-	// robotIDs are the robots this device serves, from the connection's hello.
-	robotIDs []string
+	robotIDs []string // the robots this device serves, from the connection's hello
 }
 
 // New builds a Node. Run starts it.
@@ -196,7 +195,7 @@ func (n *Node) Run(ctx context.Context) error {
 // has been applied (applyConfig), so they report the latch the owner may have set while the link was down.
 func (n *Node) Connected() {
 	n.mu.Lock()
-	n.configured = false
+	n.configured, n.robotIDs = false, nil
 	n.mu.Unlock()
 }
 
@@ -211,10 +210,10 @@ func (n *Node) Disconnected(err error) {
 func (n *Node) Frame(f protocol.Frame) {
 	switch m := f.Msg.(type) {
 	case protocol.Hello:
-		n.log.Info("server hello", "device", m.DeviceID, "robots", m.RobotIDs, "session", m.SessionID)
 		n.mu.Lock()
 		n.robotIDs = m.RobotIDs
 		n.mu.Unlock()
+		n.log.Info("server hello", "device", m.DeviceID, "robots", m.RobotIDs, "session", m.SessionID)
 	case protocol.Config:
 		n.applyConfig(m)
 	case protocol.Command:

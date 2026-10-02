@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,6 +63,43 @@ func TestPublishRetriesOnBadKey(t *testing.T) {
 	<-done
 	if e := p.LastError(); e == "" || contains(e, "wrong-key-value") {
 		t.Fatalf("last error %q", e)
+	}
+}
+
+// The receiver's key can change while it serves (a fake Bot rotating the publish key): under -race this is the check
+// that ServeHTTP reads it under the lock.
+func TestWHIPReceiverSetPublishKeyWhileServing(t *testing.T) {
+	rx := &WHIPReceiver{PublishKey: "old"}
+	srv := httptest.NewServer(rx)
+	defer srv.Close()
+	del := func(key string) int {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/whip/x/session", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+			return 0
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				del("new")
+			}
+		}()
+	}
+	rx.SetPublishKey("new")
+	wg.Wait()
+	if c := del("old"); c != http.StatusUnauthorized {
+		t.Fatalf("old key after SetPublishKey: HTTP %d", c)
+	}
+	if c := del("new"); c == http.StatusUnauthorized {
+		t.Fatal("new key refused after SetPublishKey")
 	}
 }
 
