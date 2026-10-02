@@ -34,13 +34,16 @@ const (
 
 // Close codes the server ends the device socket with.
 const (
-	CloseReplaced = 4000 // a second connection with the same credential replaced this one
-	CloseInvalid  = 4002 // the credential is wrong or revoked (sent right after the upgrade)
-	CloseRevoked  = 4003 // the owner revoked the device while it was connected
+	CloseReplaced = 4000 // a second connection with the same credential replaced this one: reconnect normally
+	CloseInvalid  = 4002 // the credential is wrong, rotated or revoked (sent right after the upgrade)
+	CloseRevoked  = 4003 // the owner revoked the device (or rotated its credential) while it was connected
 )
 
-// Error codes in error.code that the Node acts on.
-const ErrNotPaired = "bot.not_paired" // a frame arrived before the server authenticated the socket
+// Error codes in error.code that the Node tells apart.
+const (
+	ErrNotPaired = "bot.not_paired" // a frame arrived on a socket that has no credential
+	ErrNotReady  = "bot.not_ready"  // more than 64 frames arrived while the server was still authenticating
+)
 
 // Device → server message types.
 const (
@@ -77,7 +80,8 @@ const (
 	FaultEstopped      = "estopped"       // the remote e-stop is latched
 	FaultLocalStop     = "local_stop"     // the local kill switch (`openvibe-node stop`) is latched
 	FaultNoHeartbeat   = "no_heartbeat"   // a plugin lost the core's heartbeat
-	FaultNotReady      = "not_ready"      // the driver is starting or restarting
+	FaultNotReady      = "not_ready"      // the driver is starting or restarting, or the server's config has not arrived
+	FaultExpired       = "expired"        // the command's deadline_ms had passed when it arrived
 	FaultPluginDown    = "plugin_down"    // the driver process is not running
 	FaultPluginTimeout = "plugin_timeout" // the driver did not answer in time
 	FaultHardware      = "hardware"       // the driver reported a hardware error
@@ -131,9 +135,11 @@ type Limits struct {
 }
 
 type Config struct {
-	HeartbeatMS     int      `json:"heartbeat_ms"`
-	Limits          Limits   `json:"limits"`
-	AllowedCommands []string `json:"allowed_commands"` // command kinds operators may send; empty = all
+	HeartbeatMS int    `json:"heartbeat_ms"`
+	Limits      Limits `json:"limits"`
+	// AllowedCommands are the kinds the robot takes (Bot always includes halt). Absent (nil) allows every kind; an
+	// empty list allows only halt.
+	AllowedCommands []string `json:"allowed_commands"`
 	EstopLatched    bool     `json:"estop_latched"`
 }
 
@@ -144,7 +150,9 @@ type Operator struct {
 }
 
 type Command struct {
+	// ID is minted by the server: the dedup and ack key. Ref is the operator's own id, for logs only.
 	ID    string          `json:"id"`
+	Ref   string          `json:"ref,omitempty"`
 	Kind  string          `json:"kind"`
 	Value json.RawMessage `json:"value,omitempty"`
 	// DeadlineMS is an absolute instant in epoch milliseconds on the server's clock, present on motion kinds only.
@@ -356,19 +364,21 @@ func derefMessage(m Message) Message {
 // ---- pairing (HTTPS) ----
 
 // PairBodyFromPaired turns Bot's `paired` frame (pairing over the socket) into the body its POST /api/v1/pair answers
-// with: the same device id, credential, publish key and profile, and robot_ids[0] as robot_id (server/api/v1.js).
+// with: the same device id, credential, publish key, WHIP URL and profile, and robot_ids[0] as robot_id
+// (server/api/v1.js).
 func PairBodyFromPaired(frame []byte) []byte {
 	var p struct {
 		DeviceID   string          `json:"device_id"`
 		Credential string          `json:"credential"`
 		PublishKey string          `json:"publish_key"`
+		WHIPURL    string          `json:"whip_url"`
 		RobotIDs   []string        `json:"robot_ids"`
 		Profile    json.RawMessage `json:"profile"`
 	}
 	if json.Unmarshal(frame, &p) != nil {
 		return nil
 	}
-	r := PairResponse{DeviceID: p.DeviceID, Credential: p.Credential, PublishKey: p.PublishKey, Profile: p.Profile}
+	r := PairResponse{DeviceID: p.DeviceID, Credential: p.Credential, PublishKey: p.PublishKey, WHIPURL: p.WHIPURL, Profile: p.Profile}
 	if len(p.RobotIDs) > 0 {
 		r.RobotID = p.RobotIDs[0]
 	}
@@ -399,11 +409,13 @@ type ICEServer struct {
 	Credential string   `json:"credential,omitempty"`
 }
 
-// PairResponse is the 201 answer of POST /api/v1/pair. The credential and publish key appear only here.
+// PairResponse is the 201 answer of POST /api/v1/pair. The credential, publish key and WHIP URL (which embeds the
+// publish key; null when Bot has no ingest configured) appear only here.
 type PairResponse struct {
 	DeviceID   string          `json:"device_id"`
 	Credential string          `json:"credential"`
 	PublishKey string          `json:"publish_key"`
+	WHIPURL    string          `json:"whip_url,omitempty"`
 	RobotID    string          `json:"robot_id"`
 	Profile    json.RawMessage `json:"profile,omitempty"`
 }

@@ -1,8 +1,15 @@
 // Package fakebot is a stand-in for OpenVibe.Bot used by tests. It speaks Bot's real device contract (docs/protocol.md
-// section 1 and POST /api/v1/pair, pinned in internal/protocol/testdata/bot): it redeems pairing codes, upgrades every
-// /device request and then authenticates the Authorization header (a bad credential closes with 4002, a revoked
-// device with 4003, a second connection replaces the first with 4000), sends hello and config, and answers
-// heartbeats. Tests drive it to send commands, e-stops and silence, and read back what the device sent.
+// section 1, server/realtime.js and POST /api/v1/pair in server/api/v1.js, pinned in internal/protocol/testdata/bot):
+// it redeems pairing codes (refusals are RFC 9457 problem bodies with Bot's codes), upgrades every /device request
+// and then authenticates the Authorization header (a bad credential closes with 4002, a revoked device with 4003, a
+// second connection replaces the first with 4000), sends hello and then config (always with allowed_commands and
+// the robot's estop_latched), sends commands with a server-minted id, an absolute deadline_ms, the operator and the
+// robot, and answers heartbeats. Like Bot, it keeps the robot's e-stop latch: an estop frame it sends sets or clears
+// it, a device's estop_state latched:true sets it, and latched:false is only a report. Tests drive it to send
+// commands, e-stops, errors and silence, and read back what the device sent.
+//
+// heartbeat_ack still echoes the heartbeat's seq (Bot d398445); Bot now echoes heartbeat.t as echo, and that change
+// is a follow-up on both sides.
 package fakebot
 
 import (
@@ -43,10 +50,17 @@ type Server struct {
 	live         map[string]*Conn  // device id → its current connection
 	estop        map[string]bool   // robot id → the robot's e-stop latch, as Bot keeps it
 	pairRequests []protocol.PairRequest
+	pairRefusal  *refusal
 	credInURL    bool
 
 	conns chan *Conn
 	count atomic.Int64
+	dials atomic.Int64
+}
+
+type refusal struct {
+	status       int
+	code, detail string
 }
 
 // RobotID is the robot AddCode and AddCredential attach devices to.
@@ -116,6 +130,30 @@ func (s *Server) Revoke(cred string) {
 	}
 }
 
+// RefusePair makes the next POST /api/v1/pair answer with this problem, as Bot's pairing.redeem refuses a code
+// (403 bot.pairing_code_invalid / _locked / _used / _expired, 404 bot.no_pairing_code, 422 bot.invalid_pairing_code,
+// 429 rate_limited).
+func (s *Server) RefusePair(status int, code, detail string) {
+	s.mu.Lock()
+	s.pairRefusal = &refusal{status, code, detail}
+	s.mu.Unlock()
+}
+
+// SetEstop sets or clears the robot's latch as the owner's REST call does: devices learn it from the next config
+// (connected devices get no frame here; send protocol.Estop for that).
+func (s *Server) SetEstop(latched bool) {
+	s.mu.Lock()
+	s.estop[RobotID] = latched
+	s.mu.Unlock()
+}
+
+// EstopLatched reports the robot's latch as Bot would hold it.
+func (s *Server) EstopLatched() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.estop[RobotID]
+}
+
 // PairRequests returns what devices sent to /api/v1/pair.
 func (s *Server) PairRequests() []protocol.PairRequest {
 	s.mu.Lock()
@@ -129,6 +167,9 @@ func (s *Server) CredentialSeenInURL() bool {
 	defer s.mu.Unlock()
 	return s.credInURL
 }
+
+// Dials counts every /device request, authenticated or not.
+func (s *Server) Dials() int { return int(s.dials.Load()) }
 
 // Connections counts accepted (authenticated) device connections.
 func (s *Server) Connections() int { return int(s.count.Load()) }
@@ -160,6 +201,12 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 	code := strings.ToUpper(strings.ReplaceAll(req.Code, "-", ""))
 	s.mu.Lock()
 	s.pairRequests = append(s.pairRequests, req)
+	if rf := s.pairRefusal; rf != nil {
+		s.pairRefusal = nil
+		s.mu.Unlock()
+		problem(w, rf.status, rf.code, rf.detail)
+		return
+	}
 	robot, ok := s.codes[code]
 	if ok && req.Robot != "" && req.Robot != robot {
 		ok = false
@@ -174,8 +221,8 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 	}
 	body := s.PairBody
 	if body == nil {
-		cred, dev := token(), "dev_"+token()[:12]
-		body, _ = json.Marshal(protocol.PairResponse{DeviceID: dev, Credential: cred, PublishKey: "pk_" + token()[:16],
+		cred, dev, pk := token(), "dev_"+token()[:12], "pk_"+token()[:16]
+		body, _ = json.Marshal(protocol.PairResponse{DeviceID: dev, Credential: cred, PublishKey: pk, WHIPURL: s.HTTP.URL + "/whip/" + pk,
 			RobotID: robot, Profile: json.RawMessage(`{"id":"sim.rover","limits":{"max_command_ms":300,"heartbeat_ms":1000}}`)})
 	}
 	var pr protocol.PairResponse
@@ -192,6 +239,7 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 
 func (s *Server) device(w http.ResponseWriter, r *http.Request) {
+	s.dials.Add(1)
 	s.mu.Lock()
 	for cred := range s.creds {
 		if strings.Contains(r.URL.RawQuery, cred) || strings.Contains(r.URL.Path, cred) {
@@ -222,6 +270,9 @@ func (s *Server) device(w http.ResponseWriter, r *http.Request) {
 	greeting := s.Greeting
 	cfg := s.Config
 	cfg.EstopLatched = s.estop[c.RobotID]
+	if cfg.AllowedCommands == nil {
+		cfg.AllowedCommands = append([]string(nil), protocol.Kinds...) // Bot always sends the list, halt included
+	}
 	c.srv = s
 	s.mu.Unlock()
 	if c.DeviceID == "" {
@@ -278,12 +329,21 @@ type Conn struct {
 // Send writes one frame to the device.
 func (c *Conn) Send(m protocol.Message) error { return c.sendAt(time.Now().UnixMilli(), m) }
 
-// Command sends a command the way Bot does: deadline_ms is the absolute instant ts + deadlineMS (none when 0), and
-// the operator is usr_test unless cmd names one.
+// Command sends a command the way Bot does: deadline_ms is the absolute instant ts + deadlineMS (none when 0), ref is
+// the operator's own id, the operator is usr_test unless cmd names one, and robot_id is the device's robot.
 func (c *Conn) Command(cmd protocol.Command, deadlineMS int) error {
-	ts := time.Now().UnixMilli()
+	return c.CommandLate(cmd, deadlineMS, 0)
+}
+
+// CommandLate sends a command stamped late ago, as if it had sat in a queue on the way for that long: ts and the
+// deadline are both in the past by late.
+func (c *Conn) CommandLate(cmd protocol.Command, deadlineMS int, late time.Duration) error {
+	ts := time.Now().Add(-late).UnixMilli()
 	if deadlineMS > 0 {
 		cmd.DeadlineMS = ts + int64(deadlineMS)
+	}
+	if cmd.Ref == "" {
+		cmd.Ref = "op_" + cmd.ID
 	}
 	if cmd.Operator == nil {
 		cmd.Operator = &protocol.Operator{Subject: "usr_test", Role: "operator"}
@@ -294,7 +354,18 @@ func (c *Conn) Command(cmd protocol.Command, deadlineMS int) error {
 	return c.sendAt(ts, cmd)
 }
 
-// setEstop records the robot's latch: Bot keeps it from estop frames it sends and estop_state frames it receives.
+// SendLate writes one frame stamped late ago, as if it had sat in a queue on the way for that long.
+func (c *Conn) SendLate(m protocol.Message, late time.Duration) error {
+	return c.sendAt(time.Now().Add(-late).UnixMilli(), m)
+}
+
+// SendError sends Bot's error frame.
+func (c *Conn) SendError(code, detail string) error {
+	return c.Send(protocol.Error{Code: code, Detail: detail})
+}
+
+// setEstop records the robot's latch: Bot keeps it from the estop frames it sends and the latched:true estop_state
+// frames it receives.
 func (c *Conn) setEstop(latched bool) {
 	if c.srv == nil {
 		return
@@ -363,8 +434,8 @@ func (c *Conn) read() {
 		if err != nil {
 			continue
 		}
-		if es, ok := f.Msg.(protocol.EstopState); ok {
-			c.setEstop(es.Latched)
+		if es, ok := f.Msg.(protocol.EstopState); ok && es.Latched {
+			c.setEstop(true) // a report of latched:false never clears Bot's latch
 		}
 		if hb, ok := f.Msg.(protocol.Heartbeat); ok && c.autoAck.Load() && !c.muted.Load() {
 			_ = c.Send(protocol.HeartbeatAck{Seq: hb.Seq, ServerTime: time.Now().UTC().Format(time.RFC3339Nano)})

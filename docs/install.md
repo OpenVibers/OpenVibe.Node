@@ -101,8 +101,8 @@ macOS: `/Library/Application Support/OpenVibe Node`. Windows: `%ProgramData%\Ope
   e.g. `["ffmpeg", "-f", "v4l2", "-i", "/dev/video0", "-c:v", "libx264", "-preset", "ultrafast", "-tune",
   "zerolatency", "-profile:v", "baseline", "-g", "30", "-f", "h264", "-"]`), `plugin` (with `video.plugin`), `off`.
   `fps`, `width`, `height`, `ffmpeg` tune the rest. `whip_url`: where the camera publishes, with the publish key from
-  pairing. OpenVibe.Bot hands out the key but no endpoint, so until `video.whip_url` is set (an `https://` URL) video
-  stays off and the log says so.
+  pairing. It overrides the `whip_url` OpenVibe.Bot returns at pairing; with neither (Bot has no ingest configured)
+  video stays off and the log says so.
 - `limits`: local caps on top of the owner's limits from openvibe.bot; the stricter value wins.
 - `python`: interpreter for bundled plugins (default `<state>/venv/bin/python`, then `python3`).
 

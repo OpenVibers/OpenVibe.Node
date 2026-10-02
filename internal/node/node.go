@@ -72,6 +72,10 @@ type Node struct {
 	videoSrc  string
 	lastTelem time.Time
 	started   time.Time
+
+	// configured is set by the first config on a connection; until then only halt runs, so a latch the owner set
+	// while the link was down is applied before any motion.
+	configured bool
 }
 
 // New builds a Node. Run starts it.
@@ -125,7 +129,7 @@ func New(opt Options) (*Node, error) {
 		}
 		n.link = link.New(link.Options{URL: u, Credential: opt.Creds.Credential, UserAgent: "openvibe-node/" + opt.Version,
 			Log: opt.Log, HeartbeatInterval: opt.HeartbeatInterval, BackoffMin: opt.LinkBackoffMin}, n)
-		// Bot hands out only the publish key; the WHIP endpoint is local config (or an older pairing's stored URL).
+		// The WHIP endpoint is the pairing's whip_url (built by Bot from the publish key) unless the config sets one.
 		whip := opt.Config.Video.WHIPURL
 		if whip == "" {
 			whip = opt.Creds.WHIPURL
@@ -185,15 +189,20 @@ func (n *Node) Run(ctx context.Context) error {
 
 // ---- link.Handler ----
 
-// Connected sends status. estop_state waits for config: Bot treats a device's estop_state as the robot's latch, so
-// reporting "clear" before config told us about an owner e-stop set while we were offline would clear it.
+// Connected sends nothing: Bot sends config right after hello, and the first status and estop_state go out once it
+// has been applied (applyConfig), so they report the latch the owner may have set while the link was down.
 func (n *Node) Connected() {
-	n.sendStatus()
+	n.mu.Lock()
+	n.configured = false
+	n.mu.Unlock()
 }
 
 func (n *Node) Disconnected(err error) {
 	n.log.Warn("link lost: stopping every actuator", "err", err)
 	n.mgr.StopAll()
+	n.mu.Lock()
+	n.configured = false
+	n.mu.Unlock()
 }
 
 func (n *Node) Frame(f protocol.Frame) {
@@ -205,6 +214,7 @@ func (n *Node) Frame(f protocol.Frame) {
 	case protocol.Command:
 		n.command(m, f.TS, time.Now())
 	case protocol.Estop:
+		// latched:false is the owner's clear. It clears only the remote latch: a local (CLI or file) stop stays.
 		if m.Latched {
 			n.remoteEstop("by "+m.By, m.By)
 		} else {
@@ -236,18 +246,23 @@ func (n *Node) applyConfig(c protocol.Config) {
 	} else if !c.EstopLatched && st.Remote {
 		n.remoteClear("server")
 	}
-	n.sendEstopState()
 	l := safety.Merge(c.Limits, n.opt.Config.Limits.MaxSpeed, n.opt.Config.Limits.MaxTurn, n.opt.Config.Limits.MaxCommandMS)
 	n.mu.Lock()
 	n.limits = l
 	n.allowed = nil
-	if len(c.AllowedCommands) > 0 {
+	if c.AllowedCommands != nil {
 		n.allowed = map[string]bool{protocol.KindHalt: true}
 		for _, k := range c.AllowedCommands {
 			n.allowed[k] = true
 		}
 	}
+	first := !n.configured
+	n.configured = true
 	n.mu.Unlock()
+	if first {
+		n.sendStatus()
+	}
+	n.sendEstopState()
 	if n.link != nil {
 		hb := c.HeartbeatMS
 		if hb <= 0 {
@@ -255,16 +270,21 @@ func (n *Node) applyConfig(c protocol.Config) {
 		}
 		n.link.SetTiming(hb)
 	}
-	n.log.Info("config", "max_speed", l.MaxSpeed, "max_turn", l.MaxTurn, "max_command_ms", l.MaxCommandMS)
+	n.log.Info("config", "max_speed", l.MaxSpeed, "max_turn", l.MaxTurn, "max_command_ms", l.MaxCommandMS,
+		"allowed", c.AllowedCommands, "estop_latched", c.EstopLatched)
 }
 
 // command validates and routes one command. The synchronous part (checks, clamping, queueing to the plugin) keeps
-// commands in arrival order; the reply is awaited on its own goroutine. sentMS is the frame's ts: the absolute
-// deadline_ms minus it is the time the server allowed, on the server's own clock, so clock skew does not matter.
+// commands in arrival order; the reply is awaited on its own goroutine. deadline_ms is an absolute instant on the
+// server's clock: it is compared with the link's estimate of that clock at receipt (serverNow), so a command that
+// arrives after its deadline is nacked and never reaches a plugin, and a plugin gets only the time that is left.
 func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 	if c.ID == "" {
 		n.log.Warn("command without id ignored", "kind", c.Kind)
 		return
+	}
+	if c.Operator != nil {
+		n.log.Debug("command", "id", c.ID, "ref", c.Ref, "kind", c.Kind, "robot", c.RobotID, "operator", c.Operator.Subject, "role", c.Operator.Role)
 	}
 	entry, first := n.dedup.Begin(c.ID)
 	if !first {
@@ -291,7 +311,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		return
 	}
 	n.mu.Lock()
-	limits, allowed := n.limits, n.allowed
+	limits, allowed, configured := n.limits, n.allowed, n.configured
 	n.mu.Unlock()
 	if c.Kind == protocol.KindHalt {
 		n.mgr.StopAll()
@@ -300,8 +320,12 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		n.send(r)
 		return
 	}
+	if !configured {
+		nack(protocol.FaultNotReady, "the server's config has not arrived on this connection yet")
+		return
+	}
 	if allowed != nil && !allowed[c.Kind] {
-		nack(protocol.FaultNotAllowed, "")
+		nack(protocol.FaultNotAllowed, c.Kind+" is not in this robot's allowed_commands")
 		return
 	}
 	if protocol.GuardedKinds[c.Kind] {
@@ -314,6 +338,15 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 			nack(protocol.FaultEstopped, st.RemoteReason)
 			return
 		}
+	}
+	deadline := limits.Deadline(0)
+	if c.DeadlineMS > 0 {
+		left := c.DeadlineMS - n.serverNow(sentMS, received)
+		if left <= 0 {
+			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived", -left))
+			return
+		}
+		deadline = limits.Deadline(int(min(left, int64(limits.MaxCommandMS)+1)))
 	}
 	value, err := limits.Clamp(c.Kind, c.Value)
 	if err != nil {
@@ -338,19 +371,6 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind)
 		return
 	}
-	deadline := limits.Deadline(0)
-	if c.DeadlineMS > 0 {
-		ref := sentMS
-		if ref <= 0 {
-			ref = received.UnixMilli()
-		}
-		left := c.DeadlineMS - ref
-		if left <= 0 {
-			nack(protocol.FaultBadValue, "the command's deadline had already passed")
-			return
-		}
-		deadline = limits.Deadline(int(min(left, int64(limits.MaxCommandMS)+1)))
-	}
 	wait := p.Begin(n.ctx, c.ID, c.Kind, value, deadline)
 	go func() {
 		r := wait()
@@ -363,6 +383,20 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		n.dedup.Complete(entry, msg)
 		n.send(msg)
 	}()
+}
+
+// serverNow is the server's clock when a frame stamped sentMS was received: the link's estimate, else the frame's
+// own ts.
+func (n *Node) serverNow(sentMS int64, received time.Time) int64 {
+	if n.link != nil {
+		if ms, ok := n.link.ServerNow(received); ok {
+			return ms
+		}
+	}
+	if sentMS > 0 {
+		return sentMS
+	}
+	return received.UnixMilli()
 }
 
 func (n *Node) send(m protocol.Message) {
@@ -403,9 +437,15 @@ func (n *Node) pollLatch(ctx context.Context) {
 	}
 }
 
+// sendEstopState reports the device's latch. Bot reads latched:true as "this device is stopped" and latches the robot
+// (so the local kill switch shows on the panel and the gate stops sending motion); latched:false is a report only
+// and never clears the owner's latch.
 func (n *Node) sendEstopState() {
+	if !n.reporting() {
+		return
+	}
 	st := n.latch.State()
-	n.send(protocol.EstopState{Latched: st.Remote, By: "device", At: time.Now().UTC().Format(time.RFC3339Nano),
+	n.send(protocol.EstopState{Latched: st.Stopped(), By: "device", At: time.Now().UTC().Format(time.RFC3339Nano),
 		LocalStop: st.Local, Reason: st.RemoteReason})
 }
 
@@ -695,10 +735,20 @@ func (n *Node) Status() Status {
 	return s
 }
 
+// reporting is whether status and estop_state may go out: only once this connection's config has been applied.
+func (n *Node) reporting() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.configured
+}
+
 func (n *Node) sendStatus() {
+	if !n.reporting() {
+		return
+	}
 	st := n.latch.State()
 	s := protocol.Status{Firmware: "openvibe-node-" + n.opt.Version, Capabilities: map[string]any{}, AgentVersion: n.opt.Version,
-		DeviceKind: n.opt.Config.DeviceKind, OS: runtime.GOOS, Arch: runtime.GOARCH, EstopLatched: st.Remote, LocalStop: st.Local,
+		DeviceKind: n.opt.Config.DeviceKind, OS: runtime.GOOS, Arch: runtime.GOARCH, EstopLatched: st.Stopped(), LocalStop: st.Local,
 		Drivers: []protocol.DriverStatus{}, Faults: []protocol.Fault{}}
 	for _, i := range n.mgr.Infos() {
 		d := protocol.DriverStatus{Name: i.Name, State: i.State}
