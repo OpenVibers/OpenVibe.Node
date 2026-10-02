@@ -47,10 +47,14 @@ func TestHelperProcess(t *testing.T) {
 		}
 	case "env":
 		cwd, _ := os.Getwd()
-		_, lerr := net.Listen("tcp", "127.0.0.1:0")
+		// A down loopback still lets a socket bind 127.0.0.1; connecting to it is what fails.
+		lerr := errors.New("no listener")
+		if l, err := net.Listen("tcp", "127.0.0.1:0"); err == nil {
+			_, lerr = net.DialTimeout("tcp", l.Addr().String(), time.Second)
+		}
 		_, derr := net.DialTimeout("tcp", "192.0.2.1:9", time.Second)
 		_ = json.NewEncoder(result).Encode(map[string]any{"env": os.Environ(), "cwd": cwd, "pid": os.Getpid(),
-			"uid": os.Getuid(), "listen": fmt.Sprint(lerr), "dial": fmt.Sprint(derr)})
+			"uid": os.Getuid(), "loopback": fmt.Sprint(lerr), "dial": fmt.Sprint(derr)})
 	}
 	os.Exit(0)
 }
@@ -151,10 +155,10 @@ func TestIsolation(t *testing.T) {
 	run(t, w, j)
 	ex := s.exit(t, j.ID)
 	var r struct {
-		Env          []string
-		Cwd          string
-		PID, UID     int
-		Listen, Dial string
+		Env            []string
+		Cwd            string
+		PID, UID       int
+		Loopback, Dial string
 	}
 	if err := json.Unmarshal(ex.Result, &r); err != nil || ex.Reason != protocol.ExitExited {
 		t.Fatalf("%+v %s: %v", ex, ex.Result, err)
@@ -162,8 +166,8 @@ func TestIsolation(t *testing.T) {
 	if r.PID != 1 || r.UID != os.Getuid() {
 		t.Fatalf("pid %d uid %d, want 1 and %d", r.PID, r.UID, os.Getuid())
 	}
-	if r.Listen == "<nil>" || r.Dial == "<nil>" {
-		t.Fatalf("network reachable: listen %s, dial %s", r.Listen, r.Dial)
+	if r.Loopback == "<nil>" || r.Dial == "<nil>" {
+		t.Fatalf("network reachable: loopback %s, dial %s", r.Loopback, r.Dial)
 	}
 	for _, kv := range r.Env {
 		if strings.HasPrefix(kv, "OPENVIBE_NODE_SECRET=") {
