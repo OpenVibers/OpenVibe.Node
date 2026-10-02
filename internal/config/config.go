@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 )
@@ -106,6 +107,66 @@ type Config struct {
 	// Python is the interpreter for plugins without an explicit command (default: <state>/venv/bin/python, then python3).
 	Python   string `json:"python,omitempty"`
 	LogLevel string `json:"log_level,omitempty"`
+	// Worker runs `function` jobs from the control link (docs/worker.md). Off unless enabled.
+	Worker WorkerConfig `json:"worker,omitzero"`
+}
+
+// WorkerConfig is the job worker. Disabled (the default), every job is refused "class not available". Only the
+// functions listed here ever run: a job names one by name and exact version, and nothing is downloaded.
+type WorkerConfig struct {
+	Enabled   bool             `json:"enabled,omitempty"`
+	Functions []FunctionConfig `json:"functions,omitempty"`
+	// RunAs is the dedicated unprivileged uid/gid jobs run as; it needs the Node to run as root. Without it the Node
+	// refuses to run jobs unless AllowSameUser is set.
+	RunAs *RunAs `json:"run_as,omitempty"`
+	// AllowSameUser runs jobs as the Node's own user (no run_as). A job can then read every file the Node can,
+	// including credential.json, and use the Node user's groups (gpio, dialout, video): for development only.
+	AllowSameUser bool       `json:"allow_same_user,omitempty"`
+	Caps          WorkerCaps `json:"caps,omitzero"`
+}
+
+// FunctionConfig is one function a job may run: Command is started with the job's args as JSON on stdin.
+type FunctionConfig struct {
+	Name    string            `json:"name"`
+	Version string            `json:"version"`
+	Command []string          `json:"command"` // Command[0] is an absolute path
+	Env     map[string]string `json:"env,omitempty"`
+}
+
+// RunAs is a uid and gid on this machine.
+type RunAs struct {
+	UID uint32 `json:"uid"`
+	GID uint32 `json:"gid"`
+}
+
+// WorkerCaps are the owner's local caps on every job; a job's own ttl_ms and limits are clamped to them (the
+// stricter value wins). Zero means the default (DefaultWorkerCaps).
+type WorkerCaps struct {
+	MaxTTLMS       int64 `json:"max_ttl_ms,omitempty"`
+	MaxWallMS      int64 `json:"max_wall_ms,omitempty"`
+	MaxCPUMS       int64 `json:"max_cpu_ms,omitempty"`
+	MaxMemBytes    int64 `json:"max_mem_bytes,omitempty"`
+	MaxOutputBytes int64 `json:"max_output_bytes,omitempty"` // stdout of one job, in bytes
+	MaxJobs        int   `json:"max_jobs,omitempty"`         // jobs running at once
+}
+
+// DefaultWorkerCaps are the caps for every field the config leaves at zero.
+var DefaultWorkerCaps = WorkerCaps{MaxTTLMS: 600000, MaxWallMS: 300000, MaxCPUMS: 300000, MaxMemBytes: 512 << 20,
+	MaxOutputBytes: 1 << 20, MaxJobs: 1}
+
+// WithDefaults fills the zero fields of c from DefaultWorkerCaps.
+func (c WorkerCaps) WithDefaults() WorkerCaps {
+	d := DefaultWorkerCaps
+	for _, f := range []struct{ v, def *int64 }{{&c.MaxTTLMS, &d.MaxTTLMS}, {&c.MaxWallMS, &d.MaxWallMS},
+		{&c.MaxCPUMS, &d.MaxCPUMS}, {&c.MaxMemBytes, &d.MaxMemBytes}, {&c.MaxOutputBytes, &d.MaxOutputBytes}} {
+		if *f.v <= 0 {
+			*f.v = *f.def
+		}
+	}
+	if c.MaxJobs <= 0 {
+		c.MaxJobs = d.MaxJobs
+	}
+	return c
 }
 
 type LocalLimits struct {
@@ -238,6 +299,35 @@ func (c *Config) Validate() error {
 		if l != nil && (*l < 0 || *l > 1) {
 			return errors.New("config: limits must be between 0 and 1")
 		}
+	}
+	return c.Worker.validate()
+}
+
+var (
+	functionNameRe    = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	functionVersionRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$`)
+)
+
+func (w WorkerConfig) validate() error {
+	seen := map[string]bool{}
+	for _, f := range w.Functions {
+		if !functionNameRe.MatchString(f.Name) || !functionVersionRe.MatchString(f.Version) {
+			return fmt.Errorf("config: worker function %q version %q: name or version is not a valid artifact name or exact version", f.Name, f.Version)
+		}
+		if seen[f.Name+"@"+f.Version] {
+			return fmt.Errorf("config: worker function %s@%s listed twice", f.Name, f.Version)
+		}
+		seen[f.Name+"@"+f.Version] = true
+		if len(f.Command) == 0 || !filepath.IsAbs(f.Command[0]) {
+			return fmt.Errorf("config: worker function %s@%s needs a command starting with an absolute path", f.Name, f.Version)
+		}
+	}
+	if w.RunAs != nil && (w.RunAs.UID == 0 || w.RunAs.GID == 0) {
+		return errors.New("config: worker.run_as must not be root (uid or gid 0)")
+	}
+	c := w.Caps
+	if c.MaxTTLMS < 0 || c.MaxWallMS < 0 || c.MaxCPUMS < 0 || c.MaxMemBytes < 0 || c.MaxOutputBytes < 0 || c.MaxJobs < 0 {
+		return errors.New("config: worker.caps must not be negative")
 	}
 	return nil
 }
