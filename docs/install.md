@@ -117,11 +117,13 @@ Raspberry Pi OS Bookworm (64-bit recommended). Enable I²C and SPI: `sudo raspi-
 `--driver adeept` (or `adeept-mecanum`).
 
 The kit's own software (`Adeept_Robot.service`, `WebServer.py` on `0.0.0.0:8888` with the fixed login
-`admin:123456`, MJPEG on `:5000`) must not run: anyone on the network could drive the car. The installer disables it,
-including autostart lines in root's and the invoking user's crontabs and `/etc/rc.local`. From a root shell, it checks
-`pi`'s crontab when that account exists. It comments out the kit's lines with the marker
-`#openvibe-node-disabled:` and keeps the original text, so running the installer again changes nothing. Check with
-`systemctl status Adeept_Robot.service`, `crontab -l` (and `sudo crontab -l -u pi` for a root-shell install) and
+`admin:123456`, MJPEG on `:5000`) must not run: anyone on the network could drive the car. The installer
+(`install/install.sh`) now does this automatically: it stops and disables `Adeept_Robot.service` and comments out the
+kit's autostart lines in the invoking user's crontab, root's crontab and `/etc/rc.local`, prefixing each with the
+marker `#openvibe-node-disabled:` and keeping the original text, so undoing it is removing the marker and a second
+run changes nothing. From a root shell, it checks `pi`'s crontab when that account exists. Verify with
+`systemctl status Adeept_Robot.service`, `crontab -l | grep openvibe-node-disabled` (and
+`sudo crontab -l -u pi | grep openvibe-node-disabled` for a root-shell install) and
 `grep openvibe-node-disabled /etc/rc.local`. The Node replaces it.
 
 If a direction is wrong on your car, fix it in `config.json` → `plugins[0].config`: `motors.<wheel>.direction`,
