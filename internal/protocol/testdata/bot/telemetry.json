@@ -1,0 +1,2 @@
+{ "v": 1, "seq": 13, "ts": 1738065600800, "type": "telemetry", "battery": 0.72, "voltage": 7.41,
+  "sensors": { "ultrasonic": 118 }, "rssi": -57 }

@@ -30,7 +30,20 @@ func NormalizeCode(code string) (string, error) {
 	return c, nil
 }
 
-// Pair redeems a one-time code at <server>/api/v1/pair.
+// RobotRe matches an OpenVibe.Bot robot id (rob_ + a ULID).
+var RobotRe = regexp.MustCompile(`^rob_[0-9A-Za-z]{6,64}$`)
+
+// pairMessages turns Bot's problem codes into what the person at the terminal should do next.
+var pairMessages = map[string]string{
+	"bot.invalid_pairing_code": "a pairing code is 8 letters and digits, like ABCD-1234",
+	"bot.pairing_code_invalid": "that is not the pairing code for this robot; check it, or ask for a new one on openvibe.bot",
+	"bot.pairing_code_locked":  "too many wrong tries: the code is dead; ask for a new one on openvibe.bot",
+	"bot.pairing_code_used":    "the pairing code was already used; ask for a new one on openvibe.bot",
+	"bot.pairing_code_expired": "the pairing code expired (codes last 10 minutes); ask for a new one on openvibe.bot",
+	"bot.no_pairing_code":      "this robot has no live pairing code; ask for a new one on openvibe.bot",
+}
+
+// Pair redeems a one-time code with POST <server>/api/v1/pair.
 func Pair(ctx context.Context, client *http.Client, server string, req protocol.PairRequest) (*credentials.Credentials, error) {
 	u, err := url.Parse(server)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
@@ -63,19 +76,19 @@ func Pair(ctx context.Context, client *http.Client, server string, req protocol.
 		return nil, fmt.Errorf("pairing response: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		var pe protocol.PairError
+		var pe protocol.Problem
 		_ = json.Unmarshal(raw, &pe)
-		switch {
-		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone || pe.Error == "invalid_code" || pe.Error == "expired":
-			return nil, errors.New("the pairing code is wrong, used or expired; ask for a new one on openvibe.bot")
-		case resp.StatusCode == http.StatusTooManyRequests:
-			return nil, errors.New("too many wrong tries for this code; ask for a new one on openvibe.bot")
+		if m, ok := pairMessages[pe.Code]; ok {
+			return nil, errors.New(m)
 		}
-		msg := pe.Message
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, errors.New("too many pairing attempts from here; wait a minute and try again")
+		}
+		msg := pe.Detail
 		if msg == "" {
-			msg = pe.Error
+			msg = pe.Title
 		}
-		return nil, fmt.Errorf("pairing refused: HTTP %d %s", resp.StatusCode, msg)
+		return nil, fmt.Errorf("pairing refused: HTTP %d %s %s", resp.StatusCode, pe.Code, msg)
 	}
 	var pr protocol.PairResponse
 	if err := json.Unmarshal(raw, &pr); err != nil {
@@ -85,9 +98,9 @@ func Pair(ctx context.Context, client *http.Client, server string, req protocol.
 		return nil, errors.New("pairing response has no device id or credential")
 	}
 	return &credentials.Credentials{
-		DeviceID: pr.DeviceID, Credential: credentials.NewSecret(pr.Credential), PublishKey: credentials.NewSecret(pr.PublishKey),
-		Server: strings.TrimSuffix(server, "/"), DeviceURL: pr.DeviceURL, WHIPURL: pr.WHIPURL, ICEServers: pr.ICEServers,
-		Profile: pr.Profile, PairedAt: time.Now().UTC(),
+		DeviceID: pr.DeviceID, RobotID: pr.RobotID, Credential: credentials.NewSecret(pr.Credential),
+		PublishKey: credentials.NewSecret(pr.PublishKey), Server: strings.TrimSuffix(server, "/"), Profile: pr.Profile,
+		PairedAt: time.Now().UTC(),
 	}, nil
 }
 

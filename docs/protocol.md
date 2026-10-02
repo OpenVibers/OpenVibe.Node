@@ -1,46 +1,50 @@
 # Node ↔ OpenVibe.Bot protocol (bot.device-message@1, device side)
 
-This is the wire format the Node speaks today, from ADR-043 decisions 1, 2, 4, 5 and 6. OpenVibe.Bot's own
-`docs/protocol.md` is the source of truth; every field name below lives in one Go package, `internal/protocol/`, so
-aligning with it is a change to that package only. The ADR-043 text mirrored in this repo is updated to match (pairing
-field `code`, relative `deadline_ms`, plugin events in `telemetry.events`). Points still to be confirmed with the
-service are marked **(to align)**.
+OpenVibe.Bot's own `docs/protocol.md` (section 1, the `/device` socket) and its `POST /api/v1/pair` handler are the
+source of truth. Every field name below lives in one Go package, `internal/protocol/`, and the exact frames from Bot's
+doc are pinned verbatim in [`internal/protocol/testdata/bot`](../internal/protocol/testdata/bot) (its README names the
+Bot commit). `go test ./internal/protocol ./internal/link` decodes every one of them and drives the fake server
+(`internal/fakebot`) through pair → connect → command → ack → reconnect with those exact bytes.
 
 ## 1. Pairing
 
-The owner adds a robot on openvibe.bot and gets an 8-character code (Crockford base32, shown `XXXX-XXXX`, 10 minutes,
-single use, 5 wrong tries end it). The Node normalises it (upper case; dash and spaces removed; `I`/`L` → `1`, `O` → `0`)
-and redeems it:
+The owner adds a robot on openvibe.bot and gets an 8-character code (shown `XXXX-XXXX`, 10 minutes, single use, 5 wrong
+tries end it) and an installer command with the robot's id: `… | sh -s -- --robot rob_… --code XXXX-XXXX`. The Node
+normalises the code (upper case; dash and spaces removed; `I`/`L` → `1`, `O` → `0`, as Bot does) and redeems it over
+HTTPS, which Bot offers for agents that pair without a socket:
 
 ```http
 POST https://openvibe.bot/api/v1/pair
 Content-Type: application/json
 
-{"code": "ABCD1234", "agent_version": "v0.1.0", "device_kind": "onboard",
+{"robot": "rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X", "code": "7Q2M4XZP", "agent_version": "v0.1.0", "device_kind": "onboard",
  "drivers": ["adeept_adr036"],
  "capabilities": {"adeept_adr036": {"drive": {"type": "differential"}, "ptz": {...}, ...}},
- "os": "linux", "arch": "arm64", "hostname": "rover"}
+ "name": "rover"}
 ```
 
+The body has exactly the fields of Bot's `pair` frame without the envelope. `robot` (from `--robot`) attributes a wrong
+try to that robot's code; `name` (from `--name`, default the hostname, at most 80 characters) is what the owner sees.
 `device_kind` is `onboard` (the Node runs on the robot) or `bridge` (it drives the robot over the robot's own link, as
 with Cozmo). `capabilities` is keyed by plugin name and holds each plugin's `describe` capabilities
-([plugins.md](plugins.md)). The code field is `code`, as in Bot's `docs/protocol.md`.
+([plugins.md](plugins.md)).
 
-Answer `2xx`:
+Answer `201`:
 
 ```json
-{"device_id": "dev_…", "credential": "<32 random bytes, encoded>", "publish_key": "…",
- "profile": {…bot.robot-profile@1…},
- "whip_url": "https://…/whip/…", "device_url": "wss://openvibe.bot/device",
- "ice_servers": [{"urls": ["turn:…"], "username": "…", "credential": "…"}]}
+{"device_id": "dev_…", "credential": "…", "publish_key": "…", "robot_id": "rob_…",
+ "profile": {"id": "adeept.adr036", "limits": {"max_command_ms": 300, "heartbeat_ms": 1000}, …}}
 ```
 
-`whip_url`, `device_url` and `ice_servers` are optional; without `device_url` the Node dials `wss://<origin>/device`
-**(to align: where the WHIP URL comes from)**. Errors: `404`/`410` or `{"error":"invalid_code"|"expired"}` → "code wrong,
-used or expired"; `429` → "too many tries". Plain `http://` is refused except for `localhost` (tests).
+This is Bot's `paired` frame with `robot_ids[0]` as `robot_id` (and no `profile_id`; it is `profile.id`). Errors are
+RFC 9457 problems; the Node turns their `code` into a sentence: `bot.pairing_code_invalid` (wrong code),
+`bot.pairing_code_locked` (5 wrong tries), `bot.pairing_code_used`, `bot.pairing_code_expired`, `bot.no_pairing_code`,
+`bot.invalid_pairing_code` (malformed); `429` → "wait a minute". Plain `http://` is refused except for `localhost`
+(tests).
 
-The credential and publish key are stored in `credential.json` (mode 0600) and never appear in a URL, a log line, an
-error, `openvibe-node status` or telemetry (the Go type `credentials.Secret` prints as `[redacted]` in every format).
+The credential and publish key are stored in `credential.json` (mode 0600, with the device and robot ids) and never
+appear in a URL, a log line, an error, `openvibe-node status` or telemetry (the Go type `credentials.Secret` prints as
+`[redacted]` in every format).
 
 ## 2. The control link
 
@@ -52,7 +56,14 @@ Authorization: Bearer <credential>
 User-Agent: openvibe-node/<version>
 ```
 
-`401`/`403` means the credential was revoked or rotated away: the Node logs "pair again" and keeps retrying slowly.
+Bot upgrades first and authenticates after, so the Node sends nothing and counts the link as up only once `hello`
+arrives (Bot answers any frame on a not-yet-authenticated socket with `error` `bot.not_paired`). Close codes:
+
+| code / answer                | meaning                                              | the Node                                               |
+|------------------------------|------------------------------------------------------|--------------------------------------------------------|
+| `4000`                       | a second connection with this credential replaced it | waits 60 s (+ jitter) before dialing, so two agents with one credential do not kick each other off every second |
+| `4002`, or HTTP `401`/`403`  | the credential is wrong or revoked                   | retries after ≥ 10 s; gives up after 3 in a row, "pair again" |
+| `4003`                       | the owner revoked the device while it was connected  | stops the link at once, "pair again"                    |
 
 ### Frames
 
@@ -65,34 +76,40 @@ Every frame is one JSON object in one text message with the envelope fields at t
 | `ts`   | int    | sender's clock, Unix milliseconds                                      |
 | `type` | string | message type                                                           |
 
-Unknown `type`s are ignored (a newer server may send more). Frames are at most 1 MiB.
+Unknown `type`s are ignored (a newer server may send more). Frames are at most 1 MiB. `heartbeat` and `heartbeat_ack`
+carry their own `seq` (the echoed heartbeat number) in the same object as the envelope's; the Node sets a heartbeat's
+`seq` equal to its envelope `seq`, so either reading gives the same number.
 
 ### Server → device
 
 | type            | fields                                                                                           |
 |-----------------|--------------------------------------------------------------------------------------------------|
-| `hello`         | `device_id`, `robot_id`, `session`, `server_time`                                                |
-| `config`        | `limits` {`max_speed` 0..1, `max_turn` 0..1, `max_command_ms`}, `heartbeat_ms`, `deadman_ms`, `telemetry_ms` (≥ 500), `allowed` [kinds] |
-| `command`       | `id` (idempotency key), `kind`, `value`, `deadline_ms`, `operator`, `role`, `target` (optional plugin name) |
-| `estop`         | `reason`, `by` — latched                                                                         |
-| `estop_clear`   | `by` — the owner clears the remote e-stop                                                        |
-| `heartbeat_ack` | `t` (echo of the heartbeat's `t`; the Node measures RTT from it)                                 |
+| `hello`         | `session_id`, `device_id`, `robot_ids` [], `server_time` (RFC 3339) — on every authenticated connection |
+| `config`        | `heartbeat_ms`, `limits` {`max_speed` 0..1, `max_turn` 0..1, `max_command_ms`, `heartbeat_ms`}, `allowed_commands` [kinds], `estop_latched` — right after `hello` |
+| `command`       | `id` (idempotency key), `kind`, `value`, `deadline_ms` (absolute, motion kinds only), `operator` {`subject`, `role`}, `robot_id`; Node only: `target` (plugin name) |
+| `estop`         | `latched` (true: the e-stop latched; false: the owner cleared it), `by`, `at`                    |
+| `heartbeat_ack` | `seq` (the heartbeat's), `server_time`; the Node measures RTT from its own send time             |
+| `error`         | `code`, `detail` — a frame the server refused; logged, never fatal                               |
+
+`config.estop_latched` is the robot's e-stop as the server holds it: an owner e-stop set while the device was offline
+latches the Node on reconnect, and a clear made while offline releases it.
 
 ### Device → server
 
 | type          | fields                                                                                              |
 |---------------|-----------------------------------------------------------------------------------------------------|
-| `status`      | `agent_version`, `device_kind`, `os`, `arch`, `drivers` [{`name`, `driver`, `version`, `state`, `capabilities`}], `faults` [{`code`, `driver`, `message`}], `estop_latched`, `local_stop`, `video` |
-| `telemetry`   | `battery` {`volts`, `percent`}, `rssi`, `sensors` {…}, `events` [{`name`, `driver`, `ts`, `fields`}] |
-| `ack`         | `id`, `latency_ms` (receipt → plugin ack)                                                           |
-| `nack`        | `id`, `fault_code`, `message`                                                                       |
-| `heartbeat`   | `t` (device clock, ms)                                                                              |
-| `estop_state` | `latched` (remote e-stop), `local_stop` (local kill switch), `reason`                              |
+| `status`      | `firmware` (`openvibe-node-<version>`), `capabilities` {per plugin}, `faults` [{`code`, `driver`, `message`}], `estop_latched`; Node extras: `agent_version`, `device_kind`, `os`, `arch`, `drivers` [{`name`, `driver`, `version`, `state`, `capabilities`}], `local_stop`, `video` |
+| `telemetry`   | `battery` (0..1), `voltage` (V), `rssi`, `sensors` {…}; Node extra: `events` [{`name`, `driver`, `ts`, `fields`}] |
+| `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack)                                               |
+| `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
+| `heartbeat`   | `seq`, `rtt_ms` (the last measured round trip, once there is one)                                   |
+| `estop_state` | `latched` (the remote e-stop), `by` (`device`), `at`; Node extras: `local_stop` (local kill switch), `reason` |
 
-`status` and `estop_state` are sent on every connect and whenever a plugin changes state, faults or the latch changes.
-Plugin events (`cliff`, `picked_up`, `low_battery`, `heartbeat_lost`, …) travel in `telemetry.events` and are sent
-within 100 ms; sensor telemetry is sent at most every `telemetry_ms` (default 500 ms, so ≤ 2 Hz). There is no
-separate `event` message type.
+`status` is sent when `hello` arrives and whenever a plugin changes state or faults; `estop_state` after every
+`config` and whenever the latch changes (never before `config`: Bot takes a device's `estop_state` as the robot's
+latch, so reporting "clear" before learning of an owner e-stop would clear it). Plugin events (`cliff`, `picked_up`,
+`low_battery`, `heartbeat_lost`, …) travel in `telemetry.events` and are sent within 100 ms; sensor telemetry is sent
+at most every 500 ms (≤ 2 Hz, Bot's cap). There is no separate `event` message type.
 
 ### Commands
 
@@ -109,15 +126,18 @@ Sign conventions: `throttle`/`x` positive = forward; `steer` positive = turn rig
 `rotation` positive = counter-clockwise (left); `pan` positive = right, `tilt` positive = up (plugins can invert a
 servo in their config to make the hardware match).
 
-`deadline_ms` is **relative to receipt** (milliseconds the command stays valid), not an absolute timestamp: a device's
-clock may be minutes off, and a relative deadline cannot be stretched by clock skew. Default 300 ms; capped at
-`max_command_ms` (default 1000). A held control is re-sent by the panel every 150 ms, each with a new `id`.
+`deadline_ms` is an **absolute** instant in Unix milliseconds on the server's clock, present on `drive`, `actuator` and
+`ptz`. A device's clock may be minutes off, so the Node never compares it with its own clock: it takes
+`deadline_ms − ts` (both from the server's clock) as the time the command stays valid and starts that window at
+receipt. A deadline at or before `ts` → `nack bad_value`. No `deadline_ms` → 300 ms. Always capped at `max_command_ms`
+(default 1000). A held control is re-sent by the panel every 150 ms, each with a new `id`. Plugins still get a
+relative `deadline_ms` ([plugins.md](plugins.md)).
 
 What the Node does with a command, in order:
 
 1. A repeated `id` is answered with the first result and never executed again (the cache lives for 10 minutes and
    across reconnects).
-2. Unknown kind → `nack unsupported`. Kind not in `config.allowed` → `nack not_allowed` (`halt` is always allowed).
+2. Unknown kind → `nack unsupported`. Kind not in `config.allowed_commands` → `nack not_allowed` (`halt` is always allowed).
 3. `halt` → every plugin stops, `ack`.
 4. `drive`, `ptz`, `actuator` while the local kill switch is latched → `nack local_stop`; while the remote e-stop is
    latched → `nack estopped`.
@@ -139,10 +159,11 @@ Commands are never queued while offline and never replayed after a reconnect.
 
 ### Heartbeat, deadman, reconnect
 
-- The device sends `heartbeat` every `heartbeat_ms` (default 1000). The server answers `heartbeat_ack`.
-- If nothing at all arrives from the server for `deadman_ms` (default 2 × `heartbeat_ms`: two missed heartbeats), the
-  Node closes the link. Every close stops every actuator at once.
-- Reconnect: exponential backoff from 0.5 s to 30 s with full jitter; at least 10 s after a `401`/`403`.
+- The device sends `heartbeat` every `config.heartbeat_ms` (default 1000). The server answers `heartbeat_ack`.
+- If nothing at all arrives from the server for 2 × `heartbeat_ms` (two missed heartbeats), the Node closes the link.
+  Every close stops every actuator at once. (Bot marks the device offline after `heartbeat_ms × 2 + 3000 ms`.)
+- Reconnect: exponential backoff from 0.5 s to 30 s with full jitter; see the close-code table for `4000`, `4002` and
+  `4003`.
 
 ## 3. Safety paths (ADR-043 decision 6)
 
@@ -150,7 +171,7 @@ Commands are never queued while offline and never replayed after a reconnect.
 |----------------------------------------------|----------------------------------------------------|-----------------------------------------|
 | motion command's deadline passes             | the plugin (its own timer)                         | no                                      |
 | 2 missed heartbeats / link closed            | the core → `stop` to every plugin                  | no                                      |
-| server `estop`                               | the core → `estop` to every plugin                 | yes, persisted; `estop_clear` or `openvibe-node resume` |
+| server `estop`                               | the core → `estop` to every plugin                 | yes, persisted; `estop` `latched:false` or `openvibe-node resume` |
 | `openvibe-node stop` (local kill switch)     | the core → `estop` to every plugin                 | yes, persisted; only `openvibe-node resume` |
 | core shutdown                                | `stop`, then stdin closed                          | no                                      |
 | core killed / crashed                        | the plugin: stdin EOF, or 1 s without a heartbeat  | no                                      |
@@ -161,7 +182,9 @@ The latch file is `latch.json` in the state directory. A corrupt latch file is r
 
 ## 4. Video (WHIP)
 
-The Node publishes one H.264 track (Constrained Baseline, `profile-level-id=42e01f`, packetization-mode 1) to
-`whip_url` with `Authorization: Bearer <publish_key>`: `POST` with `Content-Type: application/sdp` → `201` with the
+Bot hands out only the publish key (in the pairing answer); it does not own media and names no WHIP endpoint (the
+camera publishes to OpenRe). So the endpoint is local config, `video.whip_url` in `config.json`; without it video stays
+off and the log says so. When it is set, the Node publishes one H.264 track (Constrained Baseline,
+`profile-level-id=42e01f`, packetization-mode 1) to it with `Authorization: Bearer <publish_key>`: `POST` with `Content-Type: application/sdp` → `201` with the
 answer and a `Location`; `DELETE <Location>` on shutdown. PLI/FIR from the far end request a keyframe. The session is
 re-established with backoff; video runs on its own goroutines and never waits on control or vice versa.

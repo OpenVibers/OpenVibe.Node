@@ -5,10 +5,11 @@ like **OpenVibe.Bot** (robots: drive, cameras, sensors, with safety) and, later,
 for AI agents) can use the device. It connects out, needs no open ports, and keeps a local kill switch.
 
 ```sh
-curl -fsSL https://openvibe.bot/install | sh -s -- ABCD-1234 --robot adeept
+curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept
 ```
 
-Get the code on openvibe.bot. `--robot` is `adeept`, `adeept-mecanum`, `cozmo` or `none` (dry run). Details, manual
+openvibe.bot shows this command with the robot's id and a fresh code. `--driver` is `adeept`, `adeept-mecanum`, `cozmo`
+or `none` (dry run; the old `--robot adeept` form still works but is deprecated). Details, manual
 install, Windows and configuration: [docs/install.md](docs/install.md).
 
 ```sh

@@ -2,7 +2,8 @@
 // device WebSocket's frame envelope, each message type, fault codes and the endpoint paths. Nothing outside this
 // package knows a JSON field name, so aligning with the service's docs/protocol.md is a change to this package only.
 //
-// Source of truth: ADR-043 decisions 1, 2, 4, 5 and 6 (bot.device-message@1).
+// Source of truth: OpenVibe.Bot docs/protocol.md section 1 (the /device socket) and its POST /pair; the exact frames
+// are pinned in testdata/bot (see its README for the Bot commit).
 package protocol
 
 import (
@@ -26,10 +27,20 @@ const (
 	TypeHello        = "hello"
 	TypeConfig       = "config"
 	TypeCommand      = "command"
-	TypeEstop        = "estop"
-	TypeEstopClear   = "estop_clear"
+	TypeEstop        = "estop" // latched true sets the e-stop, false is the owner clearing it
 	TypeHeartbeatAck = "heartbeat_ack"
+	TypeError        = "error"
 )
+
+// Close codes the server ends the device socket with.
+const (
+	CloseReplaced = 4000 // a second connection with the same credential replaced this one
+	CloseInvalid  = 4002 // the credential is wrong or revoked (sent right after the upgrade)
+	CloseRevoked  = 4003 // the owner revoked the device while it was connected
+)
+
+// Error codes in error.code that the Node acts on.
+const ErrNotPaired = "bot.not_paired" // a frame arrived before the server authenticated the socket
 
 // Device → server message types.
 const (
@@ -105,10 +116,10 @@ type Frame struct {
 // ---- server → device ----
 
 type Hello struct {
-	DeviceID   string `json:"device_id,omitempty"`
-	RobotID    string `json:"robot_id,omitempty"`
-	Session    string `json:"session,omitempty"`
-	ServerTime int64  `json:"server_time,omitempty"`
+	SessionID  string   `json:"session_id"`
+	DeviceID   string   `json:"device_id"`
+	RobotIDs   []string `json:"robot_ids"`
+	ServerTime string   `json:"server_time"` // RFC 3339
 }
 
 type Limits struct {
@@ -116,37 +127,51 @@ type Limits struct {
 	MaxSpeed     *float64 `json:"max_speed,omitempty"`
 	MaxTurn      *float64 `json:"max_turn,omitempty"`
 	MaxCommandMS int      `json:"max_command_ms,omitempty"`
+	HeartbeatMS  int      `json:"heartbeat_ms,omitempty"`
 }
 
 type Config struct {
-	Limits      Limits   `json:"limits"`
-	HeartbeatMS int      `json:"heartbeat_ms,omitempty"`
-	DeadmanMS   int      `json:"deadman_ms,omitempty"`
-	TelemetryMS int      `json:"telemetry_ms,omitempty"`
-	Allowed     []string `json:"allowed,omitempty"` // command kinds the current operator may send; empty = all
+	HeartbeatMS     int      `json:"heartbeat_ms"`
+	Limits          Limits   `json:"limits"`
+	AllowedCommands []string `json:"allowed_commands"` // command kinds operators may send; empty = all
+	EstopLatched    bool     `json:"estop_latched"`
+}
+
+// Operator is who sent a command, as the server's gate saw them.
+type Operator struct {
+	Subject string `json:"subject"`
+	Role    string `json:"role"`
 }
 
 type Command struct {
-	ID         string          `json:"id"`
-	Kind       string          `json:"kind"`
-	Value      json.RawMessage `json:"value,omitempty"`
-	DeadlineMS int             `json:"deadline_ms,omitempty"` // milliseconds from receipt; see docs/protocol.md
-	Operator   string          `json:"operator,omitempty"`
-	Role       string          `json:"role,omitempty"`
-	Target     string          `json:"target,omitempty"` // optional driver name; default: the first driver with the capability
+	ID    string          `json:"id"`
+	Kind  string          `json:"kind"`
+	Value json.RawMessage `json:"value,omitempty"`
+	// DeadlineMS is an absolute instant in epoch milliseconds on the server's clock, present on motion kinds only.
+	DeadlineMS int64     `json:"deadline_ms,omitempty"`
+	Operator   *Operator `json:"operator,omitempty"`
+	RobotID    string    `json:"robot_id,omitempty"`
+	Target     string    `json:"target,omitempty"` // Node only: a driver name; default: the first driver with the capability
 }
 
+// Estop is sent when the e-stop latches (Latched true) or the owner clears it (Latched false).
 type Estop struct {
-	Reason string `json:"reason,omitempty"`
-	By     string `json:"by,omitempty"`
+	Latched bool   `json:"latched"`
+	By      string `json:"by,omitempty"`
+	At      string `json:"at,omitempty"` // RFC 3339
 }
 
-type EstopClear struct {
-	By string `json:"by,omitempty"`
-}
-
+// HeartbeatAck echoes the heartbeat's seq. The server writes it over the envelope's seq, so the decoded frame's
+// Seq is the echoed value too.
 type HeartbeatAck struct {
-	T int64 `json:"t"`
+	Seq        uint64 `json:"seq"`
+	ServerTime string `json:"server_time,omitempty"`
+}
+
+// Error is a frame the server refused.
+type Error struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // ---- device → server ----
@@ -166,6 +191,8 @@ type Fault struct {
 }
 
 type Status struct {
+	Firmware     string         `json:"firmware"`     // Bot: the agent's own version string
+	Capabilities map[string]any `json:"capabilities"` // Bot: per driver, as in the pairing request
 	AgentVersion string         `json:"agent_version"`
 	DeviceKind   string         `json:"device_kind,omitempty"`
 	OS           string         `json:"os,omitempty"`
@@ -177,11 +204,6 @@ type Status struct {
 	Video        string         `json:"video,omitempty"`
 }
 
-type Battery struct {
-	Volts   *float64 `json:"volts,omitempty"`
-	Percent *float64 `json:"percent,omitempty"`
-}
-
 type Event struct {
 	Name   string         `json:"name"`
 	Driver string         `json:"driver,omitempty"`
@@ -190,7 +212,8 @@ type Event struct {
 }
 
 type Telemetry struct {
-	Battery *Battery       `json:"battery,omitempty"`
+	Battery *float64       `json:"battery,omitempty"` // charge, 0..1
+	Voltage *float64       `json:"voltage,omitempty"`
 	RSSI    *int           `json:"rssi,omitempty"`
 	Sensors map[string]any `json:"sensors,omitempty"`
 	Events  []Event        `json:"events,omitempty"`
@@ -207,12 +230,17 @@ type Nack struct {
 	Message   string `json:"message,omitempty"`
 }
 
+// Heartbeat carries the same seq as its envelope (the link sets it), so the server's echo is unambiguous.
 type Heartbeat struct {
-	T int64 `json:"t"`
+	Seq   uint64 `json:"seq"`
+	RTTMS *int64 `json:"rtt_ms,omitempty"`
 }
 
 type EstopState struct {
 	Latched   bool   `json:"latched"`
+	By        string `json:"by,omitempty"`
+	At        string `json:"at,omitempty"` // RFC 3339
+	RobotID   string `json:"robot_id,omitempty"`
 	LocalStop bool   `json:"local_stop"`
 	Reason    string `json:"reason,omitempty"`
 }
@@ -221,8 +249,8 @@ func (Hello) MessageType() string        { return TypeHello }
 func (Config) MessageType() string       { return TypeConfig }
 func (Command) MessageType() string      { return TypeCommand }
 func (Estop) MessageType() string        { return TypeEstop }
-func (EstopClear) MessageType() string   { return TypeEstopClear }
 func (HeartbeatAck) MessageType() string { return TypeHeartbeatAck }
+func (Error) MessageType() string        { return TypeError }
 func (Status) MessageType() string       { return TypeStatus }
 func (Telemetry) MessageType() string    { return TypeTelemetry }
 func (Ack) MessageType() string          { return TypeAck }
@@ -235,8 +263,8 @@ var registry = map[string]func() Message{
 	TypeConfig:       func() Message { return &Config{} },
 	TypeCommand:      func() Message { return &Command{} },
 	TypeEstop:        func() Message { return &Estop{} },
-	TypeEstopClear:   func() Message { return &EstopClear{} },
 	TypeHeartbeatAck: func() Message { return &HeartbeatAck{} },
+	TypeError:        func() Message { return &Error{} },
 	TypeStatus:       func() Message { return &Status{} },
 	TypeTelemetry:    func() Message { return &Telemetry{} },
 	TypeAck:          func() Message { return &Ack{} },
@@ -305,7 +333,7 @@ func derefMessage(m Message) Message {
 		return *v
 	case *Estop:
 		return *v
-	case *EstopClear:
+	case *Error:
 		return *v
 	case *HeartbeatAck:
 		return *v
@@ -327,21 +355,42 @@ func derefMessage(m Message) Message {
 
 // ---- pairing (HTTPS) ----
 
+// PairBodyFromPaired turns Bot's `paired` frame (pairing over the socket) into the body its POST /api/v1/pair answers
+// with: the same device id, credential, publish key and profile, and robot_ids[0] as robot_id (server/api/v1.js).
+func PairBodyFromPaired(frame []byte) []byte {
+	var p struct {
+		DeviceID   string          `json:"device_id"`
+		Credential string          `json:"credential"`
+		PublishKey string          `json:"publish_key"`
+		RobotIDs   []string        `json:"robot_ids"`
+		Profile    json.RawMessage `json:"profile"`
+	}
+	if json.Unmarshal(frame, &p) != nil {
+		return nil
+	}
+	r := PairResponse{DeviceID: p.DeviceID, Credential: p.Credential, PublishKey: p.PublishKey, Profile: p.Profile}
+	if len(p.RobotIDs) > 0 {
+		r.RobotID = p.RobotIDs[0]
+	}
+	b, _ := json.Marshal(r)
+	return b
+}
+
 // DeviceKind values for PairRequest.DeviceKind.
 const (
 	DeviceOnboard = "onboard"
 	DeviceBridge  = "bridge"
 )
 
+// PairRequest is the body of POST /api/v1/pair (the same fields as Bot's `pair` frame, without the envelope).
 type PairRequest struct {
+	Robot        string         `json:"robot,omitempty"` // rob_… from the installer command; attributes a wrong try to that robot's code
 	Code         string         `json:"code"`
 	AgentVersion string         `json:"agent_version"`
 	DeviceKind   string         `json:"device_kind"`
 	Drivers      []string       `json:"drivers"`
 	Capabilities map[string]any `json:"capabilities"`
-	OS           string         `json:"os,omitempty"`
-	Arch         string         `json:"arch,omitempty"`
-	Hostname     string         `json:"hostname,omitempty"`
+	Name         string         `json:"name,omitempty"`
 }
 
 type ICEServer struct {
@@ -350,18 +399,19 @@ type ICEServer struct {
 	Credential string   `json:"credential,omitempty"`
 }
 
+// PairResponse is the 201 answer of POST /api/v1/pair. The credential and publish key appear only here.
 type PairResponse struct {
 	DeviceID   string          `json:"device_id"`
 	Credential string          `json:"credential"`
 	PublishKey string          `json:"publish_key"`
+	RobotID    string          `json:"robot_id"`
 	Profile    json.RawMessage `json:"profile,omitempty"`
-	WHIPURL    string          `json:"whip_url,omitempty"`
-	DeviceURL  string          `json:"device_url,omitempty"` // optional override of wss://<origin>/device
-	ICEServers []ICEServer     `json:"ice_servers,omitempty"`
 }
 
-// PairError is the body of a non-2xx pairing answer.
-type PairError struct {
-	Error   string `json:"error"`
-	Message string `json:"message,omitempty"`
+// Problem is the RFC 9457 body of a non-2xx answer from Bot's REST API.
+type Problem struct {
+	Status int    `json:"status"`
+	Code   string `json:"code"` // e.g. bot.pairing_code_invalid
+	Title  string `json:"title,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }

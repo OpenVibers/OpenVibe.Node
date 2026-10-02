@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"runtime"
@@ -124,8 +125,16 @@ func New(opt Options) (*Node, error) {
 		}
 		n.link = link.New(link.Options{URL: u, Credential: opt.Creds.Credential, UserAgent: "openvibe-node/" + opt.Version,
 			Log: opt.Log, HeartbeatInterval: opt.HeartbeatInterval, BackoffMin: opt.LinkBackoffMin}, n)
-		if opt.Creds.WHIPURL != "" && opt.Config.Video.Source != "off" {
-			n.pub = video.NewPublisher(video.Options{WHIPURL: opt.Creds.WHIPURL, PublishKey: opt.Creds.PublishKey,
+		// Bot hands out only the publish key; the WHIP endpoint is local config (or an older pairing's stored URL).
+		whip := opt.Config.Video.WHIPURL
+		if whip == "" {
+			whip = opt.Creds.WHIPURL
+		}
+		if whip == "" && opt.Config.Video.Source != "off" {
+			opt.Log.Info("video off: no video.whip_url in the config")
+		}
+		if whip != "" && opt.Config.Video.Source != "off" {
+			n.pub = video.NewPublisher(video.Options{WHIPURL: whip, PublishKey: opt.Creds.PublishKey,
 				ICEServers: opt.Creds.ICEServers, Log: opt.Log, IncludeLoopback: opt.VideoLoopback})
 		}
 	}
@@ -176,9 +185,10 @@ func (n *Node) Run(ctx context.Context) error {
 
 // ---- link.Handler ----
 
+// Connected sends status. estop_state waits for config: Bot treats a device's estop_state as the robot's latch, so
+// reporting "clear" before config told us about an owner e-stop set while we were offline would clear it.
 func (n *Node) Connected() {
 	n.sendStatus()
-	n.sendEstopState()
 }
 
 func (n *Node) Disconnected(err error) {
@@ -189,51 +199,69 @@ func (n *Node) Disconnected(err error) {
 func (n *Node) Frame(f protocol.Frame) {
 	switch m := f.Msg.(type) {
 	case protocol.Hello:
-		n.log.Info("server hello", "device", m.DeviceID)
+		n.log.Info("server hello", "device", m.DeviceID, "robots", m.RobotIDs, "session", m.SessionID)
 	case protocol.Config:
 		n.applyConfig(m)
 	case protocol.Command:
-		n.command(m, time.Now())
+		n.command(m, f.TS, time.Now())
 	case protocol.Estop:
-		n.log.Warn("e-stop from the server", "reason", m.Reason, "by", m.By)
-		n.mgr.EstopAll() // at once, before the disk write
-		if _, err := n.latch.SetRemote(m.Reason); err != nil {
-			n.log.Error("could not persist the e-stop (it is held in memory)", "err", err)
-		}
-		n.sendEstopState()
-	case protocol.EstopClear:
-		n.log.Warn("e-stop cleared by the server", "by", m.By)
-		if _, err := n.latch.ClearRemote(); err != nil {
-			n.log.Error("could not persist the e-stop clear", "err", err)
+		if m.Latched {
+			n.remoteEstop("by "+m.By, m.By)
+		} else {
+			n.remoteClear(m.By)
 		}
 		n.sendEstopState()
 	}
 }
 
+func (n *Node) remoteEstop(reason, by string) {
+	n.log.Warn("e-stop from the server", "by", by)
+	n.mgr.EstopAll() // at once, before the disk write
+	if _, err := n.latch.SetRemote(reason); err != nil {
+		n.log.Error("could not persist the e-stop (it is held in memory)", "err", err)
+	}
+}
+
+func (n *Node) remoteClear(by string) {
+	n.log.Warn("e-stop cleared by the server", "by", by)
+	if _, err := n.latch.ClearRemote(); err != nil {
+		n.log.Error("could not persist the e-stop clear", "err", err)
+	}
+}
+
 func (n *Node) applyConfig(c protocol.Config) {
+	// The server's estop_latched is the owner's latch: it may have been set or cleared while the link was down.
+	if st := n.latch.State(); c.EstopLatched && !st.Remote {
+		n.remoteEstop("latched on the server", "server")
+	} else if !c.EstopLatched && st.Remote {
+		n.remoteClear("server")
+	}
+	n.sendEstopState()
 	l := safety.Merge(c.Limits, n.opt.Config.Limits.MaxSpeed, n.opt.Config.Limits.MaxTurn, n.opt.Config.Limits.MaxCommandMS)
 	n.mu.Lock()
 	n.limits = l
 	n.allowed = nil
-	if len(c.Allowed) > 0 {
+	if len(c.AllowedCommands) > 0 {
 		n.allowed = map[string]bool{protocol.KindHalt: true}
-		for _, k := range c.Allowed {
+		for _, k := range c.AllowedCommands {
 			n.allowed[k] = true
 		}
 	}
-	if c.TelemetryMS >= 500 {
-		n.telemMS = c.TelemetryMS
-	}
 	n.mu.Unlock()
 	if n.link != nil {
-		n.link.SetTiming(c.HeartbeatMS, c.DeadmanMS)
+		hb := c.HeartbeatMS
+		if hb <= 0 {
+			hb = c.Limits.HeartbeatMS
+		}
+		n.link.SetTiming(hb)
 	}
 	n.log.Info("config", "max_speed", l.MaxSpeed, "max_turn", l.MaxTurn, "max_command_ms", l.MaxCommandMS)
 }
 
 // command validates and routes one command. The synchronous part (checks, clamping, queueing to the plugin) keeps
-// commands in arrival order; the reply is awaited on its own goroutine.
-func (n *Node) command(c protocol.Command, received time.Time) {
+// commands in arrival order; the reply is awaited on its own goroutine. sentMS is the frame's ts: the absolute
+// deadline_ms minus it is the time the server allowed, on the server's own clock, so clock skew does not matter.
+func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 	if c.ID == "" {
 		n.log.Warn("command without id ignored", "kind", c.Kind)
 		return
@@ -310,7 +338,19 @@ func (n *Node) command(c protocol.Command, received time.Time) {
 		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind)
 		return
 	}
-	deadline := limits.Deadline(c.DeadlineMS)
+	deadline := limits.Deadline(0)
+	if c.DeadlineMS > 0 {
+		ref := sentMS
+		if ref <= 0 {
+			ref = received.UnixMilli()
+		}
+		left := c.DeadlineMS - ref
+		if left <= 0 {
+			nack(protocol.FaultBadValue, "the command's deadline had already passed")
+			return
+		}
+		deadline = limits.Deadline(int(min(left, int64(limits.MaxCommandMS)+1)))
+	}
 	wait := p.Begin(n.ctx, c.ID, c.Kind, value, deadline)
 	go func() {
 		r := wait()
@@ -365,7 +405,8 @@ func (n *Node) pollLatch(ctx context.Context) {
 
 func (n *Node) sendEstopState() {
 	st := n.latch.State()
-	n.send(protocol.EstopState{Latched: st.Remote, LocalStop: st.Local, Reason: st.RemoteReason})
+	n.send(protocol.EstopState{Latched: st.Remote, By: "device", At: time.Now().UTC().Format(time.RFC3339Nano),
+		LocalStop: st.Local, Reason: st.RemoteReason})
 }
 
 // ---- plugin output ----
@@ -441,7 +482,7 @@ func (n *Node) flushTelemetry(eventsOnly bool) {
 		n.lastTelem = time.Now()
 	}
 	n.mu.Unlock()
-	if t.Battery == nil && len(t.Sensors) == 0 && t.RSSI == nil && len(t.Events) == 0 {
+	if t.Battery == nil && t.Voltage == nil && len(t.Sensors) == 0 && t.RSSI == nil && len(t.Events) == 0 {
 		return
 	}
 	n.send(t)
@@ -456,8 +497,13 @@ func mergeTelemetry(per map[string]map[string]any, events []protocol.Event) prot
 	sort.Strings(names)
 	for _, name := range names {
 		d := per[name]
-		if b, ok := d["battery"].(map[string]any); ok && t.Battery == nil {
-			t.Battery = &protocol.Battery{Volts: num(b["volts"]), Percent: num(b["percent"])}
+		// Plugins report battery {percent, volts}; Bot wants battery as a 0..1 fraction and voltage in volts.
+		if b, ok := d["battery"].(map[string]any); ok && t.Battery == nil && t.Voltage == nil {
+			if p := num(b["percent"]); p != nil {
+				frac := math.Max(0, math.Min(1, *p/100))
+				t.Battery = &frac
+			}
+			t.Voltage = num(b["volts"])
 		}
 		if r := num(d["rssi"]); r != nil && t.RSSI == nil {
 			v := int(*r)
@@ -651,12 +697,14 @@ func (n *Node) Status() Status {
 
 func (n *Node) sendStatus() {
 	st := n.latch.State()
-	s := protocol.Status{AgentVersion: n.opt.Version, DeviceKind: n.opt.Config.DeviceKind, OS: runtime.GOOS, Arch: runtime.GOARCH,
-		EstopLatched: st.Remote, LocalStop: st.Local, Drivers: []protocol.DriverStatus{}, Faults: []protocol.Fault{}}
+	s := protocol.Status{Firmware: "openvibe-node-" + n.opt.Version, Capabilities: map[string]any{}, AgentVersion: n.opt.Version,
+		DeviceKind: n.opt.Config.DeviceKind, OS: runtime.GOOS, Arch: runtime.GOARCH, EstopLatched: st.Remote, LocalStop: st.Local,
+		Drivers: []protocol.DriverStatus{}, Faults: []protocol.Fault{}}
 	for _, i := range n.mgr.Infos() {
 		d := protocol.DriverStatus{Name: i.Name, State: i.State}
 		if i.Describe != nil {
 			d.Driver, d.Version, d.Capabilities = i.Describe.Driver, i.Describe.Version, i.Describe.Capabilities
+			s.Capabilities[i.Name] = i.Describe.Capabilities
 		}
 		s.Drivers = append(s.Drivers, d)
 		if i.Fault != nil {
