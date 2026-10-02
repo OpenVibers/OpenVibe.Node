@@ -390,7 +390,8 @@ func (l *Link) session(ctx context.Context) error {
 			delete(l.hbSent, m.Seq)
 			l.mu.Unlock()
 			if ok {
-				l.lastRTT.Store(int64(time.Since(sent)))
+				// A coarse clock (Windows) can read 0 on a fast loopback; 0 means "not measured yet", so floor at 1 ns.
+				l.lastRTT.Store(int64(max(time.Since(sent), 1)))
 			}
 			continue
 		case protocol.Error:
