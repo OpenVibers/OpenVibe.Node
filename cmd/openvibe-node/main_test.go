@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenVibers/OpenVibe.Node/internal/config"
 	"github.com/OpenVibers/OpenVibe.Node/internal/credentials"
 	"github.com/OpenVibers/OpenVibe.Node/internal/fakebot"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
@@ -69,7 +70,11 @@ func TestPair(t *testing.T) {
 	if _, errOut, code := cli(t, "pair", "nope", "--home", home); code == 0 || !strings.Contains(errOut, "8 letters") {
 		t.Fatalf("bad code accepted: %s", errOut)
 	}
-	out, errOut, code := cli(t, "pair", "abcd-2345", "--home", home, "--server", srv.URL())
+	if _, errOut, code := cli(t, "pair", "abcd-2345", "--robot", "adeept", "--home", home, "--server", srv.URL()); code == 0 || !strings.Contains(errOut, "rob_") {
+		t.Fatalf("driver kind accepted as --robot: %s", errOut)
+	}
+	// The flags Bot's installer command uses: --robot rob_… --code CODE.
+	out, errOut, code := cli(t, "pair", "--code", "abcd-2345", "--robot", fakebot.RobotID, "--name", "Rover", "--home", home, "--server", srv.URL())
 	if code != 0 {
 		t.Fatalf("pair failed: %s", errOut)
 	}
@@ -88,7 +93,7 @@ func TestPair(t *testing.T) {
 		t.Fatal("config not written")
 	}
 	reqs := srv.PairRequests()
-	if len(reqs) != 1 || reqs[0].Code != "ABCD2345" || reqs[0].AgentVersion != version {
+	if len(reqs) != 1 || reqs[0].Code != "ABCD2345" || reqs[0].AgentVersion != version || reqs[0].Robot != fakebot.RobotID || reqs[0].Name != "Rover" {
 		t.Fatalf("%+v", reqs)
 	}
 	if _, err := exec.LookPath("python3"); err == nil && len(reqs[0].Drivers) != 1 {
@@ -141,6 +146,15 @@ func TestRunDryRun(t *testing.T) {
 	whip := &video.WHIPReceiver{PublishKey: c.PublishKey.Reveal()}
 	srv.SetWHIP(whip)
 	defer whip.Close()
+	// Bot hands out the publish key only; the WHIP endpoint is local config.
+	cfg, err := config.Load(filepath.Join(home, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Video.WHIPURL = srv.URL() + "/whip/" + c.DeviceID
+	if err := config.Save(filepath.Join(home, "config.json"), cfg); err != nil {
+		t.Fatal(err)
+	}
 
 	exe, _ := os.Executable()
 	cmd := exec.Command(exe, "run", "--dry-run", "--home", home)
@@ -170,7 +184,7 @@ func TestRunDryRun(t *testing.T) {
 	}
 	send := func(id, kind, value string) protocol.Message {
 		t.Helper()
-		conn.Send(protocol.Command{ID: id, Kind: kind, Value: json.RawMessage(value), DeadlineMS: 300})
+		conn.Command(protocol.Command{ID: id, Kind: kind, Value: json.RawMessage(value)}, 300)
 		r, err := conn.Reply(id, 5*time.Second)
 		if err != nil {
 			t.Fatal(err)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -169,7 +170,7 @@ func TestReconnectAfterDrop(t *testing.T) {
 	waitFrame(t, rec, protocol.TypeConfig)
 	c.Close()
 	<-rec.gotDown
-	if err := l.Send(protocol.Heartbeat{T: 1}); !errors.Is(err, ErrOffline) && l.Connected() == false {
+	if err := l.Send(protocol.Heartbeat{}); !errors.Is(err, ErrOffline) && l.Connected() == false {
 		t.Fatalf("send while offline: %v", err)
 	}
 	if _, err := srv.NextConn(3 * time.Second); err != nil {
@@ -187,12 +188,11 @@ func TestSendOffline(t *testing.T) {
 	}
 }
 
-func TestUnauthorizedNeverLogsCredential(t *testing.T) {
+// A revoke closes the live socket with 4003: the link stops for good and never logs the credential.
+func TestRevokedStopsAndNeverLogsCredential(t *testing.T) {
 	srv, l, rec, logs, cancel := setup(t, 100*time.Millisecond)
-	c, _ := srv.NextConn(3 * time.Second)
 	waitFrame(t, rec, protocol.TypeConfig)
 	srv.Revoke("cred-0123456789abcdef")
-	c.Close()
 	<-rec.gotDown
 	deadline := time.Now().Add(3 * time.Second)
 	for !strings.Contains(l.Stats().LastError, "pair again") {
@@ -201,9 +201,85 @@ func TestUnauthorizedNeverLogsCredential(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	time.Sleep(200 * time.Millisecond) // well past BackoffMax: a running loop would have dialed again
+	if n := srv.Connections(); n != 1 {
+		t.Fatalf("reconnected after a revoke: %d connections", n)
+	}
 	cancel()
 	if strings.Contains(logs.String(), "cred-0123456789abcdef") {
 		t.Fatalf("credential in logs: %s", logs.String())
+	}
+}
+
+// A credential the server does not know is closed with 4002 after the upgrade; the link gives up after MaxRefused.
+func TestRefusedCredentialGivesUp(t *testing.T) {
+	srv := fakebot.New()
+	defer srv.Close()
+	u, _ := DeviceURL(srv.URL())
+	rec := newRecorder()
+	l := New(Options{URL: u, Credential: credentials.NewSecret("cred-unknown"), BackoffMin: 10 * time.Millisecond, MaxRefused: 1,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, rec)
+	done := make(chan struct{})
+	go func() { l.Run(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("link kept dialing with a refused credential")
+	}
+	if !strings.Contains(l.Stats().LastError, "pair again") || rec.connected != 0 {
+		t.Fatalf("last error %q, connected %d", l.Stats().LastError, rec.connected)
+	}
+}
+
+// A second connection with the same credential replaces the first (4000); the replaced link waits ReplacedBackoff
+// instead of dialing straight back and kicking the newcomer off.
+func TestReplacedWaitsBeforeReconnecting(t *testing.T) {
+	srv := fakebot.New()
+	defer srv.Close()
+	srv.AddCredential("cred-x", "dev_x")
+	u, _ := DeviceURL(srv.URL())
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := newRecorder()
+	first := New(Options{URL: u, Credential: credentials.NewSecret("cred-x"), BackoffMin: 10 * time.Millisecond,
+		ReplacedBackoff: time.Hour, Log: quiet}, rec)
+	go first.Run(ctx)
+	waitFrame(t, rec, protocol.TypeConfig)
+	second := New(Options{URL: u, Credential: credentials.NewSecret("cred-x"), Log: quiet}, newRecorder())
+	go second.Run(ctx)
+	if err := <-rec.gotDown; err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("err %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := srv.Connections(); n != 2 || !second.Connected() {
+		t.Fatalf("connections %d, newcomer connected %v", n, second.Connected())
+	}
+}
+
+// Before hello the socket is not authenticated: nothing is sent and Connected has not run.
+func TestNothingSentBeforeHello(t *testing.T) {
+	srv := fakebot.New()
+	defer srv.Close()
+	srv.AddCredential("cred-x", "dev_x")
+	srv.Greeting = [][]byte{} // upgrade, authenticate, but stay silent
+	u, _ := DeviceURL(srv.URL())
+	rec := newRecorder()
+	l := New(Options{URL: u, Credential: credentials.NewSecret("cred-x"), HeartbeatInterval: 20 * time.Millisecond,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go l.Run(ctx)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if len(c.Frames()) != 0 || rec.connected != 0 || l.Connected() {
+		t.Fatalf("sent %d frames before hello", len(c.Frames()))
+	}
+	if err := l.Send(protocol.Heartbeat{}); !errors.Is(err, ErrOffline) {
+		t.Fatalf("send before hello: %v", err)
 	}
 }
 
@@ -228,18 +304,18 @@ func TestPair(t *testing.T) {
 	srv := fakebot.New()
 	defer srv.Close()
 	srv.AddCode("ABCD1234")
-	req := protocol.PairRequest{Code: "ABCD1234", AgentVersion: "t", DeviceKind: "onboard", Drivers: []string{"dryrun"}}
+	req := protocol.PairRequest{Robot: fakebot.RobotID, Code: "ABCD1234", AgentVersion: "t", DeviceKind: "onboard", Drivers: []string{"dryrun"}}
 	c, err := Pair(context.Background(), nil, srv.URL(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.DeviceID == "" || c.Credential.IsZero() || c.PublishKey.IsZero() || !strings.HasSuffix(c.WHIPURL, c.DeviceID) {
+	if c.DeviceID == "" || c.Credential.IsZero() || c.PublishKey.IsZero() || c.RobotID != fakebot.RobotID {
 		t.Fatalf("%+v", c)
 	}
-	if _, err := Pair(context.Background(), nil, srv.URL(), req); err == nil || !strings.Contains(err.Error(), "wrong, used or expired") {
+	if _, err := Pair(context.Background(), nil, srv.URL(), req); err == nil || !strings.Contains(err.Error(), "not the pairing code") {
 		t.Fatalf("code reused: %v", err)
 	}
-	if got := srv.PairRequests(); len(got) != 2 || got[0].Drivers[0] != "dryrun" || got[0].DeviceKind != "onboard" {
+	if got := srv.PairRequests(); len(got) != 2 || got[0].Drivers[0] != "dryrun" || got[0].DeviceKind != "onboard" || got[0].Robot != fakebot.RobotID {
 		t.Fatalf("%+v", got)
 	}
 	if _, err := Pair(context.Background(), nil, "http://openvibe.example", req); err == nil {

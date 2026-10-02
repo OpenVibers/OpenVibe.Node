@@ -2,7 +2,12 @@
 // authenticated with the device credential in the Authorization header of the upgrade (never in the URL). It sends a
 // heartbeat every interval, declares the link lost when nothing has arrived for the deadman interval (two heartbeats
 // by default), and reconnects with exponential backoff and full jitter. Nothing is queued while offline: Send fails
-// and the caller decides.
+// and the caller decides. The connection counts as up only once the server's hello arrives: OpenVibe.Bot
+// authenticates after the upgrade and answers anything sent earlier with error bot.not_paired.
+//
+// Close codes: 4000 (another connection with this credential replaced this one) waits ReplacedBackoff before trying
+// again, so two agents sharing a credential do not take turns kicking each other off; 4003 (revoked) ends Run;
+// 4002 (credential refused) ends Run after MaxRefused refusals in a row, so a server blip is survived.
 package link
 
 import (
@@ -29,9 +34,10 @@ var ErrOffline = errors.New("link offline")
 
 // Handler receives link events. Calls are made from the link's goroutines, one at a time per connection.
 type Handler interface {
-	// Connected runs after the upgrade, before any frame is read. The handler sends status and estop_state here.
+	// Connected runs when the server's hello arrives, before the hello itself reaches Frame. The handler sends status
+	// and estop_state here.
 	Connected()
-	// Frame is every decoded server frame except heartbeat_ack.
+	// Frame is every decoded server frame except heartbeat_ack and error.
 	Frame(f protocol.Frame)
 	// Disconnected runs when a connection ends for any reason. The handler must stop every actuator.
 	Disconnected(err error)
@@ -49,6 +55,8 @@ type Options struct {
 	Deadman           time.Duration // default 2 × heartbeat
 	BackoffMin        time.Duration // default 500 ms
 	BackoffMax        time.Duration // default 30 s
+	ReplacedBackoff   time.Duration // wait after close 4000; default 60 s
+	MaxRefused        int           // consecutive 4002 / HTTP 401 before giving up; default 3
 }
 
 // Link is the reconnecting control connection.
@@ -60,6 +68,7 @@ type Link struct {
 	mu        sync.Mutex
 	out       chan []byte
 	seq       uint64
+	hbSent    map[uint64]time.Time // heartbeat seq → send time, for the RTT
 	heartbeat time.Duration
 	deadman   time.Duration
 
@@ -83,6 +92,12 @@ func New(opt Options, h Handler) *Link {
 	if opt.BackoffMax <= 0 {
 		opt.BackoffMax = 30 * time.Second
 	}
+	if opt.ReplacedBackoff <= 0 {
+		opt.ReplacedBackoff = 60 * time.Second
+	}
+	if opt.MaxRefused <= 0 {
+		opt.MaxRefused = 3
+	}
 	if opt.Log == nil {
 		opt.Log = slog.Default()
 	}
@@ -94,16 +109,14 @@ func New(opt Options, h Handler) *Link {
 	return l
 }
 
-// SetTiming applies the server's heartbeat_ms / deadman_ms (from config) to the current and later connections.
-func (l *Link) SetTiming(heartbeatMS, deadmanMS int) {
+// SetTiming applies the server's config.heartbeat_ms to the current and later connections; the link is declared
+// lost after two intervals without a frame.
+func (l *Link) SetTiming(heartbeatMS int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if heartbeatMS > 0 {
 		l.heartbeat = time.Duration(heartbeatMS) * time.Millisecond
 		l.deadman = 2 * l.heartbeat
-	}
-	if deadmanMS > 0 {
-		l.deadman = time.Duration(deadmanMS) * time.Millisecond
 	}
 }
 
@@ -142,7 +155,23 @@ func (l *Link) Send(m protocol.Message) error {
 		return ErrOffline
 	}
 	l.seq++
-	b, err := protocol.Encode(l.seq, time.Now().UnixMilli(), m)
+	now := time.Now()
+	if hb, ok := m.(protocol.Heartbeat); ok {
+		// The body seq equals the envelope seq, so heartbeat_ack's echo is the same whichever the server reads.
+		hb.Seq = l.seq
+		if rtt := l.lastRTT.Load(); rtt > 0 {
+			ms := time.Duration(rtt).Milliseconds()
+			hb.RTTMS = &ms
+		}
+		m = hb
+		for s := range l.hbSent {
+			if s+8 < l.seq {
+				delete(l.hbSent, s)
+			}
+		}
+		l.hbSent[l.seq] = now
+	}
+	b, err := protocol.Encode(l.seq, now.UnixMilli(), m)
 	if err != nil {
 		return err
 	}
@@ -154,9 +183,10 @@ func (l *Link) Send(m protocol.Message) error {
 	}
 }
 
-// Run connects and reconnects until ctx ends.
+// Run connects and reconnects until ctx ends, the credential is revoked (close 4003), or the server has refused the
+// credential MaxRefused times in a row.
 func (l *Link) Run(ctx context.Context) {
-	attempt := 0
+	attempt, refused := 0, 0
 	for ctx.Err() == nil {
 		start := time.Now()
 		err := l.session(ctx)
@@ -165,6 +195,18 @@ func (l *Link) Run(ctx context.Context) {
 		}
 		msg := errMsg(err)
 		l.lastErr.Store(msg)
+		if errors.Is(err, errRevoked) {
+			l.log.Error("link stopped", "err", msg)
+			return
+		}
+		if errors.Is(err, errUnauthorized) {
+			if refused++; refused >= l.opt.MaxRefused {
+				l.log.Error("link stopped: the server refused the credential", "times", refused, "err", msg)
+				return
+			}
+		} else {
+			refused = 0
+		}
 		if time.Since(start) > 30*time.Second {
 			attempt = 0
 		}
@@ -177,6 +219,10 @@ func (l *Link) Run(ctx context.Context) {
 		}
 		// Full jitter, with a floor so a flapping server is not hammered.
 		wait := l.opt.BackoffMin/2 + time.Duration(rand.Int63n(int64(max)))
+		if errors.Is(err, errReplaced) {
+			// Another agent holds this credential now. Fighting it would flap both; come back much later.
+			wait = l.opt.ReplacedBackoff + time.Duration(rand.Int63n(int64(l.opt.ReplacedBackoff)/4+1))
+		}
 		attempt++
 		l.reconnects.Add(1)
 		l.log.Warn("link down; reconnecting", "err", msg, "in", wait.Round(time.Millisecond))
@@ -188,7 +234,28 @@ func (l *Link) Run(ctx context.Context) {
 	}
 }
 
-var errUnauthorized = errors.New("the server refused the device credential (revoked or rotated?); pair again with `openvibe-node pair <CODE>`")
+var (
+	errUnauthorized = errors.New("the server refused the device credential (revoked or rotated?); pair again with `openvibe-node pair <CODE>`")
+	errRevoked      = errors.New("the owner revoked this device; pair again with `openvibe-node pair <CODE>`")
+	errReplaced     = errors.New("another connection with this device's credential replaced this one (is a second agent running with the same credential?)")
+)
+
+// closeErr maps the server's close codes to the errors Run acts on.
+func closeErr(err error) error {
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) {
+		return nil
+	}
+	switch ce.Code {
+	case protocol.CloseReplaced:
+		return errReplaced
+	case protocol.CloseInvalid:
+		return errUnauthorized
+	case protocol.CloseRevoked:
+		return errRevoked
+	}
+	return nil
+}
 
 func errMsg(err error) string {
 	if err == nil {
@@ -216,13 +283,11 @@ func (l *Link) session(ctx context.Context) error {
 	defer conn.Close()
 	conn.SetReadLimit(1 << 20)
 
+	// Nothing is sent until the server's hello: until then the socket is not authenticated.
 	out := make(chan []byte, 256)
 	l.mu.Lock()
-	l.out, l.seq = out, 0
+	l.out, l.seq, l.hbSent = nil, 0, map[uint64]time.Time{}
 	l.mu.Unlock()
-	l.connected.Store(true)
-	l.connectedAt.Store(time.Now().UnixMilli())
-	l.log.Info("link up", "url", redactURL(l.opt.URL))
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	var endErr error
@@ -285,7 +350,7 @@ func (l *Link) session(ctx context.Context) error {
 				}
 				if !now.Before(next) {
 					next = now.Add(hb)
-					_ = l.Send(protocol.Heartbeat{T: now.UnixMilli()})
+					_ = l.Send(protocol.Heartbeat{})
 				}
 				if now.Sub(time.Unix(0, lastRx.Load())) > deadman {
 					end(fmt.Errorf("heartbeat lost: nothing from the server for %s", deadman))
@@ -295,13 +360,16 @@ func (l *Link) session(ctx context.Context) error {
 		}
 	}()
 
-	l.handler.Connected()
-
+	up := false
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if sessCtx.Err() == nil {
-				end(fmt.Errorf("read: %s", scrub(err.Error(), l.opt.Credential)))
+				if ce := closeErr(err); ce != nil {
+					end(ce)
+				} else {
+					end(fmt.Errorf("read: %s", scrub(err.Error(), l.opt.Credential)))
+				}
 			}
 			return endErr
 		}
@@ -315,10 +383,37 @@ func (l *Link) session(ctx context.Context) error {
 			}
 			continue
 		}
-		if ack, ok := f.Msg.(protocol.HeartbeatAck); ok {
-			if ack.T > 0 {
-				l.lastRTT.Store(int64(time.Since(time.UnixMilli(ack.T))))
+		switch m := f.Msg.(type) {
+		case protocol.HeartbeatAck:
+			l.mu.Lock()
+			sent, ok := l.hbSent[m.Seq]
+			delete(l.hbSent, m.Seq)
+			l.mu.Unlock()
+			if ok {
+				l.lastRTT.Store(int64(time.Since(sent)))
 			}
+			continue
+		case protocol.Error:
+			if m.Code == protocol.ErrNotPaired {
+				l.log.Warn("server: this connection is not authenticated yet", "code", m.Code, "detail", m.Detail)
+			} else {
+				l.log.Warn("server refused a frame", "code", m.Code, "detail", m.Detail)
+			}
+			continue
+		case protocol.Hello:
+			if !up {
+				up = true
+				l.mu.Lock()
+				l.out = out
+				l.mu.Unlock()
+				l.connected.Store(true)
+				l.connectedAt.Store(time.Now().UnixMilli())
+				l.log.Info("link up", "url", redactURL(l.opt.URL), "device", m.DeviceID, "session", m.SessionID)
+				l.handler.Connected()
+			}
+		}
+		if !up {
+			l.log.Warn("ignoring a frame before hello", "type", f.Type)
 			continue
 		}
 		l.handler.Frame(f)

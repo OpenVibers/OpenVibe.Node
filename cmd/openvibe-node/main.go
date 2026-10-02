@@ -43,7 +43,7 @@ var version = "dev"
 const usage = `openvibe-node %s: connect this device to OpenVibe.
 
 Usage:
-  openvibe-node pair <CODE> [--server URL] [--kind onboard|bridge] [--force]
+  openvibe-node pair <CODE> [--robot rob_…] [--name NAME] [--server URL] [--kind onboard|bridge] [--force]
   openvibe-node run [--dry-run]
   openvibe-node install [--user NAME]
   openvibe-node uninstall
@@ -83,6 +83,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var (
 		server  = fs.String("server", "", "OpenVibe.Bot origin (pair)")
 		kind    = fs.String("kind", "", "onboard or bridge (pair)")
+		robot   = fs.String("robot", "", "the rob_… id of the robot to pair with, from the installer command (pair)")
+		name    = fs.String("name", "", "a name for this device on openvibe.bot; default: the hostname (pair)")
+		codeArg = fs.String("code", "", "the pairing code, instead of the argument (pair)")
 		force   = fs.Bool("force", false, "pair again even if already paired")
 		dryRun  = fs.Bool("dry-run", false, "run only the dry-run plugin and the test pattern (run)")
 		asJSON  = fs.Bool("json", false, "print JSON (status, plugins)")
@@ -106,11 +109,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var err error
 	switch cmd {
 	case "pair":
+		if *codeArg != "" {
+			positional = append(positional, *codeArg)
+		}
 		if len(positional) != 1 {
-			fmt.Fprintln(stderr, "usage: openvibe-node pair <CODE>")
+			fmt.Fprintln(stderr, "usage: openvibe-node pair <CODE> [--robot rob_…] [--name NAME]")
 			return 2
 		}
-		err = cmdPair(g, positional[0], *server, *kind, *force, stdout)
+		err = cmdPair(g, pairArgs{code: positional[0], robot: *robot, name: *name, server: *server, kind: *kind, force: *force}, stdout)
 	case "run":
 		err = cmdRun(g, *dryRun)
 	case "install":
@@ -190,10 +196,30 @@ func probeAll(cfg *config.Config, paths config.Paths, log *slog.Logger) (map[str
 	return out, failed
 }
 
-func cmdPair(g *globals, code, server, kind string, force bool, stdout io.Writer) error {
-	code, err := link.NormalizeCode(code)
+// pairArgs are the flags of `openvibe-node pair`.
+type pairArgs struct {
+	code, robot, name, server, kind string
+	force                           bool
+}
+
+// maxNameLen is the longest device name OpenVibe.Bot stores.
+const maxNameLen = 80
+
+func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
+	code, err := link.NormalizeCode(a.code)
 	if err != nil {
 		return err
+	}
+	server, kind, force := a.server, a.kind, a.force
+	if a.robot != "" && !link.RobotRe.MatchString(a.robot) {
+		return fmt.Errorf("--robot must be a robot id like rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X (a driver kind such as %q goes in the config's plugins)", a.robot)
+	}
+	name := strings.TrimSpace(a.name)
+	if name == "" {
+		name, _ = os.Hostname()
+	}
+	if r := []rune(name); len(r) > maxNameLen {
+		name = string(r[:maxNameLen])
 	}
 	if err := g.paths.Ensure(); err != nil {
 		return fmt.Errorf("cannot create %s (run with sudo, or use --home): %w", g.paths.ConfigDir, err)
@@ -216,9 +242,8 @@ func cmdPair(g *globals, code, server, kind string, force bool, stdout io.Writer
 		return err
 	}
 	descs, _ := probeAll(cfg, g.paths, g.log)
-	req := protocol.PairRequest{Code: code, AgentVersion: version, DeviceKind: cfg.DeviceKind, Drivers: []string{},
-		Capabilities: map[string]any{}, OS: runtime.GOOS, Arch: runtime.GOARCH}
-	req.Hostname, _ = os.Hostname()
+	req := protocol.PairRequest{Robot: a.robot, Code: code, AgentVersion: version, DeviceKind: cfg.DeviceKind, Drivers: []string{},
+		Capabilities: map[string]any{}, Name: name}
 	names := make([]string, 0, len(descs))
 	for n := range descs {
 		names = append(names, n)
@@ -244,7 +269,7 @@ func cmdPair(g *globals, code, server, kind string, force bool, stdout io.Writer
 		}
 		chownLikeDir(g.paths.ConfigFile(), g.paths.ConfigDir)
 	}
-	fmt.Fprintf(stdout, "Paired as %s. Credential saved to %s (mode 600).\n", creds.DeviceID, g.paths.CredentialFile())
+	fmt.Fprintf(stdout, "Paired as %s (robot %s). Credential saved to %s (mode 600).\n", creds.DeviceID, creds.RobotID, g.paths.CredentialFile())
 	fmt.Fprintln(stdout, "Confirm the device on openvibe.bot, then start it: `openvibe-node run` or `sudo openvibe-node install`.")
 	if service.Status(serviceOptions(g, "")) == "running" {
 		_ = service.Control(serviceOptions(g, ""), "restart")
@@ -396,8 +421,8 @@ func cmdStatus(g *globals, asJSON bool, stdout io.Writer) error {
 		}
 		fmt.Fprintln(stdout)
 	}
-	if b := s.Telemetry.Battery; b != nil && b.Percent != nil {
-		fmt.Fprintf(stdout, "Battery:  %.0f%%\n", *b.Percent)
+	if b := s.Telemetry.Battery; b != nil {
+		fmt.Fprintf(stdout, "Battery:  %.0f%%\n", *b*100)
 	}
 	return nil
 }

@@ -1,14 +1,19 @@
 #!/bin/sh
 # OpenVibe Node installer.
 #
-#   curl -fsSL https://openvibe.bot/install | sh -s -- <CODE> [--robot adeept|adeept-mecanum|cozmo|none]
+#   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|none]
 #
 # Detects the OS and CPU, downloads the openvibe-node binary and the plugin bundle (checking their SHA-256), creates
 # a Python virtual environment for the plugins, disables the Adeept kit's stock control server if it finds it,
 # installs the system service and pairs the device with <CODE>. Run it again to upgrade; the credential is kept.
+# openvibe.bot shows the first line with the robot id and a fresh code filled in.
 #
 # Options:
-#   --robot KIND     adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), none (dry run). Default: none.
+#   --robot ROBOT    the rob_… id of the robot to pair with (from openvibe.bot). A driver kind here (adeept, …) is the
+#                    old meaning of --robot: still accepted, but deprecated; use --driver.
+#   --code CODE      the one-time pairing code (or give it as the first argument).
+#   --name NAME      the device's name on openvibe.bot (default: the hostname).
+#   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), none (dry run). Default: none.
 #   --no-service     install and pair, but do not install the service.
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
 #                    downloading.
@@ -20,22 +25,38 @@ set -eu
 
 REPO_URL="https://github.com/OpenVibers/OpenVibe.Node"
 CODE=""
-ROBOT="none"
+DRIVER="none"
+ROBOT_ID=""
+NAME=""
 SERVICE=1
 LOCAL=""
 TAG="latest"
 
 usage() {
-	echo "usage: install.sh [CODE] [--robot adeept|adeept-mecanum|cozmo|none] [--no-service] [--local DIR] [--version TAG]"
-	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- <CODE> --robot adeept"
+	echo "usage: install.sh [--robot rob_…] [--code CODE | CODE] [--name NAME] [--driver adeept|adeept-mecanum|cozmo|none]"
+	echo "                  [--no-service] [--local DIR] [--version TAG]"
+	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
 }
 say() { printf '%s\n' "openvibe-node: $*"; }
 die() { printf '%s\n' "openvibe-node: error: $*" >&2; exit 1; }
+# --robot is the rob_… pairing target; it used to name the driver kind, which still works but is deprecated.
+robot_arg() {
+	case "$1" in
+	rob_*) ROBOT_ID="$1" ;;
+	*) say "warning: --robot $1 is deprecated; use --driver $1 (--robot now takes the rob_… id from openvibe.bot)"; DRIVER="$1" ;;
+	esac
+}
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--robot) ROBOT="${2:-}"; shift 2 ;;
-	--robot=*) ROBOT="${1#*=}"; shift ;;
+	--robot) robot_arg "${2:-}"; shift 2 ;;
+	--robot=*) robot_arg "${1#*=}"; shift ;;
+	--driver) DRIVER="${2:-}"; shift 2 ;;
+	--driver=*) DRIVER="${1#*=}"; shift ;;
+	--code) CODE="${2:-}"; shift 2 ;;
+	--code=*) CODE="${1#*=}"; shift ;;
+	--name) NAME="${2:-}"; shift 2 ;;
+	--name=*) NAME="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
 	--local) LOCAL="${2:-}"; shift 2 ;;
 	--version) TAG="${2:-}"; shift 2 ;;
@@ -45,7 +66,8 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-case "$ROBOT" in adeept|adeept-mecanum|cozmo|none) ;; *) die "--robot must be adeept, adeept-mecanum, cozmo or none" ;; esac
+case "$DRIVER" in adeept|adeept-mecanum|cozmo|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo or none" ;; esac
+case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
 
 # Root for the service, /usr/local/bin and /etc.
 SUDO=""
@@ -137,11 +159,11 @@ $SUDO "$PIP" install --quiet "$STATE/plugins/sdk" "$STATE/plugins/dryrun"
 PLUGINS='[{"name": "dryrun"}]'
 KIND=onboard
 VIDEO='"source": "auto"'
-case "$ROBOT" in
+case "$DRIVER" in
 adeept|adeept-mecanum)
 	[ $IS_PI = 1 ] || say "warning: this is not a Raspberry Pi; the Adeept plugin will report a hardware fault"
 	$SUDO "$PIP" install --quiet "$STATE/plugins/adeept_adr036[pi]"
-	WHEELS=ordinary; [ "$ROBOT" = adeept-mecanum ] && WHEELS=mecanum
+	WHEELS=ordinary; [ "$DRIVER" = adeept-mecanum ] && WHEELS=mecanum
 	PLUGINS="[{\"name\": \"adeept_adr036\", \"config\": {\"backend\": \"real\", \"wheels\": \"$WHEELS\"}}]"
 	;;
 cozmo)
@@ -193,7 +215,10 @@ if [ -n "$CODE" ]; then
 	if $SUDO "$BIN_DIR/openvibe-node" status --json 2>/dev/null | grep -q '"paired":true'; then
 		say "already paired; keeping the credential (to pair again: sudo openvibe-node pair --force <CODE>)"
 	else
-		$SUDO "$BIN_DIR/openvibe-node" pair "$CODE"
+		set -- pair "$CODE"
+		[ -z "$ROBOT_ID" ] || set -- "$@" --robot "$ROBOT_ID"
+		[ -z "$NAME" ] || set -- "$@" --name "$NAME"
+		$SUDO "$BIN_DIR/openvibe-node" "$@"
 	fi
 else
 	say "not paired yet: get a code on openvibe.bot and run: sudo openvibe-node pair <CODE>"

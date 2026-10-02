@@ -137,6 +137,9 @@ type VideoConfig struct {
 	FPS     int      `json:"fps,omitempty"`
 	Width   int      `json:"width,omitempty"`
 	Height  int      `json:"height,omitempty"`
+	// WHIPURL is where the camera publishes (with the pairing's publish key). OpenVibe.Bot does not hand one out,
+	// so video stays off until it is set here.
+	WHIPURL string `json:"whip_url,omitempty"`
 }
 
 // Bundled lists the plugins that ship with the Node.
@@ -224,6 +227,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Video.Source == "command" && len(c.Video.Command) == 0 {
 		return errors.New("config: video.source command needs video.command")
+	}
+	if c.Video.WHIPURL != "" && !strings.HasPrefix(c.Video.WHIPURL, "https://") && !strings.HasPrefix(c.Video.WHIPURL, "http://") {
+		return errors.New("config: video.whip_url must be an https:// URL")
 	}
 	for _, l := range []*float64{c.Limits.MaxSpeed, c.Limits.MaxTurn} {
 		if l != nil && (*l < 0 || *l > 1) {

@@ -44,8 +44,9 @@ func (s *Secret) UnmarshalJSON([]byte) error {
 // Credentials is what `openvibe-node pair` stores.
 type Credentials struct {
 	DeviceID   string
+	RobotID    string // rob_… the device was paired to
 	Credential Secret
-	PublishKey Secret
+	PublishKey Secret // WHIP publish key; secret like the credential
 	Server     string
 	DeviceURL  string
 	WHIPURL    string
@@ -58,6 +59,7 @@ type Credentials struct {
 type file struct {
 	Version    int                  `json:"version"`
 	DeviceID   string               `json:"device_id"`
+	RobotID    string               `json:"robot_id,omitempty"`
 	Credential string               `json:"credential"`
 	PublishKey string               `json:"publish_key"`
 	Server     string               `json:"server"`
@@ -77,7 +79,7 @@ func Save(path string, c *Credentials) error {
 		return errors.New("credentials: refusing to save an empty credential")
 	}
 	b, err := json.MarshalIndent(file{
-		Version: 1, DeviceID: c.DeviceID, Credential: c.Credential.Reveal(), PublishKey: c.PublishKey.Reveal(),
+		Version: 1, DeviceID: c.DeviceID, RobotID: c.RobotID, Credential: c.Credential.Reveal(), PublishKey: c.PublishKey.Reveal(),
 		Server: c.Server, DeviceURL: c.DeviceURL, WHIPURL: c.WHIPURL, ICEServers: c.ICEServers, Profile: c.Profile,
 		PairedAt: c.PairedAt,
 	}, "", "  ")
@@ -144,7 +146,7 @@ func Load(path string, warn func(string)) (*Credentials, error) {
 		return nil, fmt.Errorf("credentials: %s is incomplete; pair again", path)
 	}
 	return &Credentials{
-		DeviceID: f.DeviceID, Credential: NewSecret(f.Credential), PublishKey: NewSecret(f.PublishKey),
+		DeviceID: f.DeviceID, RobotID: f.RobotID, Credential: NewSecret(f.Credential), PublishKey: NewSecret(f.PublishKey),
 		Server: f.Server, DeviceURL: f.DeviceURL, WHIPURL: f.WHIPURL, ICEServers: f.ICEServers, Profile: f.Profile,
 		PairedAt: f.PairedAt,
 	}, nil

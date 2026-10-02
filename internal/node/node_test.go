@@ -83,7 +83,7 @@ func start(t *testing.T) *env {
 	cfg.Python = py
 	cfg.Plugins = []config.PluginConfig{{Name: "dryrun", Config: map[string]any{"record": record, "log_commands": false},
 		Env: map[string]string{"PYTHONPATH": filepath.Join(root, "plugins/sdk") + string(os.PathListSeparator) + filepath.Join(root, "plugins/dryrun")}}}
-	cfg.Video = config.VideoConfig{Source: "auto", Width: 64, Height: 48, FPS: 10}
+	cfg.Video = config.VideoConfig{Source: "auto", Width: 64, Height: 48, FPS: 10, WHIPURL: srv.URL() + "/whip/" + creds.DeviceID}
 
 	n, err := New(Options{Config: cfg, Paths: paths, Creds: creds, Version: "test", HeartbeatInterval: 100 * time.Millisecond,
 		LinkBackoffMin: 50 * time.Millisecond, VideoLoopback: true, LatchPoll: 50 * time.Millisecond,
@@ -141,7 +141,7 @@ func (e *env) cmd(kind, value string, deadline int) protocol.Message {
 
 func (e *env) cmdID(id, kind, value string, deadline int) protocol.Message {
 	e.t.Helper()
-	if err := e.conn.Send(protocol.Command{ID: id, Kind: kind, Value: json.RawMessage(value), DeadlineMS: deadline, Operator: "usr_1", Role: "operator"}); err != nil {
+	if err := e.conn.Command(protocol.Command{ID: id, Kind: kind, Value: json.RawMessage(value)}, deadline); err != nil {
 		e.t.Fatal(err)
 	}
 	r, err := e.conn.Reply(id, 5*time.Second)
@@ -320,7 +320,7 @@ func TestEstopLatchedUntilOwnerClears(t *testing.T) {
 	e := start(t)
 	n := len(e.records())
 	e.cmd("drive", `{"throttle":0.3}`, 1000)
-	e.conn.Send(protocol.Estop{Reason: "owner", By: "usr_owner"})
+	e.conn.Send(protocol.Estop{Latched: true, By: "usr_owner"})
 	e.waitStop(n, time.Second)
 	if _, err := e.conn.Expect(protocol.TypeEstopState, 2*time.Second, func(m protocol.Message) bool { return m.(protocol.EstopState).Latched }); err != nil {
 		t.Fatal(err)
@@ -342,7 +342,7 @@ func TestEstopLatchedUntilOwnerClears(t *testing.T) {
 	if _, err := e.conn.Expect(protocol.TypeEstopState, 5*time.Second, func(m protocol.Message) bool { return m.(protocol.EstopState).Latched }); err != nil {
 		t.Fatal(err)
 	}
-	e.conn.Send(protocol.EstopClear{By: "usr_owner"})
+	e.conn.Send(protocol.Estop{Latched: false, By: "usr_owner"})
 	if _, err := e.conn.Expect(protocol.TypeEstopState, 2*time.Second, func(m protocol.Message) bool { return !m.(protocol.EstopState).Latched }); err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +363,7 @@ func TestLocalKillSwitch(t *testing.T) {
 		t.Fatalf("%q", c)
 	}
 	// The owner's estop_clear does not clear the local kill switch.
-	e.conn.Send(protocol.EstopClear{By: "usr_owner"})
+	e.conn.Send(protocol.Estop{Latched: false, By: "usr_owner"})
 	time.Sleep(100 * time.Millisecond)
 	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultLocalStop {
 		t.Fatalf("after server clear: %q", c)
@@ -442,7 +442,7 @@ func TestVideoAndTelemetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tl := f.Msg.(protocol.Telemetry); tl.Battery.Percent == nil || tl.Sensors["distance_cm"] == nil {
+	if tl := f.Msg.(protocol.Telemetry); tl.Battery == nil || tl.Sensors["distance_cm"] == nil {
 		t.Fatalf("%+v", tl)
 	}
 	// ≤ 2 Hz.
