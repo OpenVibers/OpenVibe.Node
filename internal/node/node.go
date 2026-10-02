@@ -76,6 +76,7 @@ type Node struct {
 	// configured is set by the first config on a connection; until then only halt runs, so a latch the owner set
 	// while the link was down is applied before any motion.
 	configured bool
+	robotIDs   []string // from this connection's hello
 }
 
 // New builds a Node. Run starts it.
@@ -193,7 +194,7 @@ func (n *Node) Run(ctx context.Context) error {
 // has been applied (applyConfig), so they report the latch the owner may have set while the link was down.
 func (n *Node) Connected() {
 	n.mu.Lock()
-	n.configured = false
+	n.configured, n.robotIDs = false, nil
 	n.mu.Unlock()
 }
 
@@ -208,6 +209,9 @@ func (n *Node) Disconnected(err error) {
 func (n *Node) Frame(f protocol.Frame) {
 	switch m := f.Msg.(type) {
 	case protocol.Hello:
+		n.mu.Lock()
+		n.robotIDs = m.RobotIDs
+		n.mu.Unlock()
 		n.log.Info("server hello", "device", m.DeviceID, "robots", m.RobotIDs, "session", m.SessionID)
 	case protocol.Config:
 		n.applyConfig(m)
@@ -445,8 +449,15 @@ func (n *Node) sendEstopState() {
 		return
 	}
 	st := n.latch.State()
+	// robot_id names the robot only when the device serves exactly one; a bridge for several leaves it out.
+	var robot string
+	n.mu.Lock()
+	if len(n.robotIDs) == 1 {
+		robot = n.robotIDs[0]
+	}
+	n.mu.Unlock()
 	n.send(protocol.EstopState{Latched: st.Stopped(), By: "device", At: time.Now().UTC().Format(time.RFC3339Nano),
-		LocalStop: st.Local, Reason: st.RemoteReason})
+		RobotID: robot, LocalStop: st.Local, Reason: st.RemoteReason})
 }
 
 // ---- plugin output ----
