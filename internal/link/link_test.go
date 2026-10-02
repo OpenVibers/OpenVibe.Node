@@ -230,6 +230,32 @@ func TestHeartbeatAckEchoOnlySetsRTT(t *testing.T) {
 	}
 }
 
+// An ack that carries only seq (older Bot, no t/echo) still sets the RTT from the bounded send-time lookup.
+func TestHeartbeatAckSeqOnlySetsRTT(t *testing.T) {
+	srv, l, rec, _, _ := setup(t, 200*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeConfig)
+	c.Mute() // stop fakebot's automatic t+echo answers; this test sends the ack itself
+	f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb := f.Msg.(protocol.Heartbeat)
+	if err := c.Send(protocol.HeartbeatAck{Seq: hb.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for l.Stats().RTT <= 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a seq-only heartbeat_ack did not set the RTT")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestDeadmanOnSilentServer(t *testing.T) {
 	srv, _, rec, _, _ := setup(t, 50*time.Millisecond)
 	c, _ := srv.NextConn(3 * time.Second)
