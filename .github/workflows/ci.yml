@@ -24,7 +24,12 @@ jobs:
       - run: pip install av numpy
       - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
+      # The job worker isolates jobs in unprivileged user and network namespaces, which Ubuntu's AppArmor restricts by
+      # default; its tests skip where they cannot run, and OPENVIBE_WORKER_TESTS=require makes them fail here instead.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: go test -race -count=1 ./...
+        env:
+          OPENVIBE_WORKER_TESTS: require
 
   build:
     name: cross-compile

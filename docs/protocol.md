@@ -180,9 +180,10 @@ Commands are never queued while offline and never replayed after a reconnect.
 
 ### Jobs
 
-The job frames of OpenVibe.Contracts `platform.job-frame@1` (plan T14 Run) ride the same link and envelope.
-**Running jobs is not implemented yet:** the Node advertises no runtime class, so it refuses every well-formed job
-with `class not available`, and nothing executes.
+The job frames of OpenVibe.Contracts `platform.job-frame@1` (plan T14 Run) ride the same link and envelope. The Node
+runs class `function` only, and only when the owner turned the worker on in the local config, the OS is Linux and a
+boot-time probe could start a process in its own user, network and PID namespaces ([worker.md](worker.md)).
+Otherwise it advertises no class and refuses every well-formed job with `class not available`, and nothing executes.
 
 | direction        | type           | fields                                                                                    |
 |------------------|----------------|-------------------------------------------------------------------------------------------|
@@ -205,11 +206,34 @@ checked in this order:
 | `function job needs an artifact with an exact version` | `bad_value` | a `function` job without `artifact`, or a name or version outside the contract's pattern (a range) |
 | `net policy not supported`                   | `unsupported` | `net` is present and not `deny`                             |
 | `missing or invalid args, ttl_ms or limits`  | `bad_value`   | `args` is not an object, or `ttl_ms` or a limit is missing or below 1 |
-| `class not available`                        | `unsupported` | the class is valid but this Node does not run it (today: every class) |
+| `class not available`                        | `unsupported` | the class is valid but this Node does not run it (every class but `function`; every class while the worker is off) |
+| `the e-stop or local stop is latched`        | `estopped` or `local_stop` | the stop latch is set: no job starts until it clears |
+| `class not available`                        | `shutting_down` | the Node is stopping                                      |
+| `unknown artifact`                           | `unsupported` | `artifact` is not a function the owner declared, at that exact version |
+| `worker busy`                                | `not_ready`   | `worker.caps.max_jobs` jobs are already running              |
 
-A resent `job` with an id already answered gets the same answer again, never a second acceptance; the Node
-remembers the last 1024 well-formed ids. `job_cancel` for an id that is not running (unknown, refused or ended) and
-`job_exit_ack` for an unknown id are ignored, with no answer: an `ack` keyed by a job id means the job was accepted.
+A resent `job` with an id already answered gets the same answer again, never a second acceptance and never a second
+process: `ack` while it runs, its `job_exit` once it ended; the Node remembers the last 1024 well-formed ids.
+
+An accepted job runs once the `ack` is out: `job_started` (`started_ms` anchors every usage second), its stdout as
+`job_stdout` chunks (at most 16 KiB each, UTF-8, `chunk_seq` from 1; best effort, not resent), one `job_usage` for
+every wall-clock second once it has fully elapsed (`second` from 0, `cpu_ms` that second's CPU time), then
+`job_exit`. Its `usage` is authoritative for metering (Bot writes `usage-sample` readings `service:"run"`,
+`operation:"function.invoke"`, unit `s`, idempotency key `run:<job id>:<n>`; none of those fields changes on a
+resend). The Node resends `job_started` for running jobs and `job_exit` for ended ones after every reconnect, and
+`job_exit` again on a `job` or `job_cancel` for that id, until `job_exit_ack`. `job_exit.reason`:
+
+| `reason`    | `code`  | when                                                                                                |
+|-------------|---------|-----------------------------------------------------------------------------------------------------|
+| `exited`    | status  | the process ended by itself (`code` is null if a signal it did not get from the worker ended it); `result` is what it wrote to fd 3 when it exited 0 |
+| `cancelled` | null    | `job_cancel`: the process group is killed; a job cancelled before it started never starts            |
+| `ttl`       | null    | `ttl_ms` (from receipt, clamped to `worker.caps.max_ttl_ms`) ran out, before or while it ran         |
+| `limit`     | null    | `wall_ms`, `cpu_ms` or `mem_bytes` (each clamped to the local cap), more stdout than `max_output_bytes`, or more than 256 KiB of result |
+| `stopped`   | null    | the e-stop or the local stop latched, or the Node shut down                                          |
+| `failed`    | null    | the worker could not run it: the namespaces could not be created, the spawn failed, or its CPU limit could not be set |
+
+`job_cancel` for an id that is not running (unknown, refused or ended) and `job_exit_ack` for an unknown id are
+ignored, with no answer: an `ack` keyed by a job id means the job was accepted.
 A Node that runs jobs lists its classes in `status.capabilities.worker` as `{"runtime_classes": ["function"]}`; the
 key is absent while it runs none, and `worker` is reserved as a plugin name.
 

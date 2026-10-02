@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 	"github.com/OpenVibers/OpenVibe.Node/internal/safety"
 	"github.com/OpenVibers/OpenVibe.Node/internal/video"
+	"github.com/OpenVibers/OpenVibe.Node/internal/worker"
 )
 
 // Options configure a Node.
@@ -42,8 +44,9 @@ type Options struct {
 	Log     *slog.Logger
 	Version string
 
-	// RuntimeClasses are the job classes this Node runs and advertises in status.capabilities.worker. None yet:
-	// every job is refused "class not available" until the worker that executes jobs fills this in.
+	// RuntimeClasses are the job classes this Node runs and advertises in status.capabilities.worker. New adds
+	// `function` when config.worker is enabled and its isolation probe passes; with none, every job is refused
+	// "class not available".
 	RuntimeClasses []string
 
 	// For tests.
@@ -60,9 +63,11 @@ type Node struct {
 	latch *safety.Latch
 	dedup *safety.Dedup
 	jobs  *jobs
-	mgr   *plugins.Manager
-	link  *link.Link
-	pub   *video.Publisher
+	// worker runs function jobs; nil unless config.worker is enabled on Linux and its boot-time probe passed.
+	worker *worker.Worker
+	mgr    *plugins.Manager
+	link   *link.Link
+	pub    *video.Publisher
 
 	ctx context.Context
 
@@ -149,6 +154,20 @@ func New(opt Options) (*Node, error) {
 				ICEServers: opt.Creds.ICEServers, Log: opt.Log, IncludeLoopback: opt.VideoLoopback})
 		}
 	}
+	if opt.Config.Worker.Enabled {
+		w := worker.New(opt.Config.Worker, n.sendJobFrame, opt.Log)
+		if err := w.Probe(); err != nil {
+			opt.Log.Error("worker off: jobs cannot run isolated here, every job is refused", "err", err)
+		} else {
+			n.worker = w
+			w.SetStopped(stopFault(n.latch.State()))
+			n.jobs.admit = w.Admit
+			if !slices.Contains(n.jobs.classes, protocol.ClassFunction) {
+				n.jobs.classes = append(n.jobs.classes, protocol.ClassFunction)
+			}
+			opt.Log.Info("worker on", "functions", len(opt.Config.Worker.Functions))
+		}
+	}
 	n.latch.OnChange(n.onLatch)
 	return n, nil
 }
@@ -188,6 +207,9 @@ func (n *Node) Run(ctx context.Context) error {
 	<-ctx.Done()
 	n.log.Info("shutting down: stopping every actuator")
 	n.mgr.StopAll()
+	if n.worker != nil {
+		n.worker.Close()
+	}
 	cancelPlugins()
 	n.mgr.Wait()
 	wg.Wait()
@@ -236,8 +258,11 @@ func (n *Node) Frame(f protocol.Frame) {
 	case protocol.JobCancel:
 		n.jobCancel(m)
 	case protocol.JobExitAck:
-		// No job runs yet, so no job_exit is ever waiting for this.
-		n.log.Debug("job_exit_ack ignored", "id", m.ID)
+		if n.worker != nil {
+			n.worker.ExitAck(m.ID)
+		} else {
+			n.log.Debug("job_exit_ack ignored: no worker", "id", m.ID)
+		}
 	}
 }
 
@@ -278,6 +303,9 @@ func (n *Node) applyConfig(c protocol.Config) {
 	n.mu.Unlock()
 	if first {
 		n.sendStatus()
+		if n.worker != nil {
+			n.worker.Resend()
+		}
 	}
 	n.sendEstopState()
 	if n.link != nil {
@@ -428,6 +456,9 @@ func (n *Node) send(m protocol.Message) {
 // ---- latch ----
 
 func (n *Node) onLatch(st safety.LatchState) {
+	if n.worker != nil {
+		n.worker.SetStopped(stopFault(st)) // kills every job at once while stopped
+	}
 	if st.Stopped() {
 		n.log.Warn("stop latched", "remote", st.Remote, "local", st.Local)
 		n.mgr.EstopAll()
