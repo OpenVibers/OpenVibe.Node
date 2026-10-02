@@ -200,7 +200,7 @@ func TestRunDryRun(t *testing.T) {
 		t.Fatal(errOut)
 	}
 	c, _ := credentials.Load(filepath.Join(home, "credential.json"), nil)
-	whip.PublishKey = c.PublishKey.Reveal()
+	whip.SetPublishKey(c.PublishKey.Reveal())
 
 	exe, _ := os.Executable()
 	cmd := exec.Command(exe, "run", "--dry-run", "--home", home)

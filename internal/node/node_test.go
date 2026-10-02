@@ -77,7 +77,7 @@ func start(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	whip.PublishKey = creds.PublishKey.Reveal()
+	whip.SetPublishKey(creds.PublishKey.Reveal())
 
 	record := filepath.Join(home, "record.jsonl")
 	cfg := config.Default()
@@ -221,22 +221,26 @@ func TestPairConnectAndStatus(t *testing.T) {
 		t.Fatalf("%d frames before hello", n)
 	}
 	var sawEstopState, sawStatus bool
-	for _, f := range e.conn.Frames() {
-		switch m := f.Msg.(type) {
-		case protocol.EstopState:
-			sawEstopState = true
-			if m.Latched || m.By != "device" {
-				t.Fatalf("estop_state %+v on a fresh device", m)
-			}
-		case protocol.Status:
-			sawStatus = true
-			if !strings.HasPrefix(m.Firmware, "openvibe-node-") || m.EstopLatched || m.Faults == nil {
-				t.Fatalf("status %+v", m)
+	deadline := time.Now().Add(5 * time.Second)
+	for !sawEstopState || !sawStatus {
+		for _, f := range e.conn.Frames() {
+			switch m := f.Msg.(type) {
+			case protocol.EstopState:
+				sawEstopState = true
+				if m.Latched || m.By != "device" {
+					t.Fatalf("estop_state %+v on a fresh device", m)
+				}
+			case protocol.Status:
+				sawStatus = true
+				if !strings.HasPrefix(m.Firmware, "openvibe-node-") || m.EstopLatched || m.Faults == nil {
+					t.Fatalf("status %+v", m)
+				}
 			}
 		}
-	}
-	if !sawEstopState || !sawStatus {
-		t.Fatal("no estop_state or status after hello and config")
+		if time.Now().After(deadline) {
+			t.Fatal("no estop_state or status after hello and config")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if on, _ := e.srv.RobotEstop(); on {
 		t.Fatal("the device latched the robot")
