@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tests install.sh's handling of the Adeept kit's stock-server autostart: crontab (root's and the invoking
 # user's, including @reboot lines) and /etc/rc.local. The OPENVIBE_* test overrides point the checks at files in
-# a temp dir, so this needs no root and touches no real crontab or /etc/rc.local.
+# a temp dir, so this needs no root and touches no real crontab, rc.local, service or process.
 set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"

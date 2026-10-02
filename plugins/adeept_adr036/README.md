@@ -8,8 +8,11 @@ kit's code is imported.
 ## Keep the kit's stock server disabled
 
 The kit's own server listens on `0.0.0.0:8888` with the fixed login `admin` / `123456` and streams MJPEG on `:5000`.
-Anyone on the network could drive the car with it. Disable its autostart (the kit installer adds it to the user's
-crontab or `/etc/rc.local`, depending on version) and do not run it next to the Node. This plugin never starts it.
+Anyone on the network could drive the car with it. The installer disables its autostart (the kit installer adds it
+to the user's crontab or `/etc/rc.local`, depending on version): it comments those lines out with the marker
+`#openvibe-node-disabled:` and keeps the original text, so running the installer again changes nothing. Check with
+`systemctl status Adeept_Robot.service`, `crontab -l` (and `sudo crontab -l -u pi`) and
+`grep openvibe-node-disabled /etc/rc.local`. Do not run it next to the Node. This plugin never starts it.
 
 ## Wiring (kit defaults)
 
