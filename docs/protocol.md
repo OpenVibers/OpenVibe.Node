@@ -62,11 +62,27 @@ arrives (Bot answers any frame on a not-yet-authenticated socket with `error` `b
 | code / answer                | meaning                                              | the Node                                               |
 |------------------------------|------------------------------------------------------|--------------------------------------------------------|
 | `4000`                       | a second connection with this credential replaced it | reconnects with the normal backoff                      |
-| `4002`, or HTTP `401`/`403`  | the credential is wrong, rotated or revoked          | retries no sooner than 10 s (jitter only adds), logs "pair again, or install the current credential" |
+| `4002`, or HTTP `401`/`403`  | the credential is wrong, rotated or revoked          | retries no sooner than 10 s (jitter only adds), logs "pair again, or import the owner's rotation" |
 | `4003`                       | the owner revoked the device (or rotated its credential) while it was connected | the same as `4002`             |
 
 The link never gives up on its own: the owner may pair the device again. Bot's `error` frames (`bot.not_paired`,
 `bot.not_ready`, `bot.forbidden`, …) are logged and never end the connection.
+
+### Rotating a credential
+
+The owner can rotate a device's credential in OpenVibe.Bot (`POST /api/v1/devices/:id/rotate`). Its answer is JSON
+with `device.id`, `credential` and `publish_key`, and the old credential keeps working for 60 s. Pipe that response
+body into the Node to take the new pair without pairing again:
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $TOKEN" https://openvibe.bot/api/v1/devices/dev_…/rotate \
+  | openvibe-node credential import
+```
+
+`import` keeps every other stored field (server, WHIP URL, robot ids, profile, version), rewrites `credential.json`
+atomically at mode 0600 and never prints either secret. It refuses unless a credential file exists ("pair first") and
+unless the response's `device.id` is the device this Node is paired as. A running Node keeps using the old credential
+until it restarts; on a refused credential it logs the two remedies: pair again, or import the owner's rotation.
 
 ### Frames
 

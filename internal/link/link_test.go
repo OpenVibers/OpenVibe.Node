@@ -313,7 +313,7 @@ func TestRevokedRetriesAfterTenSecondsAndNeverLogsCredential(t *testing.T) {
 		t.Fatalf("disconnect error %v", err)
 	}
 	waitLastError(t, l, "pair again")
-	if !strings.Contains(l.Stats().LastError, "current credential") {
+	if !strings.Contains(l.Stats().LastError, "credential import") {
 		t.Fatalf("last error %q does not say how to recover", l.Stats().LastError)
 	}
 	time.Sleep(time.Second) // ten times BackoffMax: an ordinary reconnect would have dialed again by now

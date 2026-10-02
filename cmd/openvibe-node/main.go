@@ -1,6 +1,7 @@
 // Command openvibe-node connects a computer, server, Raspberry Pi or robot to OpenVibe.
 //
 //	openvibe-node pair <CODE>     redeem a one-time pairing code and store the device credential
+//	openvibe-node credential import  take a rotated credential: reads the rotate response JSON on stdin
 //	openvibe-node run             run in the foreground (this is also what the service runs)
 //	openvibe-node install         install and start the system service
 //	openvibe-node uninstall       stop and remove the system service
@@ -44,6 +45,7 @@ const usage = `openvibe-node %s: connect this device to OpenVibe.
 
 Usage:
   openvibe-node pair <CODE> [--robot rob_…] [--name NAME] [--server URL] [--kind onboard|bridge] [--force]
+  openvibe-node credential import   store the credential from a rotate response, read as JSON on stdin
   openvibe-node run [--dry-run]
   openvibe-node install [--user NAME]
   openvibe-node uninstall
@@ -70,6 +72,11 @@ type globals struct {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithStdin(args, os.Stdin, stdout, stderr)
+}
+
+// runWithStdin is run with the command's stdin, so tests can feed `credential import`.
+func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprintf(stdout, usage, version)
 		return 0
@@ -117,6 +124,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		err = cmdPair(g, pairArgs{code: positional[0], robot: *robot, name: *name, server: *server, kind: *kind, force: *force}, stdout)
+	case "credential":
+		if len(positional) != 1 || positional[0] != "import" {
+			fmt.Fprintln(stderr, "usage: openvibe-node credential import  (reads the rotate response JSON on stdin)")
+			return 2
+		}
+		err = cmdCredentialImport(g, stdin, stdout)
 	case "run":
 		err = cmdRun(g, *dryRun)
 	case "install":
@@ -275,6 +288,58 @@ func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
 		_ = service.Control(serviceOptions(g, ""), "restart")
 		fmt.Fprintln(stdout, "The service was running and has been restarted with the new credential.")
 	}
+	return nil
+}
+
+// maxRotateJSON caps what `credential import` reads from stdin: Bot's rotate answer is a few hundred bytes.
+const maxRotateJSON = 64 << 10
+
+// cmdCredentialImport replaces the stored credential and publish key with the pair from a credential rotation.
+// It reads OpenVibe.Bot's `POST /api/v1/devices/:id/rotate` response from stdin and keeps every other stored field,
+// so a rotated Node does not have to pair again. Neither secret is ever printed.
+func cmdCredentialImport(g *globals, stdin io.Reader, stdout io.Writer) error {
+	// The rotate answer is small; refuse a huge stream instead of buffering it.
+	b, err := io.ReadAll(io.LimitReader(stdin, maxRotateJSON+1))
+	if err != nil {
+		return fmt.Errorf("reading the rotate response from stdin: %w", err)
+	}
+	if len(b) > maxRotateJSON {
+		return fmt.Errorf("the rotate response is over %d KiB; pipe just the POST /api/v1/devices/:id/rotate body", maxRotateJSON>>10)
+	}
+	// The plain strings below live only in this function; nothing formats them.
+	var resp struct {
+		Device struct {
+			ID string `json:"id"`
+		} `json:"device"`
+
+		Credential string `json:"credential"`
+		PublishKey string `json:"publish_key"`
+	}
+	// Never wrap the decoder error: it can quote the response body, secrets and all.
+	if err := json.Unmarshal(b, &resp); err != nil {
+		return errors.New("stdin is not the JSON that POST /api/v1/devices/:id/rotate answered with")
+	}
+	if resp.Credential == "" || resp.PublishKey == "" {
+		return errors.New("the rotate response has no credential or publish_key; pipe the whole response body")
+	}
+	old, err := credentials.Load(g.paths.CredentialFile(), nil)
+	if errors.Is(err, credentials.ErrNotPaired) {
+		return errors.New("this Node is not paired yet; run `openvibe-node pair <CODE>` first")
+	}
+	if err != nil {
+		return err
+	}
+	if resp.Device.ID != old.DeviceID {
+		return fmt.Errorf("this rotation is for device %s, this Node is paired as %s", resp.Device.ID, old.DeviceID)
+	}
+	next := *old
+	next.Credential = credentials.NewSecret(resp.Credential)
+	next.PublishKey = credentials.NewSecret(resp.PublishKey)
+	if err := credentials.Save(g.paths.CredentialFile(), &next); err != nil {
+		return err
+	}
+	chownLikeDir(g.paths.CredentialFile(), g.paths.ConfigDir)
+	fmt.Fprintf(stdout, "Imported the rotated credential for %s. The old credential stops working after 60 s; restart the node (or it reconnects on its own).\n", old.DeviceID)
 	return nil
 }
 

@@ -7,7 +7,7 @@
 //
 // Close codes: 4000 (another connection with this credential replaced this one) reconnects with the normal backoff;
 // 4002 (credential refused) and 4003 (revoked) keep retrying, never sooner than CredentialRetryMin, and log what to
-// do: pair again, or install the current credential. Bot's error frames are logged, never fatal.
+// do: pair again, or import the owner's rotation. Bot's error frames are logged, never fatal.
 //
 // Every server frame's ts also feeds an estimate of the server's clock (ServerNow), which the Node uses to read the
 // absolute deadline_ms of a command.
@@ -280,8 +280,8 @@ func (l *Link) backoff(err error, attempt int) time.Duration {
 }
 
 var (
-	errUnauthorized = errors.New("the server refused the device credential (wrong, rotated or revoked): pair again with `openvibe-node pair <CODE>`, or install the device's current credential, then restart the Node")
-	errRevoked      = errors.New("the owner revoked this device or rotated its credential: pair again with `openvibe-node pair <CODE>`, or install the device's current credential, then restart the Node")
+	errUnauthorized = errors.New("the server refused the device credential (wrong, rotated or revoked): pair again with `openvibe-node pair <CODE>`, or, if the owner rotated it, pipe the rotate response into `openvibe-node credential import`")
+	errRevoked      = errors.New("the owner revoked this device or rotated its credential: pair again with `openvibe-node pair <CODE>`, or, if the owner rotated it, pipe the rotate response into `openvibe-node credential import`")
 	errReplaced     = errors.New("another connection with this device's credential replaced this one (is a second agent running with the same credential?)")
 )
 
