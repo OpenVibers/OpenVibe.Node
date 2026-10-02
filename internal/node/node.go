@@ -76,7 +76,8 @@ type Node struct {
 	// configured is set by the first config on a connection; until then only halt runs, so a latch the owner set
 	// while the link was down is applied before any motion.
 	configured bool
-	robotIDs   []string // from this connection's hello
+
+	robotIDs []string // the robots this device serves, from the connection's hello
 }
 
 // New builds a Node. Run starts it.
@@ -443,19 +444,18 @@ func (n *Node) pollLatch(ctx context.Context) {
 
 // sendEstopState reports the device's latch. Bot reads latched:true as "this device is stopped" and latches the robot
 // (so the local kill switch shows on the panel and the gate stops sending motion); latched:false is a report only
-// and never clears the owner's latch.
+// and never clears the owner's latch. robot_id names the robot when the device serves exactly one.
 func (n *Node) sendEstopState() {
 	if !n.reporting() {
 		return
 	}
-	st := n.latch.State()
-	// robot_id names the robot only when the device serves exactly one; a bridge for several leaves it out.
-	var robot string
 	n.mu.Lock()
+	var robot string
 	if len(n.robotIDs) == 1 {
 		robot = n.robotIDs[0]
 	}
 	n.mu.Unlock()
+	st := n.latch.State()
 	n.send(protocol.EstopState{Latched: st.Stopped(), By: "device", At: time.Now().UTC().Format(time.RFC3339Nano),
 		RobotID: robot, LocalStop: st.Local, Reason: st.RemoteReason})
 }

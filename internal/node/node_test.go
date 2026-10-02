@@ -227,8 +227,8 @@ func TestPairConnectAndStatus(t *testing.T) {
 	for _, f := range e.conn.Frames() {
 		if f.Type == protocol.TypeEstopState {
 			sawEstopState = true
-			if f.Msg.(protocol.EstopState).Latched {
-				t.Fatal("latched on a fresh device")
+			if m := f.Msg.(protocol.EstopState); m.Latched || m.RobotID != fakebot.RobotID {
+				t.Fatalf("estop_state on a fresh device: %+v", m)
 			}
 			if r := f.Msg.(protocol.EstopState).RobotID; r != fakebot.RobotID {
 				t.Fatalf("estop_state robot_id %q on a one-robot device", r)
