@@ -21,6 +21,12 @@
 # Environment:
 #   OPENVIBE_NODE_BASE   download base URL (default: GitHub releases of OpenVibers/OpenVibe.Node).
 #   OPENVIBE_SERVER      OpenVibe.Bot origin (default https://openvibe.bot).
+#
+# The Adeept stock-server check can be pointed at plain files for testing (no root, no crontab command):
+#   OPENVIBE_INSTALL_STOCK_ONLY=1   run only that check and exit.
+#   OPENVIBE_CRONTAB_ROOT=FILE      edit FILE as root's crontab instead of the real one.
+#   OPENVIBE_CRONTAB_USER=FILE      edit FILE as the invoking user's crontab instead of the real one.
+#   OPENVIBE_RC_LOCAL=FILE          edit FILE as rc.local instead of /etc/rc.local.
 set -eu
 
 REPO_URL="https://github.com/OpenVibers/OpenVibe.Node"
@@ -71,6 +77,102 @@ case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
 
 # Root for the service, /usr/local/bin and /etc.
 SUDO=""
+
+# ---- the Adeept kit's stock server: never run it (fixed admin:123456 login on 0.0.0.0:8888, MJPEG on :5000) ----
+# Its installer autostarts it from the user's crontab (or root's, with an @reboot line) or from /etc/rc.local,
+# depending on kit version. Besides the systemd unit and any running process, comment out those autostart lines
+# (marked, never deleted) so they cannot start it again.
+STOCK_SERVER_RE='Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py'
+STOCK_SERVER_MARKER='#openvibe-node-disabled:'
+CRON_USER="${SUDO_USER:-$(id -un 2>/dev/null || printf '%s' root)}"
+
+# Comment out the stock-server lines in one crontab-like file: read $1, write $2, print one line per disabled
+# entry. A line whose first non-blank character is "#" is left alone, so our marker makes a second run a no-op.
+disable_stock_lines() {
+	_src="$1" _dst="$2" _where="$3"
+	: > "$_dst"
+	while IFS= read -r _line || [ -n "$_line" ]; do
+		_trim="${_line#"${_line%%[![:space:]]*}"}"
+		if [ "${_trim#\#}" = "$_trim" ] && printf '%s\n' "$_line" | grep -Eq "$STOCK_SERVER_RE"; then
+			printf '%s %s\n' "$STOCK_SERVER_MARKER" "$_line" >> "$_dst"
+			say "disabled the Adeept kit's stock server autostart in $_where"
+		else
+			printf '%s\n' "$_line" >> "$_dst"
+		fi
+	done < "$_src"
+}
+
+# Edit a plain crontab-like file in place (the test-override paths). No crontab command and no sudo.
+disable_stock_file() {
+	_file="$1" _where="$2"
+	[ -f "$_file" ] || return 0
+	_before="$(mktemp)" _after="$(mktemp)"
+	cp "$_file" "$_before"
+	disable_stock_lines "$_before" "$_after" "$_where"
+	if ! cmp -s "$_before" "$_after"; then cp "$_after" "$_file"; fi
+	rm -f "$_before" "$_after"
+}
+
+# Comment out stock-server lines in one user's crontab and reinstall it only if it changed.
+disable_stock_crontab() {
+	_user="$1"
+	command -v crontab >/dev/null 2>&1 || return 0
+	_before="$(mktemp)" _after="$(mktemp)"
+	$SUDO crontab -u "$_user" -l > "$_before" 2>/dev/null || true
+	if [ ! -s "$_before" ]; then rm -f "$_before" "$_after"; return 0; fi
+	disable_stock_lines "$_before" "$_after" "the crontab of $_user"
+	if ! cmp -s "$_before" "$_after"; then $SUDO crontab -u "$_user" "$_after" || true; fi
+	rm -f "$_before" "$_after"
+}
+
+# Comment out stock-server lines in rc.local (the real path; needs root to write it back).
+disable_stock_rc_local() {
+	_rc="$1"
+	[ -f "$_rc" ] || return 0
+	_before="$(mktemp)" _after="$(mktemp)"
+	$SUDO cp "$_rc" "$_before" 2>/dev/null || { rm -f "$_before" "$_after"; return 0; }
+	disable_stock_lines "$_before" "$_after" "$_rc"
+	if ! cmp -s "$_before" "$_after"; then $SUDO cp "$_after" "$_rc" || true; fi
+	rm -f "$_before" "$_after"
+}
+
+disable_stock_server() {
+	if command -v systemctl >/dev/null 2>&1; then
+		unit=Adeept_Robot.service
+		if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
+			say "disabling the Adeept kit's stock server ($unit): it listens on 0.0.0.0:8888 with a fixed password"
+			$SUDO systemctl disable --now "$unit" || true
+		fi
+	fi
+	if command -v pgrep >/dev/null 2>&1 && pgrep -f "$STOCK_SERVER_RE" >/dev/null 2>&1; then
+		say "stopping a running Adeept stock server process"
+		$SUDO pkill -f "$STOCK_SERVER_RE" || true
+	fi
+	# Autostart: root's crontab and the invoking user's, then rc.local. OPENVIBE_CRONTAB_* / OPENVIBE_RC_LOCAL
+	# are test-only file overrides so the checks can run without root and without touching the real system.
+	if [ -n "${OPENVIBE_CRONTAB_ROOT:-}" ]; then
+		disable_stock_file "$OPENVIBE_CRONTAB_ROOT" "the root crontab"
+	else
+		disable_stock_crontab root
+	fi
+	if [ -n "${OPENVIBE_CRONTAB_USER:-}" ]; then
+		disable_stock_file "$OPENVIBE_CRONTAB_USER" "the crontab of $CRON_USER"
+	elif [ "$CRON_USER" != root ]; then
+		disable_stock_crontab "$CRON_USER"
+	fi
+	if [ -n "${OPENVIBE_RC_LOCAL:-}" ]; then
+		disable_stock_file "$OPENVIBE_RC_LOCAL" "rc.local ($OPENVIBE_RC_LOCAL)"
+	else
+		disable_stock_rc_local /etc/rc.local
+	fi
+}
+
+# Test hook: run only the stock-server check against the OPENVIBE_* file overrides, then stop.
+if [ "${OPENVIBE_INSTALL_STOCK_ONLY:-0}" = 1 ]; then
+	disable_stock_server
+	exit 0
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
 	command -v sudo >/dev/null 2>&1 || die "run as root (sudo is not installed)"
 	SUDO="sudo"
@@ -188,17 +290,7 @@ else
 fi
 
 # ---- the Adeept kit's stock server: never run it (fixed admin:123456 login on 0.0.0.0:8888, MJPEG on :5000) ----
-if command -v systemctl >/dev/null 2>&1; then
-	unit=Adeept_Robot.service
-	if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
-		say "disabling the Adeept kit's stock server ($unit): it listens on 0.0.0.0:8888 with a fixed password"
-		$SUDO systemctl disable --now "$unit" || true
-	fi
-fi
-if command -v pgrep >/dev/null 2>&1 && pgrep -f "Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py" >/dev/null 2>&1; then
-	say "stopping a running Adeept stock server process"
-	$SUDO pkill -f "Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py" || true
-fi
+disable_stock_server
 
 # ---- service ----
 if [ "$SERVICE" = 1 ]; then
