@@ -460,7 +460,13 @@ func (n *Node) sendEstopState() {
 	if st.Local && !st.LocalAt.IsZero() {
 		at = st.LocalAt
 	}
-	n.send(protocol.EstopState{Latched: st.Local, By: "device", At: at.UTC().Format(isoMillis)})
+	n.mu.Lock()
+	var robot string
+	if len(n.robotIDs) == 1 {
+		robot = n.robotIDs[0]
+	}
+	n.mu.Unlock()
+	n.send(protocol.EstopState{Latched: st.Local, By: "device", At: at.UTC().Format(isoMillis), RobotID: robot})
 }
 
 // isoMillis is the server's timestamp format, e.g. 2026-09-29T19:20:01.200Z.

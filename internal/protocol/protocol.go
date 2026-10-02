@@ -250,7 +250,8 @@ type Heartbeat struct {
 }
 
 // EstopState reports a latch held on the device (the local kill switch). Bot sets the robot's e-stop to Latched, so
-// latched:false is only sent to lift a latch this device reported; see node.reportLatch.
+// latched:false is only sent to lift a latch this device reported; see node.reportLatch. RobotID is the robot from
+// hello's robot_ids when the device serves exactly one, else empty.
 type EstopState struct {
 	Latched bool   `json:"latched"`
 	By      string `json:"by,omitempty"`

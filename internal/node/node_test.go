@@ -129,6 +129,20 @@ func (e *env) waitReady() {
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	// markReady sends status then estop_state on every connection, and the fake server mirrors the device's estop_state
+	// onto the robot. Waiting for the frame keeps a test from setting the robot's e-stop while the first connection's
+	// estop_state {latched:false} is still in flight and would clear it again. Frames, not Expect: the estop_state may
+	// precede the ready status, and Expect above would have skipped it.
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		for _, f := range e.conn.Frames() {
+			if f.Type == protocol.TypeEstopState {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatal("no estop_state frame within 20s")
+		}
+	}
 }
 
 var seq int
@@ -227,7 +241,7 @@ func TestPairConnectAndStatus(t *testing.T) {
 			switch m := f.Msg.(type) {
 			case protocol.EstopState:
 				sawEstopState = true
-				if m.Latched || m.By != "device" {
+				if m.Latched || m.By != "device" || m.RobotID != fakebot.RobotID {
 					t.Fatalf("estop_state %+v on a fresh device", m)
 				}
 			case protocol.Status:
