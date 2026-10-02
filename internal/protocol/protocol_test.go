@@ -56,7 +56,7 @@ func TestCommandFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := f.Msg.(Command)
-	if c.ID != "x" || c.DeadlineMS != 1738065600300 || c.Operator == nil || c.Operator.Subject != "usr_1" || c.Operator.Role != "operator" ||
+	if c.ID != "x" || c.Ref != "op-1" || c.DeadlineMS != 1738065600300 || c.Operator == nil || c.Operator.Subject != "usr_1" || c.Operator.Role != "operator" ||
 		c.RobotID != "rob_1" || string(c.Value) != `{"throttle":1}` {
 		t.Fatalf("%+v", c)
 	}
@@ -87,13 +87,18 @@ func TestBotFixtures(t *testing.T) {
 		t.Errorf("hello %+v", h)
 	}
 	if c := decode("config").Msg.(Config); c.HeartbeatMS != 1000 || c.Limits.MaxCommandMS != 300 || c.Limits.HeartbeatMS != 1000 ||
-		c.Limits.MaxSpeed == nil || *c.Limits.MaxSpeed != 1 || len(c.AllowedCommands) != 6 || c.EstopLatched {
+		c.Limits.MaxSpeed == nil || *c.Limits.MaxSpeed != 1 || len(c.AllowedCommands) != 3 || c.AllowedCommands[2] != KindHalt || c.EstopLatched {
 		t.Errorf("config %+v", c)
 	}
 	f := decode("command_drive")
 	if c := f.Msg.(Command); c.ID != "cmd_01J8Z4F…" || c.Kind != KindDrive || c.DeadlineMS-f.TS != 300 || c.Operator == nil ||
 		c.Operator.Role != "operator" || c.RobotID != "rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X" || string(c.Value) != `{ "throttle": 0.6, "steer": -0.25 }` {
 		t.Errorf("command %+v", c)
+	}
+	f = decode("command_actuator")
+	if c := f.Msg.(Command); c.ID != "cmd_01J8Z4E…" || c.Kind != KindActuator || c.DeadlineMS-f.TS != 300 ||
+		string(c.Value) != `{ "name": "pan", "value": -0.4 }` {
+		t.Errorf("actuator command %+v", c)
 	}
 	if f := decode("heartbeat_ack"); f.Seq != 41 || f.Msg.(HeartbeatAck).Seq != 41 {
 		t.Errorf("heartbeat_ack %+v", f)
@@ -126,7 +131,7 @@ func TestBotFixtures(t *testing.T) {
 }
 
 // TestBotPairShapes checks the pairing bodies against Bot's pair frame: the request carries exactly its fields, and
-// the REST answer (v1.js: device_id, credential, publish_key, robot_id = robot_ids[0], profile) decodes.
+// the REST answer (v1.js: device_id, credential, publish_key, whip_url, robot_id = robot_ids[0], profile) decodes.
 func TestBotPairShapes(t *testing.T) {
 	var frame map[string]any
 	if err := json.Unmarshal(fixture(t, "pair"), &frame); err != nil {
@@ -152,7 +157,7 @@ func TestBotPairShapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r.DeviceID != "dev_01J8Z4…" || r.Credential != "Xb3…" || r.PublishKey != "Vt9…" || r.RobotID != "rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X" ||
-		len(r.Profile) == 0 {
+		r.WHIPURL != "https://ingest.openre.stream/whip/Vt9…" || len(r.Profile) == 0 {
 		t.Fatalf("%+v", r)
 	}
 }

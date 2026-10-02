@@ -49,7 +49,7 @@ func TestBotFixturesEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	if creds.DeviceID != "dev_01J8Z4…" || creds.Credential.Reveal() != "Xb3…" || creds.PublishKey.Reveal() != "Vt9…" ||
-		creds.RobotID != "rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X" || len(creds.Profile) == 0 {
+		creds.RobotID != "rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X" || creds.WHIPURL != "https://ingest.openre.stream/whip/Vt9…" || len(creds.Profile) == 0 {
 		t.Fatalf("credentials %+v", creds)
 	}
 	if got := srv.PairRequests(); len(got) != 1 || !reflect.DeepEqual(got[0], req) {
@@ -76,7 +76,7 @@ func TestBotFixturesEndToEnd(t *testing.T) {
 			t.Fatalf("hello %+v", h)
 		}
 		if cf := waitFrame(t, rec, protocol.TypeConfig).Msg.(protocol.Config); cf.HeartbeatMS != 1000 || cf.Limits.MaxCommandMS != 300 ||
-			len(cf.AllowedCommands) != 6 || cf.EstopLatched {
+			len(cf.AllowedCommands) != 3 || cf.EstopLatched {
 			t.Fatalf("config %+v", cf)
 		}
 		if !l.Connected() {
@@ -109,6 +109,23 @@ func TestBotFixturesEndToEnd(t *testing.T) {
 	if !reflect.DeepEqual(r, want.Msg) {
 		t.Fatalf("ack %+v, want %+v", r, want.Msg)
 	}
+	// Bot's error frame is logged, never handed on and never fatal.
+	if err := c.SendRaw(botFixture(t, "error")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SendRaw(botFixture(t, "estop")); err != nil {
+		t.Fatal(err)
+	}
+	if f := waitFrame(t, rec, protocol.TypeEstop); f.Msg.(protocol.Estop).Latched || !l.Connected() {
+		t.Fatalf("after error and estop: %+v, connected %v", f, l.Connected())
+	}
+	rec.mu.Lock()
+	for _, f := range rec.frames {
+		if f.Type == protocol.TypeError {
+			t.Errorf("error frame reached the handler: %+v", f)
+		}
+	}
+	rec.mu.Unlock()
 	// Heartbeats carry Bot's seq and are acked by it.
 	if f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil); err != nil || f.Msg.(protocol.Heartbeat).Seq != f.Seq {
 		t.Fatalf("heartbeat %+v %v", f, err)

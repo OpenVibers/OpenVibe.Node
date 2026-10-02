@@ -41,6 +41,7 @@ var pairMessages = map[string]string{
 	"bot.pairing_code_used":    "the pairing code was already used; ask for a new one on openvibe.bot",
 	"bot.pairing_code_expired": "the pairing code expired (codes last 10 minutes); ask for a new one on openvibe.bot",
 	"bot.no_pairing_code":      "this robot has no live pairing code; ask for a new one on openvibe.bot",
+	"rate_limited":             "too many pairing attempts from here; wait a minute and try again",
 }
 
 // Pair redeems a one-time code with POST <server>/api/v1/pair.
@@ -99,8 +100,8 @@ func Pair(ctx context.Context, client *http.Client, server string, req protocol.
 	}
 	return &credentials.Credentials{
 		DeviceID: pr.DeviceID, RobotID: pr.RobotID, Credential: credentials.NewSecret(pr.Credential),
-		PublishKey: credentials.NewSecret(pr.PublishKey), Server: strings.TrimSuffix(server, "/"), Profile: pr.Profile,
-		PairedAt: time.Now().UTC(),
+		PublishKey: credentials.NewSecret(pr.PublishKey), WHIPURL: pr.WHIPURL, Server: strings.TrimSuffix(server, "/"),
+		Profile: pr.Profile, PairedAt: time.Now().UTC(),
 	}, nil
 }
 

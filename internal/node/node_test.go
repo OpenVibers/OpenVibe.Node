@@ -50,6 +50,13 @@ type env struct {
 // ready and the link is up.
 func start(t *testing.T) *env {
 	t.Helper()
+	return startWith(t, nil, true)
+}
+
+// startWith is start with prep run on the fake server before pairing; ready false returns once the device has
+// connected, without waiting for its first status.
+func startWith(t *testing.T, prep func(*fakebot.Server), ready bool) *env {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("end-to-end tests run on unix")
 	}
@@ -67,8 +74,12 @@ func start(t *testing.T) *env {
 
 	srv := fakebot.New()
 	t.Cleanup(srv.Close)
-	srv.Config = protocol.Config{HeartbeatMS: 100, Limits: protocol.Limits{MaxSpeed: f64(0.5), MaxTurn: f64(0.4), MaxCommandMS: 1000}}
+	srv.Config = protocol.Config{HeartbeatMS: 100, Limits: protocol.Limits{MaxSpeed: f64(0.5), MaxTurn: f64(0.4), MaxCommandMS: 1000},
+		AllowedCommands: append([]string(nil), protocol.Kinds...)}
 	srv.AddCode("TEST2345")
+	if prep != nil {
+		prep(srv)
+	}
 	creds, err := link.Pair(context.Background(), nil, srv.URL(), protocol.PairRequest{Code: "TEST2345", AgentVersion: "test",
 		DeviceKind: "onboard", Drivers: []string{"dryrun"}})
 	if err != nil {
@@ -97,7 +108,9 @@ func start(t *testing.T) *env {
 	e := &env{t: t, srv: srv, whip: whip, node: n, record: record, paths: paths, cancel: cancel, done: done}
 	t.Cleanup(e.stop)
 	e.conn = e.nextConn()
-	e.waitReady()
+	if ready {
+		e.waitReady()
+	}
 	return e
 }
 
@@ -263,8 +276,10 @@ func TestCommandsClampedAndIdempotent(t *testing.T) {
 	if v["throttle"] != 0.5 || v["steer"] != -0.4 {
 		t.Fatalf("not clamped to the owner limits: %s", drives[0].Value)
 	}
-	if drives[0].DeadlineMS != 300 {
-		t.Fatalf("deadline %d", drives[0].DeadlineMS)
+	// The plugin gets what is left of the 300 ms window (transit on loopback takes a few ms of it; the clock estimate
+	// rounds to whole milliseconds).
+	if d := drives[0].DeadlineMS; d < 150 || d > 305 {
+		t.Fatalf("deadline %d", d)
 	}
 	// Deadlines are capped at max_command_ms.
 	e.cmd("drive", `{"throttle":0.1}`, 60000)
@@ -362,7 +377,7 @@ func TestLocalKillSwitch(t *testing.T) {
 	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultLocalStop {
 		t.Fatalf("%q", c)
 	}
-	// The owner's estop_clear does not clear the local kill switch.
+	// The owner's clear (estop latched:false) does not clear the local kill switch.
 	e.conn.Send(protocol.Estop{Latched: false, By: "usr_owner"})
 	time.Sleep(100 * time.Millisecond)
 	if c := nackCode(e.cmd("drive", `{"throttle":0.3}`, 300)); c != protocol.FaultLocalStop {

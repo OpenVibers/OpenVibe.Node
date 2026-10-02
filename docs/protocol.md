@@ -61,9 +61,12 @@ arrives (Bot answers any frame on a not-yet-authenticated socket with `error` `b
 
 | code / answer                | meaning                                              | the Node                                               |
 |------------------------------|------------------------------------------------------|--------------------------------------------------------|
-| `4000`                       | a second connection with this credential replaced it | waits 60 s (+ jitter) before dialing, so two agents with one credential do not kick each other off every second |
-| `4002`, or HTTP `401`/`403`  | the credential is wrong or revoked                   | retries after ≥ 10 s; gives up after 3 in a row, "pair again" |
-| `4003`                       | the owner revoked the device while it was connected  | stops the link at once, "pair again"                    |
+| `4000`                       | a second connection with this credential replaced it | reconnects with the normal backoff                      |
+| `4002`, or HTTP `401`/`403`  | the credential is wrong, rotated or revoked          | retries no sooner than 10 s (jitter only adds), logs "pair again, or install the current credential" |
+| `4003`                       | the owner revoked the device (or rotated its credential) while it was connected | the same as `4002`             |
+
+The link never gives up on its own: the owner may pair the device again. Bot's `error` frames (`bot.not_paired`,
+`bot.not_ready`, `bot.forbidden`, …) are logged and never end the connection.
 
 ### Frames
 
@@ -86,13 +89,16 @@ carry their own `seq` (the echoed heartbeat number) in the same object as the en
 |-----------------|--------------------------------------------------------------------------------------------------|
 | `hello`         | `session_id`, `device_id`, `robot_ids` [], `server_time` (RFC 3339) — on every authenticated connection |
 | `config`        | `heartbeat_ms`, `limits` {`max_speed` 0..1, `max_turn` 0..1, `max_command_ms`, `heartbeat_ms`}, `allowed_commands` [kinds], `estop_latched` — right after `hello` |
-| `command`       | `id` (idempotency key), `kind`, `value`, `deadline_ms` (absolute, motion kinds only), `operator` {`subject`, `role`}, `robot_id`; Node only: `target` (plugin name) |
+| `command`       | `id` (server-minted: the idempotency and ack key), `ref` (the operator's own id, logs only), `kind`, `value`, `deadline_ms` (absolute, motion kinds only), `operator` {`subject`, `role`}, `robot_id`; Node only: `target` (plugin name) |
 | `estop`         | `latched` (true: the e-stop latched; false: the owner cleared it), `by`, `at`                    |
 | `heartbeat_ack` | `seq` (the heartbeat's), `server_time`; the Node measures RTT from its own send time             |
 | `error`         | `code`, `detail` — a frame the server refused; logged, never fatal                               |
 
 `config.estop_latched` is the robot's e-stop as the server holds it: an owner e-stop set while the device was offline
-latches the Node on reconnect, and a clear made while offline releases it.
+latches the Node on reconnect, and a clear made while offline releases it. Until a connection's `config` has been
+applied the Node runs nothing but `halt` (`nack not_ready`), so that latch is in force before any motion.
+`config.allowed_commands` absent allows every kind; present (Bot always sends it, `halt` included) it is the list.
+`estop` `latched:false` is the owner's clear: it clears the remote latch only, never the local kill switch.
 
 ### Device → server
 
@@ -103,11 +109,12 @@ latches the Node on reconnect, and a clear made while offline releases it.
 | `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack)                                               |
 | `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
 | `heartbeat`   | `seq`, `rtt_ms` (the last measured round trip, once there is one)                                   |
-| `estop_state` | `latched` (the remote e-stop), `by` (`device`), `at`; Node extras: `local_stop` (local kill switch), `reason` |
+| `estop_state` | `latched` (the device is stopped: remote e-stop or local kill switch), `by` (`device`), `at`; Node extras: `local_stop` (local kill switch), `reason` |
 
-`status` is sent when `hello` arrives and whenever a plugin changes state or faults; `estop_state` after every
-`config` and whenever the latch changes (never before `config`: Bot takes a device's `estop_state` as the robot's
-latch, so reporting "clear" before learning of an owner e-stop would clear it). Plugin events (`cliff`, `picked_up`,
+The first `status` and `estop_state` go out once the connection's `config` has been applied, never right after the
+upgrade or `hello`; then `status` whenever a plugin changes state or faults and `estop_state` after every `config`,
+`estop` and latch change. Bot reads `latched:true` as the device stopping the robot and latches it (only the owner
+clears that); `latched:false` is a report only. Plugin events (`cliff`, `picked_up`,
 `low_battery`, `heartbeat_lost`, …) travel in `telemetry.events` and are sent within 100 ms; sensor telemetry is sent
 at most every 500 ms (≤ 2 Hz, Bot's cap). There is no separate `event` message type.
 
@@ -127,33 +134,36 @@ Sign conventions: `throttle`/`x` positive = forward; `steer` positive = turn rig
 servo in their config to make the hardware match).
 
 `deadline_ms` is an **absolute** instant in Unix milliseconds on the server's clock, present on `drive`, `actuator` and
-`ptz`. A device's clock may be minutes off, so the Node never compares it with its own clock: it takes
-`deadline_ms − ts` (both from the server's clock) as the time the command stays valid and starts that window at
-receipt. A deadline at or before `ts` → `nack bad_value`. No `deadline_ms` → 300 ms. Always capped at `max_command_ms`
-(default 1000). A held control is re-sent by the panel every 150 ms, each with a new `id`. Plugins still get a
-relative `deadline_ms` ([plugins.md](plugins.md)).
+`ptz`. A device's clock may be minutes off, so the Node never compares it with its own clock: it estimates the
+server's clock from the `ts` of every frame on the connection (the largest `ts` − receive time: the skew less the
+fastest transit, kept for the whole connection so a run of delayed frames cannot reopen an expired deadline) and
+compares `deadline_ms` with that at receipt. A command that arrives at or after its deadline →
+`nack expired` and never reaches a plugin; otherwise the plugin gets only the time that is left. No `deadline_ms` →
+300 ms. Always capped at `max_command_ms` (default 1000). A held control is re-sent by the panel every 150 ms, each
+with a new `id`. Plugins still get a relative `deadline_ms` and keep their own stop timer ([plugins.md](plugins.md)).
 
 What the Node does with a command, in order:
 
 1. A repeated `id` is answered with the first result and never executed again (the cache lives for 10 minutes and
    across reconnects).
-2. Unknown kind → `nack unsupported`. Kind not in `config.allowed_commands` → `nack not_allowed` (`halt` is always allowed).
+2. Unknown kind → `nack unsupported`.
 3. `halt` → every plugin stops, `ack`.
-4. `drive`, `ptz`, `actuator` while the local kill switch is latched → `nack local_stop`; while the remote e-stop is
-   latched → `nack estopped`.
-5. The value is clamped in the core, before any plugin sees it: `throttle`, `x`, `y` to ±`max_speed`; `steer`,
+4. No `config` yet on this connection → `nack not_ready`. Kind not in `config.allowed_commands` → `nack not_allowed`.
+5. `drive`, `ptz`, `actuator` while the local kill switch is latched → `nack local_stop`; while the remote e-stop is
+   latched → `nack estopped`; past its `deadline_ms` → `nack expired`.
+6. The value is clamped in the core, before any plugin sees it: `throttle`, `x`, `y` to ±`max_speed`; `steer`,
    `rotation` to ±`max_turn`; `pan`, `tilt`, `zoom` and a numeric actuator `value` to ±1. The limits are the stricter of
    the server's `config.limits` and the local config's `limits`. Non-numbers → `nack bad_value`.
-6. It goes to the plugin named by `target`, or the first plugin whose `describe` declares the kind (for actuators, the
+7. It goes to the plugin named by `target`, or the first plugin whose `describe` declares the kind (for actuators, the
    first listing the name). None → `nack unsupported`.
-7. The plugin's `ack`/`nack` is relayed. No answer within max(deadline, 1 s) → the plugin is told to stop and the
+8. The plugin's `ack`/`nack` is relayed. No answer within max(deadline, 1 s) → the plugin is told to stop and the
    server gets `nack plugin_timeout`.
 
 Commands are never queued while offline and never replayed after a reconnect.
 
 ### Fault codes
 
-`bad_frame`, `bad_value`, `unsupported`, `not_allowed`, `estopped`, `local_stop`, `no_heartbeat`,
+`bad_frame`, `bad_value`, `unsupported`, `not_allowed`, `estopped`, `local_stop`, `expired`, `no_heartbeat`,
 `not_ready`, `plugin_down`, `plugin_timeout`, `hardware`, `firmware_unsupported`, `not_connected`, `cliff`,
 `picked_up`, `shutting_down`. Plugins may add their own; they are passed through.
 

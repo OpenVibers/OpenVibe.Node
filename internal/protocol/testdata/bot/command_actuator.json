@@ -1,0 +1,3 @@
+{ "v": 1, "seq": 8, "ts": 1738065600000, "type": "command", "id": "cmd_01J8Z4E…", "kind": "actuator",
+  "value": { "name": "pan", "value": -0.4 }, "deadline_ms": 1738065600300,
+  "operator": { "subject": "usr_01J8…", "role": "operator" }, "robot_id": "rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X" }
