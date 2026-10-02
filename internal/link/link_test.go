@@ -143,6 +143,119 @@ func TestConnectHelloConfigHeartbeat(t *testing.T) {
 	}
 }
 
+// Bot's heartbeat_ack echoes the device's send time (echo/t) over its own envelope seq, so the Node measures the
+// round trip from that; a fresh connection starts with no measurement.
+func TestHeartbeatRTTReportedAfterAck(t *testing.T) {
+	srv, l, rec, _, _ := setup(t, 60*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeHello)
+	waitFrame(t, rec, protocol.TypeConfig)
+
+	first, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hb := first.Msg.(protocol.Heartbeat); hb.T == 0 {
+		t.Fatalf("heartbeat carried no t: %+v", hb)
+	} else if hb.RTTMS != nil {
+		t.Fatalf("first heartbeat on a connection carried rtt_ms %d", *hb.RTTMS)
+	}
+
+	// fakebot auto-acks, so a later heartbeat carries the measurement: present, and never negative.
+	for {
+		f, err := c.Expect(protocol.TypeHeartbeat, 3*time.Second, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hb := f.Msg.(protocol.Heartbeat)
+		if hb.RTTMS == nil {
+			continue
+		}
+		if *hb.RTTMS < 0 {
+			t.Fatalf("rtt_ms %d", *hb.RTTMS)
+		}
+		break
+	}
+	if l.Stats().RTT <= 0 {
+		t.Fatal("no RTT in stats")
+	}
+
+	// A reconnect starts fresh: the first heartbeat on the new connection again carries no rtt_ms.
+	c.Close()
+	<-rec.gotDown
+	c2, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeHello)
+	waitFrame(t, rec, protocol.TypeConfig)
+	first2, err := c2.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hb := first2.Msg.(protocol.Heartbeat); hb.RTTMS != nil {
+		t.Fatalf("first heartbeat on a new connection carried rtt_ms %d", *hb.RTTMS)
+	}
+}
+
+// An ack that carries only echo (Bot's newer field, no t) still sets the RTT.
+func TestHeartbeatAckEchoOnlySetsRTT(t *testing.T) {
+	srv, l, rec, _, _ := setup(t, 200*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeConfig)
+	c.Mute() // stop fakebot's automatic t+echo answers; this test sends the ack itself
+	f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo := f.Msg.(protocol.Heartbeat).T
+	if echo == 0 {
+		t.Fatal("heartbeat carried no t to echo")
+	}
+	if err := c.Send(protocol.HeartbeatAck{Echo: &echo}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for l.Stats().RTT <= 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("an echo-only heartbeat_ack did not set the RTT")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// An ack that carries only seq (older Bot, no t/echo) still sets the RTT from the bounded send-time lookup.
+func TestHeartbeatAckSeqOnlySetsRTT(t *testing.T) {
+	srv, l, rec, _, _ := setup(t, 200*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeConfig)
+	c.Mute() // stop fakebot's automatic t+echo answers; this test sends the ack itself
+	f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb := f.Msg.(protocol.Heartbeat)
+	if err := c.Send(protocol.HeartbeatAck{Seq: hb.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for l.Stats().RTT <= 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a seq-only heartbeat_ack did not set the RTT")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestDeadmanOnSilentServer(t *testing.T) {
 	srv, _, rec, _, _ := setup(t, 50*time.Millisecond)
 	c, _ := srv.NextConn(3 * time.Second)

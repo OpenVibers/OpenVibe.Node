@@ -169,10 +169,13 @@ type Estop struct {
 	At      string `json:"at,omitempty"` // RFC 3339
 }
 
-// HeartbeatAck echoes the heartbeat's seq. The server writes it over the envelope's seq, so the decoded frame's
-// Seq is the echoed value too.
+// HeartbeatAck answers a heartbeat. Bot's envelope seq is its own counter and never the device's, so the body
+// carries the device's send time back as t (and, on newer Bot, echo: the same value, or null when the heartbeat
+// had no t) and Bot's clock in server_time. Seq is present only from older servers that echoed the heartbeat's seq.
 type HeartbeatAck struct {
-	Seq        uint64 `json:"seq"`
+	Seq        uint64 `json:"seq,omitempty"`
+	T          int64  `json:"t,omitempty"`
+	Echo       *int64 `json:"echo,omitempty"`
 	ServerTime string `json:"server_time,omitempty"`
 }
 
@@ -238,9 +241,12 @@ type Nack struct {
 	Message   string `json:"message,omitempty"`
 }
 
-// Heartbeat carries the same seq as its envelope (the link sets it), so the server's echo is unambiguous.
+// Heartbeat is sent every config.heartbeat_ms. Seq mirrors the envelope seq for older servers that echo it; T is the
+// device's send time (unix ms), which Bot echoes back as heartbeat_ack.t/echo and the Node measures RTT from. RTTMS is
+// the last measured round trip, absent until one has been measured (a measured 0 ms is still sent, hence the pointer).
 type Heartbeat struct {
 	Seq   uint64 `json:"seq"`
+	T     int64  `json:"t,omitempty"`
 	RTTMS *int64 `json:"rtt_ms,omitempty"`
 }
 

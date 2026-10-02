@@ -64,6 +64,13 @@ type Options struct {
 // the next try; jitter only ever adds to it.
 const CredentialRetryMin = 10 * time.Second
 
+// hbSend is one heartbeat the link sent: its monotonic send time and the t it carried, so an ack can be matched
+// back either by the echoed t (Bot) or by the body seq (older servers).
+type hbSend struct {
+	at time.Time
+	t  int64
+}
+
 // Link is the reconnecting control connection.
 type Link struct {
 	opt     Options
@@ -73,7 +80,7 @@ type Link struct {
 	mu        sync.Mutex
 	out       chan []byte
 	seq       uint64
-	hbSent    map[uint64]time.Time // heartbeat seq → send time, for the RTT
+	hbSent    map[uint64]hbSend // heartbeat seq → send time/t, bounded to the last few
 	heartbeat time.Duration
 	deadman   time.Duration
 
@@ -196,8 +203,10 @@ func (l *Link) Send(m protocol.Message) error {
 	l.seq++
 	now := time.Now()
 	if hb, ok := m.(protocol.Heartbeat); ok {
-		// The body seq equals the envelope seq, so heartbeat_ack's echo is the same whichever the server reads.
+		// The body seq still mirrors the envelope's (older servers echo it); t is the send time Bot echoes back as
+		// heartbeat_ack.t/echo, and rtt_ms is the last measured round trip, once there is one on this connection.
 		hb.Seq = l.seq
+		hb.T = now.UnixMilli()
 		if rtt := l.lastRTT.Load(); rtt > 0 {
 			ms := time.Duration(rtt).Milliseconds()
 			hb.RTTMS = &ms
@@ -208,7 +217,7 @@ func (l *Link) Send(m protocol.Message) error {
 				delete(l.hbSent, s)
 			}
 		}
-		l.hbSent[l.seq] = now
+		l.hbSent[l.seq] = hbSend{at: now, t: hb.T}
 	}
 	b, err := protocol.Encode(l.seq, now.UnixMilli(), m)
 	if err != nil {
@@ -326,8 +335,10 @@ func (l *Link) session(ctx context.Context) error {
 	// Nothing is sent until the server's hello: until then the socket is not authenticated.
 	out := make(chan []byte, 256)
 	l.mu.Lock()
-	l.out, l.seq, l.hbSent, l.hasSkew = nil, 0, map[uint64]time.Time{}, false
+	l.out, l.seq, l.hbSent, l.hasSkew = nil, 0, map[uint64]hbSend{}, false
 	l.mu.Unlock()
+	// A fresh connection has no measured round trip: the first heartbeat must not claim one.
+	l.lastRTT.Store(0)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	var endErr error
@@ -427,11 +438,32 @@ func (l *Link) session(ctx context.Context) error {
 		l.observe(f.TS, rx)
 		switch m := f.Msg.(type) {
 		case protocol.HeartbeatAck:
+			// Bot's envelope seq is its own counter, so the ack is matched to a stored send time by the echoed t
+			// (echo, or older Bot's t); a server that only echoes the heartbeat's seq is matched by that. The
+			// stored time is monotonic, so a wall-clock adjustment between send and ack cannot skew the round trip.
+			echo := m.T
+			if echo == 0 && m.Echo != nil {
+				echo = *m.Echo
+			}
 			l.mu.Lock()
-			sent, ok := l.hbSent[m.Seq]
-			delete(l.hbSent, m.Seq)
+			var sent time.Time
+			if echo > 0 {
+				for s, hb := range l.hbSent {
+					if hb.t == echo {
+						sent = hb.at
+						delete(l.hbSent, s)
+						break
+					}
+				}
+			}
+			if sent.IsZero() && m.Seq != 0 {
+				if hb, ok := l.hbSent[m.Seq]; ok {
+					sent = hb.at
+					delete(l.hbSent, m.Seq)
+				}
+			}
 			l.mu.Unlock()
-			if ok {
+			if !sent.IsZero() {
 				// A coarse clock (Windows) can read 0 on a fast loopback; 0 means "not measured yet", so floor at 1 ns.
 				l.lastRTT.Store(int64(max(time.Since(sent), 1)))
 			}

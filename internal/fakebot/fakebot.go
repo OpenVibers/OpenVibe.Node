@@ -8,8 +8,8 @@
 // it, a device's estop_state latched:true sets it, and latched:false is only a report. Tests drive it to send
 // commands, e-stops, errors and silence, and read back what the device sent.
 //
-// heartbeat_ack still echoes the heartbeat's seq (Bot d398445); Bot now echoes heartbeat.t as echo, and that change
-// is a follow-up on both sides.
+// heartbeat_ack carries Bot's own envelope seq and echoes the heartbeat's t as both t and echo (echo null when the
+// heartbeat had no t), with server_time as Bot's clock; the device measures RTT from the echoed send time.
 package fakebot
 
 import (
@@ -438,7 +438,13 @@ func (c *Conn) read() {
 			c.setEstop(true) // a report of latched:false never clears Bot's latch
 		}
 		if hb, ok := f.Msg.(protocol.Heartbeat); ok && c.autoAck.Load() && !c.muted.Load() {
-			_ = c.Send(protocol.HeartbeatAck{Seq: hb.Seq, ServerTime: time.Now().UTC().Format(time.RFC3339Nano)})
+			// Bot answers with its own envelope seq (sendAt sets it): echo and t are the heartbeat's send time.
+			ack := protocol.HeartbeatAck{ServerTime: time.Now().UTC().Format(time.RFC3339Nano)}
+			if hb.T != 0 {
+				t := hb.T
+				ack.T, ack.Echo = t, &t
+			}
+			_ = c.Send(ack)
 		}
 		c.fmu.Lock()
 		c.frames = append(c.frames, f)

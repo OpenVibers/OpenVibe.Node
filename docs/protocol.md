@@ -79,9 +79,10 @@ Every frame is one JSON object in one text message with the envelope fields at t
 | `ts`   | int    | sender's clock, Unix milliseconds                                      |
 | `type` | string | message type                                                           |
 
-Unknown `type`s are ignored (a newer server may send more). Frames are at most 1 MiB. `heartbeat` and `heartbeat_ack`
-carry their own `seq` (the echoed heartbeat number) in the same object as the envelope's; the Node sets a heartbeat's
-`seq` equal to its envelope `seq`, so either reading gives the same number.
+Unknown `type`s are ignored (a newer server may send more). Frames are at most 1 MiB. A `heartbeat` carries the
+device's send time in `t` (Unix ms) and the last measured `rtt_ms`; the server echoes `t` back in `heartbeat_ack` as
+`echo` (and `t`), so the Node measures the round trip against its own clock. A `heartbeat_ack`'s envelope `seq` is the
+server's own counter, never the heartbeat's.
 
 ### Server → device
 
@@ -91,7 +92,7 @@ carry their own `seq` (the echoed heartbeat number) in the same object as the en
 | `config`        | `heartbeat_ms`, `limits` {`max_speed` 0..1, `max_turn` 0..1, `max_command_ms`, `heartbeat_ms`}, `allowed_commands` [kinds], `estop_latched` — right after `hello` |
 | `command`       | `id` (server-minted: the idempotency and ack key), `ref` (the operator's own id, logs only), `kind`, `value`, `deadline_ms` (absolute, motion kinds only), `operator` {`subject`, `role`}, `robot_id`; Node only: `target` (plugin name) |
 | `estop`         | `latched` (true: the e-stop latched; false: the owner cleared it), `by`, `at`                    |
-| `heartbeat_ack` | `seq` (the heartbeat's), `server_time`; the Node measures RTT from its own send time             |
+| `heartbeat_ack` | `echo` (the heartbeat's `t`, or null), `t` (the same send time when the server has it), `server_time` (RFC 3339); the Node measures RTT from the echoed send time |
 | `error`         | `code`, `detail` — a frame the server refused; logged, never fatal                               |
 
 `config.estop_latched` is the robot's e-stop as the server holds it: an owner e-stop set while the device was offline
@@ -108,7 +109,7 @@ applied the Node runs nothing but `halt` (`nack not_ready`), so that latch is in
 | `telemetry`   | `battery` (0..1), `voltage` (V), `rssi`, `sensors` {…}; Node extra: `events` [{`name`, `driver`, `ts`, `fields`}] |
 | `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack)                                               |
 | `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
-| `heartbeat`   | `seq`, `rtt_ms` (the last measured round trip, once there is one)                                   |
+| `heartbeat`   | `t` (send time, Unix ms), `rtt_ms` (the last measured round trip, once there is one; 0 is a real measurement) |
 | `estop_state` | `latched` (the device is stopped: remote e-stop or local kill switch), `by` (`device`), `at`; Node extras: `local_stop` (local kill switch), `reason` |
 
 The first `status` and `estop_state` go out once the connection's `config` has been applied, never right after the

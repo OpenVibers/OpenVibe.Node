@@ -32,7 +32,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		if err := json.Unmarshal(b, &raw); err != nil {
 			t.Fatalf("%s: %v: %s", m.MessageType(), err, b)
 		}
-		// heartbeat and heartbeat_ack carry their own seq, which wins over the envelope's (as on Bot's wire).
+		// heartbeat carries its own seq (mirroring the envelope's); heartbeat_ack does too only from older servers.
 		_, ownSeq := m.(Heartbeat)
 		if _, ok := m.(HeartbeatAck); ok {
 			ownSeq = true
@@ -102,6 +102,11 @@ func TestBotFixtures(t *testing.T) {
 	}
 	if f := decode("heartbeat_ack"); f.Seq != 41 || f.Msg.(HeartbeatAck).Seq != 41 {
 		t.Errorf("heartbeat_ack %+v", f)
+	}
+	// Bot's newer ack: its own envelope seq, the device's send time echoed as echo and t.
+	if f := decode("heartbeat_ack_echo"); f.Seq != 4 || f.Msg.(HeartbeatAck).T != 1738065600500 ||
+		f.Msg.(HeartbeatAck).Echo == nil || *f.Msg.(HeartbeatAck).Echo != 1738065600500 || f.Msg.(HeartbeatAck).ServerTime == "" {
+		t.Errorf("heartbeat_ack echo %+v", f)
 	}
 	if e := decode("estop").Msg.(Estop); e.Latched || e.By != "usr_01J8…" {
 		t.Errorf("estop %+v", e)
