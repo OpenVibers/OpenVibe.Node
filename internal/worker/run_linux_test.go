@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/OpenVibers/OpenVibe.Node/internal/config"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
@@ -35,13 +36,18 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println("line 1")
 		time.Sleep(300 * time.Millisecond)
 		fmt.Println("line 2 é")
-		time.Sleep(1900 * time.Millisecond)
+		time.Sleep(2900 * time.Millisecond) // well past the second usage tick, so both are sent even under -race
 		fmt.Fprintf(result, `{"got":%s}`, bytes.TrimSpace(in))
 	case "sleep":
 		fmt.Println("sleeping")
 		time.Sleep(time.Hour)
 	case "flood":
 		line := strings.Repeat("x", 1023) + "\n"
+		for {
+			os.Stdout.WriteString(line)
+		}
+	case "badflood": // invalid UTF-8: every lone 0xff is sent as U+FFFD, 3 bytes
+		line := strings.Repeat("\xffx", 511) + "\n"
 		for {
 			os.Stdout.WriteString(line)
 		}
@@ -249,29 +255,32 @@ func TestCancelKill(t *testing.T) {
 	}
 }
 
-// TestOutputCap: stdout past max_output_bytes is cut at exactly the cap and the job is killed (limit); chunks are
-// numbered from 1 and never larger than chunkBytes.
+// TestOutputCap: stdout past max_output_bytes is cut at the cap and the job is killed (limit); chunks are numbered
+// from 1, valid UTF-8 and never larger than chunkBytes. Both bounds count the bytes sent, after invalid UTF-8 became
+// U+FFFD: ASCII is cut at exactly the cap, a U+FFFD is never split, so it may stop up to 2 bytes short.
 func TestOutputCap(t *testing.T) {
 	const capBytes = 64 << 10
-	w, s := newRunWorker(t, config.WorkerCaps{MaxOutputBytes: capBytes}, "flood")
-	j := testJob(1, "flood")
-	run(t, w, j)
-	ex := s.exit(t, j.ID)
-	if ex.Reason != protocol.ExitLimit || ex.Code != nil {
-		t.Fatalf("%+v", ex)
-	}
-	total, seq := 0, uint64(0)
-	for _, m := range s.all() {
-		if f, ok := m.(protocol.JobStdout); ok {
-			if f.ChunkSeq != seq+1 || len(f.Chunk) > chunkBytes {
-				t.Fatalf("chunk %d after %d, %d bytes", f.ChunkSeq, seq, len(f.Chunk))
-			}
-			seq = f.ChunkSeq
-			total += len(f.Chunk)
+	w, s := newRunWorker(t, config.WorkerCaps{MaxOutputBytes: capBytes}, "flood", "badflood")
+	for i, mode := range []string{"flood", "badflood"} {
+		j := testJob(i+1, mode)
+		run(t, w, j)
+		ex := s.exit(t, j.ID)
+		if ex.Reason != protocol.ExitLimit || ex.Code != nil {
+			t.Fatalf("%s: %+v", mode, ex)
 		}
-	}
-	if total != capBytes {
-		t.Fatalf("%d stdout bytes sent, cap %d", total, capBytes)
+		total, seq := 0, uint64(0)
+		for _, m := range s.all() {
+			if f, ok := m.(protocol.JobStdout); ok && f.ID == j.ID {
+				if f.ChunkSeq != seq+1 || len(f.Chunk) > chunkBytes || !utf8.ValidString(f.Chunk) {
+					t.Fatalf("%s: chunk %d after %d, %d bytes, valid %v", mode, f.ChunkSeq, seq, len(f.Chunk), utf8.ValidString(f.Chunk))
+				}
+				seq = f.ChunkSeq
+				total += len(f.Chunk)
+			}
+		}
+		if total > capBytes || total <= capBytes-utf8.UTFMax || (mode == "flood" && total != capBytes) {
+			t.Fatalf("%s: %d stdout bytes sent, cap %d", mode, total, capBytes)
+		}
 	}
 }
 

@@ -216,12 +216,15 @@ A resent `job` with an id already answered gets the same answer again, never a s
 process: `ack` while it runs, its `job_exit` once it ended; the Node remembers the last 1024 well-formed ids.
 
 An accepted job runs once the `ack` is out: `job_started` (`started_ms` anchors every usage second), its stdout as
-`job_stdout` chunks (at most 16 KiB each, UTF-8, `chunk_seq` from 1; best effort, not resent), one `job_usage` for
+`job_stdout` chunks (at most 16 KiB each as sent and `max_output_bytes` in all, valid UTF-8 with invalid bytes as
+U+FFFD, `chunk_seq` from 1; best effort, not resent), one `job_usage` for
 every wall-clock second once it has fully elapsed (`second` from 0, `cpu_ms` that second's CPU time), then
 `job_exit`. Its `usage` is authoritative for metering (Bot writes `usage-sample` readings `service:"run"`,
 `operation:"function.invoke"`, unit `s`, idempotency key `run:<job id>:<n>`; none of those fields changes on a
 resend). The Node resends `job_started` for running jobs and `job_exit` for ended ones after every reconnect, and
-`job_exit` again on a `job` or `job_cancel` for that id, until `job_exit_ack`. `job_exit.reason`:
+`job_exit` again on a `job` or `job_cancel` for that id, until `job_exit_ack`. `job_started` goes out only once the
+job's CPU limit is set; a job that fails before (no namespaces, spawn or CPU limit failed) ends `failed` without it.
+A Node shutting down sends `job_exit` (`stopped`) also for a job acked but not started yet. `job_exit.reason`:
 
 | `reason`    | `code`  | when                                                                                                |
 |-------------|---------|-----------------------------------------------------------------------------------------------------|

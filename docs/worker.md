@@ -36,8 +36,8 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   `credential.json` included, and use its groups (`gpio`, `dialout`, `video`): **for development only**. With neither
   `run_as` nor `allow_same_user` the worker stays off.
 - `caps`: the owner's local caps. A job's `ttl_ms`, `limits.wall_ms`, `limits.cpu_ms` and `limits.mem_bytes` are
-  each clamped to them (the stricter value wins, as with `max_command_ms`). `max_output_bytes` caps one job's stdout;
-  `max_jobs` how many run at once.
+  each clamped to them (the stricter value wins, as with `max_command_ms`). `max_output_bytes` caps the stdout bytes
+  one job sends (counted on the wire, after invalid UTF-8 became U+FFFD); `max_jobs` how many run at once.
 
 The class `function` is advertised in `status.capabilities.worker` only when `enabled` is true, the OS is Linux and a
 **boot-time probe** passes: it starts `/bin/sh` the way a job is started and checks that the process got user,
@@ -56,8 +56,10 @@ affected.
    `LANG=C.UTF-8`, `OPENVIBE_JOB_ID`, and the function's `env`; nothing inherited from the Node); `args` as one line of
    JSON on stdin; stderr discarded. The process starts in its own process group and in new user, network and PID
    namespaces, with `PR_SET_PDEATHSIG` SIGKILL, then gets `RLIMIT_CPU` (at `cpu_ms`, rounded up to a second) and
-   `RLIMIT_CORE` 0. `job_started` follows.
-3. **Run**: stdout streams as `job_stdout`; a watchdog samples CPU time and resident memory of every process in the
+   `RLIMIT_CORE` 0. `job_started` follows only once `RLIMIT_CPU` is set: if it cannot be set the process is killed
+   and the job ends `failed` with no `job_started`.
+3. **Run**: stdout streams as `job_stdout` chunks of at most 16 KiB each as sent (invalid UTF-8 becomes U+FFFD before
+   it is cut, and a UTF-8 sequence is never split); a watchdog samples CPU time and resident memory of every process in the
    job's PID namespace every 200 ms and sends `job_usage` for every second once it fully elapsed.
 4. **End**: the function's result is what it writes to **fd 3** (JSON, at most 256 KiB), reported only when it exits
    0. `job_exit` carries the reason, the exit code (null when it was killed) and the usage, and is resent until
@@ -66,8 +68,12 @@ affected.
 Every kill is SIGKILL to the whole process group and to the leader, which is PID 1 of the job's PID namespace, so its
 death also kills every process the job left behind. The watchdog kills at `ttl_ms` (from receipt), `wall_ms` (from
 start), `cpu_ms`, `mem_bytes`, at `max_output_bytes` of stdout, on `job_cancel`, and the moment the e-stop or the local
-stop latches (`openvibe-node stop`); while the latch is set every job is refused. A Node shutting down kills its jobs
-(`stopped`).
+stop latches (`openvibe-node stop`); while the latch is set every job is refused, and `openvibe-node resume` admits
+them again. A Node shutting down kills its jobs (`stopped`); a job acked but not started yet never starts and gets its
+`job_exit` (`stopped`) all the same.
+
+`openvibe-node status` lists the jobs not ended yet under `jobs` (`--json`: `id`, `function` as `name@version`,
+`state` `admitted`, `running` or `stopping`, and `started_ms` once running); the list is empty when the worker is off.
 
 ## Isolation model and its limits
 
@@ -89,8 +95,8 @@ What it does **not** protect against (no seccomp, no cgroups, no mount namespace
 - **The kernel**: no seccomp filter, so the whole syscall surface is open, including what user namespaces expose to
   unprivileged code (a common source of local privilege escalations). Keep the kernel patched.
 - **Memory and CPU are sampled**, not enforced by cgroups: a burst between two 200 ms samples can exceed `mem_bytes`
-  (and meet the kernel's OOM killer first); the `RLIMIT_CPU` backstop is set just after start and covers each process
-  on its own, not their sum.
+  (and meet the kernel's OOM killer first); the `RLIMIT_CPU` backstop is set just after start (before `job_started`)
+  and covers each process on its own, not their sum.
 - **No limit on processes, threads, disk or I/O**: a fork bomb is bounded only by the uid's `RLIMIT_NPROC`, disk use
   in the working directory or `/tmp` only by free space; `/tmp` and `/dev/shm` are shared with the machine.
 - **`/proc` is the host's**: a job can list the machine's processes and their command lines (not signal them: its PID

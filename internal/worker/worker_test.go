@@ -185,3 +185,37 @@ func TestIsolationUnavailableRefused(t *testing.T) {
 		t.Fatalf("job_started sent %d times for a job that could not be isolated", n)
 	}
 }
+
+// TestCloseEndsUnlaunched: a job admitted but not launched when the worker closes gets its job_exit (stopped, never
+// run), is answered with it when resent, and a later Launch starts nothing.
+func TestCloseEndsUnlaunched(t *testing.T) {
+	s := &sink{}
+	w := New(helperConfig(t, config.WorkerCaps{}, "sleep"), s.send, quiet())
+	w.isolate = func(*exec.Cmd, config.WorkerConfig) error { return errors.New("not in this test") }
+	j := testJob(1, "sleep")
+	if f, r := w.Admit(j); f != "" {
+		t.Fatalf("%s %s", f, r)
+	}
+	if jobs := w.Jobs(); len(jobs) != 1 || jobs[0] != (JobInfo{ID: j.ID, Function: "sleep@1.0.0", State: "admitted"}) {
+		t.Fatalf("jobs %+v", jobs)
+	}
+	w.Close()
+	ex := s.exit(t, j.ID)
+	if ex.Reason != protocol.ExitStopped || ex.Code != nil || ex.Usage.StartedMS != nil || string(ex.Result) != "null" {
+		t.Fatalf("%+v", ex)
+	}
+	if m, ok := w.Known(j.ID); !ok || m.(protocol.JobExit).Reason != protocol.ExitStopped {
+		t.Fatalf("a resent job is answered %+v, want its job_exit", m)
+	}
+	if jobs := w.Jobs(); len(jobs) != 0 {
+		t.Fatalf("an ended job listed: %+v", jobs)
+	}
+	w.Launch(j.ID)
+	time.Sleep(100 * time.Millisecond)
+	if n, e := s.count(protocol.TypeJobStarted, j.ID), s.count(protocol.TypeJobExit, j.ID); n != 0 || e != 1 {
+		t.Fatalf("%d job_started and %d job_exit after Close", n, e)
+	}
+	if f, _ := w.Admit(testJob(2, "sleep")); f != protocol.FaultShuttingDown {
+		t.Fatalf("admitted after Close: %q", f)
+	}
+}
