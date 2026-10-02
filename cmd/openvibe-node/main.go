@@ -486,6 +486,12 @@ func cmdStatus(g *globals, asJSON bool, stdout io.Writer) error {
 		}
 		fmt.Fprintln(stdout)
 	}
+	if len(s.Jobs) > 0 {
+		fmt.Fprintln(stdout, "Jobs:")
+		for _, j := range s.Jobs {
+			fmt.Fprintf(stdout, "  %s %s %s\n", j.ID, j.Function, j.State)
+		}
+	}
 	if b := s.Telemetry.Battery; b != nil {
 		fmt.Fprintf(stdout, "Battery:  %.0f%%\n", *b*100)
 	}

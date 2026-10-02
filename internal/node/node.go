@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -43,11 +42,6 @@ type Options struct {
 	Creds   *credentials.Credentials
 	Log     *slog.Logger
 	Version string
-
-	// RuntimeClasses are the job classes this Node runs and advertises in status.capabilities.worker. New adds
-	// `function` when config.worker is enabled and its isolation probe passes; with none, every job is refused
-	// "class not available".
-	RuntimeClasses []string
 
 	// For tests.
 	HeartbeatInterval time.Duration
@@ -103,7 +97,7 @@ func New(opt Options) (*Node, error) {
 		opt.Log.Error("latch", "err", err)
 	}
 	n := &Node{opt: opt, log: opt.Log, latch: latch, dedup: safety.NewDedup(4096, 10*time.Minute),
-		jobs: newJobs(opt.RuntimeClasses), telemetry: map[string]map[string]any{}, telemMS: 500}
+		jobs: newJobs(nil), telemetry: map[string]map[string]any{}, telemMS: 500}
 	n.limits = safety.Merge(protocol.Limits{}, opt.Config.Limits.MaxSpeed, opt.Config.Limits.MaxTurn, opt.Config.Limits.MaxCommandMS)
 
 	var specs []plugins.Spec
@@ -161,10 +155,9 @@ func New(opt Options) (*Node, error) {
 		} else {
 			n.worker = w
 			w.SetStopped(stopFault(n.latch.State()))
-			n.jobs.admit = w.Admit
-			if !slices.Contains(n.jobs.classes, protocol.ClassFunction) {
-				n.jobs.classes = append(n.jobs.classes, protocol.ClassFunction)
-			}
+			// The only class advertised (status.capabilities.worker), and only with a worker to run it; with none,
+			// every job is refused "class not available".
+			n.jobs.admit, n.jobs.classes = w.Admit, []string{protocol.ClassFunction}
 			opt.Log.Info("worker on", "functions", len(opt.Config.Worker.Functions))
 		}
 	}
@@ -733,6 +726,8 @@ type Status struct {
 	ConfigDir string             `json:"config_dir"`
 	StateDir  string             `json:"state_dir"`
 	Telemetry protocol.Telemetry `json:"telemetry"`
+	// Jobs are the worker's jobs not ended yet; empty when the worker is off.
+	Jobs []worker.JobInfo `json:"jobs"`
 }
 
 type LinkStatus struct {
@@ -781,6 +776,10 @@ func (n *Node) Status() Status {
 			ps.Driver, ps.Version, ps.Capabilities = i.Describe.Driver, i.Describe.Version, i.Describe.Capabilities
 		}
 		s.Plugins = append(s.Plugins, ps)
+	}
+	s.Jobs = []worker.JobInfo{}
+	if n.worker != nil {
+		s.Jobs = n.worker.Jobs()
 	}
 	s.Video.State = video.StateOff
 	if n.pub != nil {

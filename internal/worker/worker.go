@@ -9,6 +9,7 @@ package worker
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -57,6 +58,7 @@ type job struct {
 
 	reason    string      // why it was killed (the first reason wins); "" while nothing killed it
 	launched  bool        // Launch was called
+	started   bool        // job_started was sent (its CPU limit is set)
 	proc      *os.Process // set while the process runs
 	startedMS int64
 	exit      *protocol.JobExit // set once it ended
@@ -197,13 +199,43 @@ func (w *Worker) SetStopped(fault string) {
 	}
 }
 
+// JobInfo is a job that has not ended, as `openvibe-node status` lists it.
+type JobInfo struct {
+	ID        string `json:"id"`
+	Function  string `json:"function"` // name@version
+	State     string `json:"state"`    // admitted (not started yet), running, or stopping (killed, not ended yet)
+	StartedMS int64  `json:"started_ms,omitempty"`
+}
+
+// Jobs lists the jobs admitted or running, by id; ended jobs are not listed. Never nil.
+func (w *Worker) Jobs() []JobInfo {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := []JobInfo{}
+	for _, jb := range w.jobs {
+		if jb.exit != nil {
+			continue
+		}
+		i := JobInfo{ID: jb.req.ID, Function: jb.fn.Name + "@" + jb.fn.Version, State: "admitted"}
+		if jb.started {
+			i.State, i.StartedMS = "running", jb.startedMS
+		}
+		if jb.reason != "" {
+			i.State = "stopping"
+		}
+		out = append(out, i)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
+	return out
+}
+
 // Resend sends again, after a reconnect, job_started for every running job and job_exit for every ended job whose
 // job_exit is not acked yet.
 func (w *Worker) Resend() {
 	w.mu.Lock()
 	var msgs []protocol.Message
 	for _, jb := range w.jobs {
-		if jb.exit == nil && jb.proc != nil {
+		if jb.exit == nil && jb.started && jb.proc != nil {
 			msgs = append(msgs, protocol.JobStarted{ID: jb.req.ID, StartedMS: jb.startedMS})
 		}
 	}
@@ -216,14 +248,24 @@ func (w *Worker) Resend() {
 	}
 }
 
-// Close kills every job (job_exit says stopped), refuses new ones and waits up to 5 s for them to end.
+// Close kills every job (job_exit says stopped), refuses new ones and waits up to 5 s for them to end. A job admitted
+// but not launched yet never will be: its job_exit (stopped) is sent here.
 func (w *Worker) Close() {
 	w.mu.Lock()
 	w.closed = true
+	var never []protocol.JobExit
 	for _, jb := range w.jobs {
 		w.killLocked(jb, protocol.ExitStopped)
+		if jb.exit == nil && !jb.launched {
+			ex := notRun(jb.req.ID, protocol.ExitStopped)
+			w.endLocked(jb, ex)
+			never = append(never, ex)
+		}
 	}
 	w.mu.Unlock()
+	for _, ex := range never {
+		w.send(ex)
+	}
 	done := make(chan struct{})
 	go func() { w.wg.Wait(); close(done) }()
 	select {
@@ -256,15 +298,25 @@ func (w *Worker) run(jb *job) {
 	defer w.wg.Done()
 	ex := w.execute(jb)
 	w.mu.Lock()
+	w.endLocked(jb, ex)
+	w.mu.Unlock()
+	w.log.Info("job ended", "id", ex.ID, "reason", ex.Reason, "wall_ms", ex.Usage.WallMS)
+	w.send(ex)
+}
+
+// endLocked records jb's job_exit, kept until job_exit_ack; past endedMax the oldest ended jobs are forgotten.
+func (w *Worker) endLocked(jb *job, ex protocol.JobExit) {
 	jb.exit = &ex
 	w.ended = append(w.ended, ex.ID)
 	for len(w.ended) > endedMax {
 		delete(w.jobs, w.ended[0])
 		w.ended = w.ended[1:]
 	}
-	w.mu.Unlock()
-	w.log.Info("job ended", "id", ex.ID, "reason", ex.Reason, "wall_ms", ex.Usage.WallMS)
-	w.send(ex)
+}
+
+// notRun is the job_exit of a job whose process never ran: no code, no result, no usage.
+func notRun(id, reason string) protocol.JobExit {
+	return protocol.JobExit{ID: id, Reason: reason, Result: json.RawMessage("null")}
 }
 
 // execute runs jb's process to its end and returns its job_exit.
@@ -274,7 +326,7 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 		if err != nil {
 			w.log.Error("job not run", "id", id, "err", err)
 		}
-		return protocol.JobExit{ID: id, Reason: reason, Result: json.RawMessage("null")}
+		return notRun(id, reason)
 	}
 	w.mu.Lock()
 	reason := jb.reason
@@ -334,11 +386,19 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 		return never(protocol.ExitFailed, err)
 	}
 	pid := cmd.Process.Pid
-	w.send(protocol.JobStarted{ID: id, StartedMS: jb.startedMS})
+	// job_started only once RLIMIT_CPU is set; a job whose limit cannot be set is killed and ends failed without it.
 	if err := limitCPU(pid, jb.limits.CPUMS); err != nil {
-		w.log.Error("job killed: its CPU limit could not be set", "id", id, "err", err)
-		w.kill(jb, protocol.ExitFailed)
+		w.mu.Lock()
+		killGroup(cmd.Process)
+		jb.proc = nil
+		w.mu.Unlock()
+		_ = cmd.Wait()
+		return never(protocol.ExitFailed, fmt.Errorf("its CPU limit could not be set: %w", err))
 	}
+	w.mu.Lock()
+	jb.started = true
+	w.mu.Unlock()
+	w.send(protocol.JobStarted{ID: id, StartedMS: jb.startedMS})
 
 	stop, watched := make(chan struct{}), make(chan accounting, 1)
 	go func() { watched <- w.watch(jb, pid, start, stop) }()
@@ -431,41 +491,47 @@ func (w *Worker) watch(jb *job, pid int, start time.Time, stop <-chan struct{}) 
 	}
 }
 
-// pump sends the job's stdout as job_stdout chunks of at most chunkBytes, never splitting a UTF-8 sequence, and
-// kills the job (limit) once it wrote more than max_output_bytes; the excess is read and dropped.
+// pump sends the job's stdout as job_stdout chunks, never splitting a UTF-8 sequence, and kills the job (limit) once
+// it wrote more than max_output_bytes; the excess is read and dropped. Invalid bytes become U+FFFD first, and both
+// bounds count the bytes sent: each chunk is at most chunkBytes and all of them together at most max_output_bytes.
 func (w *Worker) pump(jb *job, r io.Reader) {
-	buf := make([]byte, chunkBytes-utf8.UTFMax) // room for a rune carried over from the last read
+	buf := make([]byte, chunkBytes)
 	var carry []byte
-	var total int64
+	left := w.caps.MaxOutputBytes
 	var seq uint64
 	over := false
+	// emit sends b's complete runes, as valid UTF-8, in chunks within both bounds; it sets over at the output cap.
 	emit := func(b []byte) {
-		seq++
-		w.send(protocol.JobStdout{ID: jb.req.ID, ChunkSeq: seq, Chunk: strings.ToValidUTF8(string(b), "�")})
+		s := strings.ToValidUTF8(string(b), "�")
+		for len(s) > 0 && !over {
+			n := min(len(s), chunkBytes)
+			if int64(n) > left {
+				n, over = int(left), true
+			}
+			for n < len(s) && n > 0 && !utf8.RuneStart(s[n]) {
+				n--
+			}
+			if n > 0 {
+				seq++
+				w.send(protocol.JobStdout{ID: jb.req.ID, ChunkSeq: seq, Chunk: s[:n]})
+				left -= int64(n)
+			}
+			s = s[n:]
+		}
+		if over {
+			w.kill(jb, protocol.ExitLimit)
+		}
 	}
 	for {
 		n, err := r.Read(buf)
 		if n > 0 && !over {
-			b := buf[:n]
-			if left := w.caps.MaxOutputBytes - total; int64(n) > left {
-				b, over = b[:left], true
-			}
-			total += int64(len(b))
-			b = append(carry, b...)
+			b := append(carry, buf[:n]...)
 			cut := completeRunes(b)
-			if over {
-				cut = len(b)
-			}
-			if cut > 0 {
-				emit(b[:cut])
-			}
+			emit(b[:cut])
 			carry = append([]byte(nil), b[cut:]...)
-			if over {
-				w.kill(jb, protocol.ExitLimit)
-			}
 		}
 		if err != nil {
-			if len(carry) > 0 {
+			if len(carry) > 0 && !over {
 				emit(carry)
 			}
 			return

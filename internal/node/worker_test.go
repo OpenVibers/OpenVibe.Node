@@ -18,11 +18,14 @@ import (
 	"github.com/OpenVibers/OpenVibe.Node/internal/config"
 	"github.com/OpenVibers/OpenVibe.Node/internal/fakebot"
 	"github.com/OpenVibers/OpenVibe.Node/internal/link"
+	"github.com/OpenVibers/OpenVibe.Node/internal/localctl"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
+	"github.com/OpenVibers/OpenVibe.Node/internal/worker"
 )
 
 // TestWorkerHelperProcess is the job's process when this test binary runs as the `hello` function (`-- job`): it
-// appends a line to the marker file named in its args, prints, holds for 1.5 s and writes its result to fd 3.
+// appends a line to the marker file named in its args, prints, holds for hold_ms (1.5 s by default) and writes its
+// result to fd 3.
 func TestWorkerHelperProcess(t *testing.T) {
 	i := slices.Index(os.Args, "--")
 	if i < 0 || i+1 >= len(os.Args) || os.Args[i+1] != "job" {
@@ -30,14 +33,18 @@ func TestWorkerHelperProcess(t *testing.T) {
 	}
 	var args struct {
 		Marker string `json:"marker"`
+		HoldMS int64  `json:"hold_ms"`
 	}
 	_ = json.NewDecoder(os.Stdin).Decode(&args)
+	if args.HoldMS == 0 {
+		args.HoldMS = 1500
+	}
 	if f, err := os.OpenFile(args.Marker, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
 		fmt.Fprintln(f, "started")
 		f.Close()
 	}
 	fmt.Println("hello from the job")
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(time.Duration(args.HoldMS) * time.Millisecond)
 	fmt.Fprint(os.NewFile(3, "result"), `{"ok":true}`)
 	os.Exit(0)
 }
@@ -191,5 +198,91 @@ func TestJobRunsOverTheLink(t *testing.T) {
 	b, err := os.ReadFile(marker)
 	if err != nil || string(b) != "started\n" {
 		t.Fatalf("the function ran %q (%v), want once", b, err)
+	}
+}
+
+// statusJobs is the jobs field of `openvibe-node status` (over the local control socket).
+func (e *env) statusJobs() []worker.JobInfo {
+	e.t.Helper()
+	r, err := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdStatus}, 2*time.Second)
+	if err != nil || !r.OK {
+		e.t.Fatalf("status: %+v %v", r, err)
+	}
+	var s struct {
+		Jobs []worker.JobInfo `json:"jobs"`
+	}
+	if err := json.Unmarshal(r.Data, &s); err != nil || s.Jobs == nil {
+		e.t.Fatalf("status %s: %v", r.Data, err)
+	}
+	return s.Jobs
+}
+
+// TestLocalStopEndsJobs: `openvibe-node status` lists a running job; `openvibe-node stop` ends it stopped and new jobs
+// are refused with local_stop; after `resume` jobs run again, and status lists none once they ended.
+func TestLocalStopEndsJobs(t *testing.T) {
+	e := startWorkerNode(t)
+	marker := filepath.Join(e.paths.StateDir, "starts")
+	hello := func(n, holdMS int) protocol.Job {
+		j := testJob(jobID(n))
+		j.Artifact = &protocol.Artifact{Name: "hello", Version: "1.0.0"}
+		j.Args = json.RawMessage(fmt.Sprintf(`{"marker":%q,"hold_ms":%d}`, marker, holdMS))
+		j.Limits.MemBytes = 4 << 30
+		return j
+	}
+	exitOf := func(id string) protocol.JobExit {
+		t.Helper()
+		f, err := e.conn.Expect(protocol.TypeJobExit, 15*time.Second, func(m protocol.Message) bool {
+			return m.(protocol.JobExit).ID == id
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.Msg.(protocol.JobExit)
+	}
+	started := func(id string) {
+		t.Helper()
+		if _, err := e.conn.Expect(protocol.TypeJobStarted, 10*time.Second, func(m protocol.Message) bool {
+			return m.(protocol.JobStarted).ID == id
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if jobs := e.statusJobs(); len(jobs) != 0 {
+		t.Fatalf("jobs before any: %+v", jobs)
+	}
+	a := hello(1, 60000)
+	if r := e.jobReply(a); r != (protocol.Ack{ID: a.ID}) {
+		t.Fatalf("%+v", r)
+	}
+	started(a.ID)
+	jobs := e.statusJobs()
+	if len(jobs) != 1 || jobs[0].ID != a.ID || jobs[0].Function != "hello@1.0.0" || jobs[0].State != "running" || jobs[0].StartedMS == 0 {
+		t.Fatalf("status jobs while running: %+v", jobs)
+	}
+
+	e.ctl(localctl.CmdStop)
+	if ex := exitOf(a.ID); ex.Reason != protocol.ExitStopped || ex.Code != nil {
+		t.Fatalf("%+v", ex)
+	}
+	if nk := e.jobNack(hello(2, 0), protocol.JobStopped); nk.FaultCode != protocol.FaultLocalStop {
+		t.Fatalf("while stopped: %+v", nk)
+	}
+	if jobs := e.statusJobs(); len(jobs) != 0 {
+		t.Fatalf("status jobs after the stop: %+v", jobs)
+	}
+
+	e.ctl(localctl.CmdResume)
+	e.expectEstopState(false, false)
+	b := hello(3, 0)
+	if r := e.jobReply(b); r != (protocol.Ack{ID: b.ID}) {
+		t.Fatalf("after resume: %+v", r)
+	}
+	started(b.ID)
+	if ex := exitOf(b.ID); ex.Reason != protocol.ExitExited {
+		t.Fatalf("%+v", ex)
+	}
+	if jobs := e.statusJobs(); len(jobs) != 0 {
+		t.Fatalf("status jobs after the end: %+v", jobs)
 	}
 }

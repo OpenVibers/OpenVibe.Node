@@ -61,7 +61,7 @@ need Python; set `"python"` in `config.json`.
 | `openvibe-node run [--dry-run]`           | run in the foreground (what the service runs)                              |
 | `openvibe-node install [--user NAME]`     | install and start the service                                              |
 | `openvibe-node uninstall`                 | stop and remove the service (config and credential are kept)               |
-| `openvibe-node status [--json]`           | link, stop latch, limits, plugins, video, battery                          |
+| `openvibe-node status [--json]`           | link, stop latch, limits, plugins, video, battery, running jobs            |
 | `openvibe-node stop`                      | **kill switch**: stop every actuator now and hold it stopped              |
 | `openvibe-node resume`                    | release the local stop (and a server e-stop)                               |
 | `openvibe-node plugins [--json]`          | plugins and their capabilities                                             |
