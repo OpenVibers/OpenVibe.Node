@@ -230,10 +230,19 @@ func TestPairConnectAndStatus(t *testing.T) {
 			if f.Msg.(protocol.EstopState).Latched {
 				t.Fatal("latched on a fresh device")
 			}
+			if r := f.Msg.(protocol.EstopState).RobotID; r != fakebot.RobotID {
+				t.Fatalf("estop_state robot_id %q on a one-robot device", r)
+			}
 		}
 	}
 	if !sawEstopState {
 		t.Fatal("no estop_state after connect")
+	}
+	// A device serving several robots cannot name one: robot_id is left out.
+	e.conn.Send(protocol.Hello{SessionID: "sess_2", DeviceID: "dev_1", RobotIDs: []string{fakebot.RobotID, "rob_other"}})
+	e.conn.Send(protocol.Estop{Latched: false, By: "usr_owner"})
+	if _, err := e.conn.Expect(protocol.TypeEstopState, 2*time.Second, func(m protocol.Message) bool { return m.(protocol.EstopState).RobotID == "" }); err != nil {
+		t.Fatal(err)
 	}
 	if e.srv.CredentialSeenInURL() {
 		t.Fatal("credential in URL")

@@ -477,6 +477,15 @@ func TestNothingSentBeforeHello(t *testing.T) {
 	if err := l.Send(protocol.Heartbeat{}); !errors.Is(err, ErrOffline) {
 		t.Fatalf("send before hello: %v", err)
 	}
+	// The deadman (40 ms) waits for hello: until HelloAllowance a server still checking the credential keeps the
+	// connection, and no heartbeat goes out.
+	time.Sleep(500 * time.Millisecond)
+	if n := srv.Dials(); n != 1 {
+		t.Fatalf("dialed %d times while waiting for hello", n)
+	}
+	if len(c.Frames()) != 0 {
+		t.Fatalf("sent %d frames before hello", len(c.Frames()))
+	}
 }
 
 func TestDeviceURL(t *testing.T) {
