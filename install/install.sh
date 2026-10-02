@@ -84,11 +84,10 @@ SUDO=""
 # (marked, never deleted) so they cannot start it again.
 STOCK_SERVER_RE='Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py'
 STOCK_SERVER_MARKER='#openvibe-node-disabled:'
-# Root's crontab is always scanned. The invoking user's crontab is scanned when the installer was started through
-# sudo. Run from a plain root shell (sudo -i, root login) SUDO_USER is unset, so fall back to the kit's usual owner
-# account pi when it exists. No other user is touched.
-CRON_USER="${SUDO_USER:-}"
-if [ -z "$CRON_USER" ] && id pi >/dev/null 2>&1; then CRON_USER=pi; fi
+# Root's crontab is always scanned. Scan the invoking user's crontab on the normal install path or through sudo.
+# From a plain root shell (sudo -i, root login), use the kit's usual owner pi when that account exists.
+CRON_USER="${SUDO_USER:-$(id -un 2>/dev/null || printf '%s' root)}"
+if [ "$CRON_USER" = root ] && id pi >/dev/null 2>&1; then CRON_USER=pi; fi
 
 # Comment out the stock-server lines in one crontab-like file: read $1, write $2, print one line per disabled
 # entry. A line whose first non-blank character is "#" is left alone, so our marker makes a second run a no-op.

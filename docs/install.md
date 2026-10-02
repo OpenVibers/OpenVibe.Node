@@ -118,10 +118,11 @@ Raspberry Pi OS Bookworm (64-bit recommended). Enable I²C and SPI: `sudo raspi-
 
 The kit's own software (`Adeept_Robot.service`, `WebServer.py` on `0.0.0.0:8888` with the fixed login
 `admin:123456`, MJPEG on `:5000`) must not run: anyone on the network could drive the car. The installer disables it,
-including the crontab (root's and `pi`'s) and `/etc/rc.local` autostart lines from the kit's own installer: it
-comments them out with the marker `#openvibe-node-disabled:` and keeps the original text, so running the installer
-again changes nothing. Check with `systemctl status Adeept_Robot.service`, `crontab -l` (and `sudo crontab -l -u pi`)
-and `grep openvibe-node-disabled /etc/rc.local`. The Node replaces it.
+including autostart lines in root's and the invoking user's crontabs and `/etc/rc.local`. From a root shell, it checks
+`pi`'s crontab when that account exists. It comments out the kit's lines with the marker
+`#openvibe-node-disabled:` and keeps the original text, so running the installer again changes nothing. Check with
+`systemctl status Adeept_Robot.service`, `crontab -l` (and `sudo crontab -l -u pi` for a root-shell install) and
+`grep openvibe-node-disabled /etc/rc.local`. The Node replaces it.
 
 If a direction is wrong on your car, fix it in `config.json` → `plugins[0].config`: `motors.<wheel>.direction`,
 `pan.invert`, `tilt.invert`, `line.invert`. See [the plugin README](../plugins/adeept_adr036/README.md).
