@@ -122,7 +122,7 @@ printf '%s\n' '@reboot python3 /home/pi/adeept_awr/Server/Server_OrdinaryWheels/
 out4="$(
 	unset SUDO_USER
 	PATH="$mock_bin:$PATH" MOCK_USER_CRON="$fallback_cron" OPENVIBE_INSTALL_STOCK_ONLY=1 \
-		OPENVIBE_CRONTAB_ROOT="$root_cron" OPENVIBE_CRONTAB_USER= OPENVIBE_RC_LOCAL="$rc_local" sh "$installer"
+		OPENVIBE_CRONTAB_ROOT="$root_cron" OPENVIBE_CRONTAB_USER='' OPENVIBE_RC_LOCAL="$rc_local" sh "$installer"
 )"
 printf '%s\n' "$out4" | grep -q 'stock server autostart in the crontab of invoking_user' ||
 	fail "logged-in user's crontab was not scanned without SUDO_USER"
