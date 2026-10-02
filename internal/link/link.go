@@ -1,10 +1,16 @@
 // Package link keeps the Node's one outbound control connection to OpenVibe.Bot: a WebSocket to wss://<origin>/device
 // authenticated with the device credential in the Authorization header of the upgrade (never in the URL). It sends a
-// heartbeat every interval once the server has spoken, measures the round trip from the server's heartbeat_ack and
-// reports it on the next heartbeat, declares the link lost when nothing has arrived for the deadman interval (two
-// heartbeats by default), and reconnects with exponential backoff and full jitter. A refused or revoked credential
-// (close 4002/4003) waits at least CredentialBackoff (10 s) before the next try. Nothing is queued while offline: Send
-// fails and the caller decides.
+// heartbeat every interval, declares the link lost when nothing has arrived for the deadman interval (two heartbeats
+// by default), and reconnects with exponential backoff and full jitter. Nothing is queued while offline: Send fails
+// and the caller decides. The connection counts as up only once the server's hello arrives: OpenVibe.Bot
+// authenticates after the upgrade and answers anything sent earlier with error bot.not_paired.
+//
+// Close codes: 4000 (another connection with this credential replaced this one) reconnects with the normal backoff;
+// 4002 (credential refused) and 4003 (revoked) keep retrying, never sooner than CredentialRetryMin, and log what to
+// do: pair again, or import the owner's rotation. Bot's error frames are logged, never fatal.
+//
+// Every server frame's ts also feeds an estimate of the server's clock (ServerNow), which the Node uses to read the
+// absolute deadline_ms of a command.
 package link
 
 import (
@@ -31,10 +37,10 @@ var ErrOffline = errors.New("link offline")
 
 // Handler receives link events. Calls are made from the link's goroutines, one at a time per connection.
 type Handler interface {
-	// Connected runs after the upgrade, before any frame is read. The server may still be checking the credential, so
-	// the handler sends nothing here: status and estop_state wait for hello and config.
+	// Connected runs when the server's hello arrives, before the hello itself reaches Frame. Bot sends config right
+	// after hello; the Node holds its first status and estop_state (and every motion command) until that config.
 	Connected()
-	// Frame is every decoded server frame except heartbeat_ack.
+	// Frame is every decoded server frame except heartbeat_ack and error.
 	Frame(f protocol.Frame)
 	// Disconnected runs when a connection ends for any reason. The handler must stop every actuator.
 	Disconnected(err error)
@@ -52,12 +58,18 @@ type Options struct {
 	Deadman           time.Duration // default 2 × heartbeat
 	BackoffMin        time.Duration // default 500 ms
 	BackoffMax        time.Duration // default 30 s
-	CredentialBackoff time.Duration // default 10 s: the least wait after a refused credential; jitter goes on top
 }
 
-// helloTimeout is how long a new connection waits for the server's first frame (hello) before giving up; the deadman
-// applies once the server has spoken.
-const helloTimeout = 10 * time.Second
+// CredentialRetryMin is the least a refused or revoked credential (close 4002 / 4003, HTTP 401 / 403) waits before
+// the next try; jitter only ever adds to it.
+const CredentialRetryMin = 10 * time.Second
+
+// hbSend is one heartbeat the link sent: its monotonic send time and the t it carried, so an ack can be matched
+// back either by the echoed t (Bot) or by the body seq (older servers).
+type hbSend struct {
+	at time.Time
+	t  int64
+}
 
 // Link is the reconnecting control connection.
 type Link struct {
@@ -68,9 +80,15 @@ type Link struct {
 	mu        sync.Mutex
 	out       chan []byte
 	seq       uint64
+	hbSent    map[uint64]hbSend // heartbeat seq → send time/t, bounded to the last few
 	heartbeat time.Duration
 	deadman   time.Duration
-	hbSent    map[uint64]time.Time // heartbeat seq → when it was sent, until its ack arrives
+
+	// The server clock estimate of this connection (see ServerNow): skew is the largest ts − local receive time (ms)
+	// seen since clockBase, the local time of its first frame; hasSkew is false until a frame arrives.
+	skew      int64
+	hasSkew   bool
+	clockBase time.Time
 
 	connected   atomic.Bool
 	lastRTT     atomic.Int64
@@ -92,9 +110,6 @@ func New(opt Options, h Handler) *Link {
 	if opt.BackoffMax <= 0 {
 		opt.BackoffMax = 30 * time.Second
 	}
-	if opt.CredentialBackoff <= 0 {
-		opt.CredentialBackoff = 10 * time.Second
-	}
 	if opt.Log == nil {
 		opt.Log = slog.Default()
 	}
@@ -106,8 +121,8 @@ func New(opt Options, h Handler) *Link {
 	return l
 }
 
-// SetTiming applies the server's heartbeat_ms (from config) to the current and later connections; the deadman is two
-// heartbeats.
+// SetTiming applies the server's config.heartbeat_ms to the current and later connections; the link is declared
+// lost after two intervals without a frame.
 func (l *Link) SetTiming(heartbeatMS int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -121,6 +136,40 @@ func (l *Link) timing() (time.Duration, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.heartbeat, l.deadman
+}
+
+// observe records one server frame's ts, read at local time at.
+func (l *Link) observe(ts int64, at time.Time) {
+	if ts <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.hasSkew {
+		l.clockBase, l.skew, l.hasSkew = at, ts-at.UnixMilli(), true
+		return
+	}
+	l.skew = max(l.skew, ts-l.localMS(at))
+}
+
+// localMS is local time at in epoch ms, measured from clockBase on the monotonic clock so a step of the wall clock
+// cannot move the estimate.
+func (l *Link) localMS(at time.Time) int64 {
+	return l.clockBase.UnixMilli() + at.Sub(l.clockBase).Milliseconds()
+}
+
+// ServerNow estimates the server's clock (epoch ms) at local time at, from the frames of the current connection. The
+// offset is the largest ts − receive time seen on the connection: the clock skew less the fastest transit, so a frame
+// that sat in a queue on the way reads as late by however long it sat there. The best sample is kept for the whole
+// connection: a run of delayed frames can never make an expired deadline look open again. A server clock that steps
+// back only makes deadlines read as expired (fail closed) until the next connection. ok is false before any frame.
+func (l *Link) ServerNow(at time.Time) (ms int64, ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.hasSkew {
+		return 0, false
+	}
+	return l.localMS(at) + l.skew, true
 }
 
 // Connected reports whether a connection is up.
@@ -148,71 +197,42 @@ func (l *Link) Stats() Stats {
 func (l *Link) Send(m protocol.Message) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, err := l.sendLocked(m)
-	return err
-}
-
-func (l *Link) sendLocked(m protocol.Message) (uint64, error) {
 	if l.out == nil {
-		return 0, ErrOffline
+		return ErrOffline
 	}
 	l.seq++
-	b, err := protocol.Encode(l.seq, time.Now().UnixMilli(), m)
+	now := time.Now()
+	if hb, ok := m.(protocol.Heartbeat); ok {
+		// The body seq still mirrors the envelope's (older servers echo it); t is the send time Bot echoes back as
+		// heartbeat_ack.t/echo, and rtt_ms is the last measured round trip, once there is one on this connection.
+		hb.Seq = l.seq
+		hb.T = now.UnixMilli()
+		if rtt := l.lastRTT.Load(); rtt > 0 {
+			ms := time.Duration(rtt).Milliseconds()
+			hb.RTTMS = &ms
+		}
+		m = hb
+		for s := range l.hbSent {
+			if s+8 < l.seq {
+				delete(l.hbSent, s)
+			}
+		}
+		l.hbSent[l.seq] = hbSend{at: now, t: hb.T}
+	}
+	b, err := protocol.Encode(l.seq, now.UnixMilli(), m)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	select {
 	case l.out <- b:
-		return l.seq, nil
+		return nil
 	default:
-		return 0, errors.New("link send queue full")
+		return errors.New("link send queue full")
 	}
 }
 
-// sendHeartbeat sends a heartbeat carrying the last measured round trip and remembers when it left.
-func (l *Link) sendHeartbeat(now time.Time) {
-	var hb protocol.Heartbeat
-	if rtt := l.lastRTT.Load(); rtt > 0 {
-		ms := time.Duration(rtt).Milliseconds()
-		hb.RTTMS = &ms
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	seq, err := l.sendLocked(hb)
-	if err != nil {
-		return
-	}
-	if len(l.hbSent) >= 32 { // acks that never came
-		l.hbSent = map[uint64]time.Time{}
-	}
-	l.hbSent[seq] = now
-}
-
-// heartbeatAck measures the round trip of the heartbeat the ack answers: the echo field when the server sends one,
-// else the envelope seq, which Bot overwrites with the heartbeat's seq.
-func (l *Link) heartbeatAck(f protocol.Frame, ack protocol.HeartbeatAck) {
-	seq := f.Seq
-	if ack.Echo != nil {
-		seq = *ack.Echo
-	}
-	l.mu.Lock()
-	sent, ok := l.hbSent[seq]
-	for s := range l.hbSent {
-		if s <= seq {
-			delete(l.hbSent, s)
-		}
-	}
-	l.mu.Unlock()
-	if ok {
-		rtt := time.Since(sent)
-		if rtt < time.Millisecond {
-			rtt = time.Millisecond
-		}
-		l.lastRTT.Store(int64(rtt))
-	}
-}
-
-// Run connects and reconnects until ctx ends.
+// Run connects and reconnects until ctx ends. A refused or revoked credential does not end it: the owner may pair
+// the device again, and the Node retries every CredentialRetryMin or more, saying so in the log.
 func (l *Link) Run(ctx context.Context) {
 	attempt := 0
 	for ctx.Err() == nil {
@@ -229,9 +249,8 @@ func (l *Link) Run(ctx context.Context) {
 		wait := l.backoff(err, attempt)
 		attempt++
 		l.reconnects.Add(1)
-		if IsCredentialError(err) {
-			l.log.Error("the server refused the device credential: re-pair or update the credential", "err", msg,
-				"retry_in", wait.Round(time.Millisecond))
+		if credentialRefused(err) {
+			l.log.Error("link down: the server refused the device credential", "err", msg, "retry_in", wait.Round(time.Millisecond))
 		} else {
 			l.log.Warn("link down; reconnecting", "err", msg, "in", wait.Round(time.Millisecond))
 		}
@@ -243,54 +262,48 @@ func (l *Link) Run(ctx context.Context) {
 	}
 }
 
-// backoff is the wait before reconnect attempt n: full jitter over an exponential window, with a floor so a flapping
-// server is not hammered. A refused credential waits at least CredentialBackoff, the jitter on top.
+// backoff is the wait before reconnect attempt number attempt (0 first) after err: exponential with full jitter and
+// a floor so a flapping server is not hammered. A refused or revoked credential waits CredentialRetryMin plus the
+// jitter, never less.
 func (l *Link) backoff(err error, attempt int) time.Duration {
-	window := l.opt.BackoffMin
-	if attempt < 30 {
-		window = l.opt.BackoffMin << attempt
+	ceil := l.opt.BackoffMax
+	if attempt < 32 {
+		if c := l.opt.BackoffMin << attempt; c > 0 && c < ceil {
+			ceil = c
+		}
 	}
-	if window > l.opt.BackoffMax || window <= 0 {
-		window = l.opt.BackoffMax
-	}
-	jitter := time.Duration(rand.Int63n(int64(window)))
-	if IsCredentialError(err) {
-		return l.opt.CredentialBackoff + jitter
+	jitter := time.Duration(rand.Int63n(int64(ceil) + 1))
+	if credentialRefused(err) {
+		return CredentialRetryMin + jitter
 	}
 	return l.opt.BackoffMin/2 + jitter
 }
 
-// CredentialError is a refused credential: close 4002 (unknown, or a rotated one past its grace), close 4003
-// (revoked), or HTTP 401/403 on the upgrade.
-type CredentialError struct {
-	Code   int // close code or HTTP status
-	Reason string
+var (
+	errUnauthorized = errors.New("the server refused the device credential (wrong, rotated or revoked): pair again with `openvibe-node pair <CODE>`, or, if the owner rotated it, pipe the rotate response into `openvibe-node credential import`")
+	errRevoked      = errors.New("the owner revoked this device or rotated its credential: pair again with `openvibe-node pair <CODE>`, or, if the owner rotated it, pipe the rotate response into `openvibe-node credential import`")
+	errReplaced     = errors.New("another connection with this device's credential replaced this one (is a second agent running with the same credential?)")
+)
+
+func credentialRefused(err error) bool {
+	return errors.Is(err, errUnauthorized) || errors.Is(err, errRevoked)
 }
 
-func (e *CredentialError) Error() string {
-	what := "the server refused the device credential"
-	if e.Code == protocol.CloseRevoked {
-		what = "the owner revoked this device"
+// closeErr maps the server's close codes to the errors Run acts on.
+func closeErr(err error) error {
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) {
+		return nil
 	}
-	return fmt.Sprintf("%s (%d %s); re-pair or update the credential: `openvibe-node pair --force <CODE>`, or "+
-		"`openvibe-node credential set` with a rotated one", what, e.Code, e.Reason)
-}
-
-// IsCredentialError reports whether err means the credential must be replaced.
-func IsCredentialError(err error) bool {
-	var ce *CredentialError
-	return errors.As(err, &ce)
-}
-
-// closeError classifies the server's close frame.
-func closeError(ce *websocket.CloseError) error {
 	switch ce.Code {
-	case protocol.CloseBadCredential, protocol.CloseRevoked:
-		return &CredentialError{Code: ce.Code, Reason: ce.Text}
 	case protocol.CloseReplaced:
-		return fmt.Errorf("replaced by a newer connection of this device (close %d)", ce.Code)
+		return errReplaced
+	case protocol.CloseInvalid:
+		return errUnauthorized
+	case protocol.CloseRevoked:
+		return errRevoked
 	}
-	return fmt.Errorf("closed by the server (%d %s)", ce.Code, ce.Text)
+	return nil
 }
 
 func errMsg(err error) string {
@@ -309,7 +322,7 @@ func (l *Link) session(ctx context.Context) error {
 	conn, resp, err := l.opt.Dialer.DialContext(ctx, l.opt.URL, h)
 	if err != nil {
 		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
-			return &CredentialError{Code: resp.StatusCode, Reason: http.StatusText(resp.StatusCode)}
+			return errUnauthorized
 		}
 		if resp != nil {
 			return fmt.Errorf("connect %s: HTTP %d", redactURL(l.opt.URL), resp.StatusCode)
@@ -319,13 +332,13 @@ func (l *Link) session(ctx context.Context) error {
 	defer conn.Close()
 	conn.SetReadLimit(1 << 20)
 
+	// Nothing is sent until the server's hello: until then the socket is not authenticated.
 	out := make(chan []byte, 256)
 	l.mu.Lock()
-	l.out, l.seq, l.hbSent = out, 0, map[uint64]time.Time{}
+	l.out, l.seq, l.hbSent, l.hasSkew = nil, 0, map[uint64]hbSend{}, false
 	l.mu.Unlock()
-	l.connected.Store(true)
-	l.connectedAt.Store(time.Now().UnixMilli())
-	l.log.Info("link up", "url", redactURL(l.opt.URL))
+	// A fresh connection has no measured round trip: the first heartbeat must not claim one.
+	l.lastRTT.Store(0)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	var endErr error
@@ -354,8 +367,6 @@ func (l *Link) session(ctx context.Context) error {
 
 	var lastRx atomic.Int64
 	lastRx.Store(time.Now().UnixNano())
-	// Heartbeats start once the server has spoken (hello): until then it may still be checking the credential.
-	var heard atomic.Bool
 
 	// Writer.
 	go func() {
@@ -388,39 +399,33 @@ func (l *Link) session(ctx context.Context) error {
 				if hbNow != hb {
 					hb, next = hbNow, now
 				}
-				if heard.Load() && !now.Before(next) {
+				if !now.Before(next) {
 					next = now.Add(hb)
-					l.sendHeartbeat(now)
+					_ = l.Send(protocol.Heartbeat{})
 				}
-				limit := deadman
-				if !heard.Load() && limit < helloTimeout {
-					limit = helloTimeout // the server is still checking the credential
-				}
-				if now.Sub(time.Unix(0, lastRx.Load())) > limit {
-					end(fmt.Errorf("heartbeat lost: nothing from the server for %s", limit))
+				if now.Sub(time.Unix(0, lastRx.Load())) > deadman {
+					end(fmt.Errorf("heartbeat lost: nothing from the server for %s", deadman))
 					return
 				}
 			}
 		}
 	}()
 
-	l.handler.Connected()
-
+	up := false
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if sessCtx.Err() == nil {
-				var ce *websocket.CloseError
-				if errors.As(err, &ce) {
-					end(closeError(ce))
+				if ce := closeErr(err); ce != nil {
+					end(ce)
 				} else {
 					end(fmt.Errorf("read: %s", scrub(err.Error(), l.opt.Credential)))
 				}
 			}
 			return endErr
 		}
-		lastRx.Store(time.Now().UnixNano())
-		heard.Store(true)
+		rx := time.Now()
+		lastRx.Store(rx.UnixNano())
 		f, err := protocol.Decode(data)
 		if err != nil {
 			if errors.Is(err, protocol.ErrUnknownType) {
@@ -430,8 +435,63 @@ func (l *Link) session(ctx context.Context) error {
 			}
 			continue
 		}
-		if ack, ok := f.Msg.(protocol.HeartbeatAck); ok {
-			l.heartbeatAck(f, ack)
+		l.observe(f.TS, rx)
+		switch m := f.Msg.(type) {
+		case protocol.HeartbeatAck:
+			// Bot's envelope seq is its own counter, so the ack is matched to a stored send time by the echoed t
+			// (echo, or older Bot's t); a server that only echoes the heartbeat's seq is matched by that. The
+			// stored time is monotonic, so a wall-clock adjustment between send and ack cannot skew the round trip.
+			echo := m.T
+			if echo == 0 && m.Echo != nil {
+				echo = *m.Echo
+			}
+			l.mu.Lock()
+			var sent time.Time
+			if echo > 0 {
+				for s, hb := range l.hbSent {
+					if hb.t == echo {
+						sent = hb.at
+						delete(l.hbSent, s)
+						break
+					}
+				}
+			}
+			if sent.IsZero() && m.Seq != 0 {
+				if hb, ok := l.hbSent[m.Seq]; ok {
+					sent = hb.at
+					delete(l.hbSent, m.Seq)
+				}
+			}
+			l.mu.Unlock()
+			if !sent.IsZero() {
+				// A coarse clock (Windows) can read 0 on a fast loopback; 0 means "not measured yet", so floor at 1 ns.
+				l.lastRTT.Store(int64(max(time.Since(sent), 1)))
+			}
+			continue
+		case protocol.Error:
+			switch m.Code {
+			case protocol.ErrNotPaired:
+				l.log.Warn("server: this connection is not authenticated yet", "code", m.Code, "detail", m.Detail)
+			case protocol.ErrNotReady:
+				l.log.Warn("server: too many frames before authentication finished", "code", m.Code, "detail", m.Detail)
+			default:
+				l.log.Warn("server refused a frame", "code", m.Code, "detail", m.Detail)
+			}
+			continue
+		case protocol.Hello:
+			if !up {
+				up = true
+				l.mu.Lock()
+				l.out = out
+				l.mu.Unlock()
+				l.connected.Store(true)
+				l.connectedAt.Store(time.Now().UnixMilli())
+				l.log.Info("link up", "url", redactURL(l.opt.URL), "device", m.DeviceID, "session", m.SessionID)
+				l.handler.Connected()
+			}
+		}
+		if !up {
+			l.log.Warn("ignoring a frame before hello", "type", f.Type)
 			continue
 		}
 		l.handler.Frame(f)

@@ -1,14 +1,19 @@
 #!/bin/sh
 # OpenVibe Node installer.
 #
-#   curl -fsSL https://openvibe.bot/install | sh -s -- <CODE> [--robot adeept|adeept-mecanum|cozmo|none]
+#   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|none]
 #
 # Detects the OS and CPU, downloads the openvibe-node binary and the plugin bundle (checking their SHA-256), creates
 # a Python virtual environment for the plugins, disables the Adeept kit's stock control server if it finds it,
 # installs the system service and pairs the device with <CODE>. Run it again to upgrade; the credential is kept.
+# openvibe.bot shows the first line with the robot id and a fresh code filled in.
 #
 # Options:
-#   --robot KIND     adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), none (dry run). Default: none.
+#   --robot ROBOT    the rob_… id of the robot to pair with (from openvibe.bot). A driver kind here (adeept, …) is the
+#                    old meaning of --robot: still accepted, but deprecated; use --driver.
+#   --code CODE      the one-time pairing code (or give it as the first argument).
+#   --name NAME      the device's name on openvibe.bot (default: the hostname).
+#   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), none (dry run). Default: none.
 #   --no-service     install and pair, but do not install the service.
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
 #                    downloading.
@@ -16,26 +21,48 @@
 # Environment:
 #   OPENVIBE_NODE_BASE   download base URL (default: GitHub releases of OpenVibers/OpenVibe.Node).
 #   OPENVIBE_SERVER      OpenVibe.Bot origin (default https://openvibe.bot).
+#
+# The Adeept stock-server check can be pointed at plain files for testing (no root, no crontab command):
+#   OPENVIBE_INSTALL_STOCK_ONLY=1   run only that check and exit.
+#   OPENVIBE_CRONTAB_ROOT=FILE      edit FILE as root's crontab instead of the real one.
+#   OPENVIBE_CRONTAB_USER=FILE      edit FILE as the invoking user's crontab instead of the real one.
+#   OPENVIBE_RC_LOCAL=FILE          edit FILE as rc.local instead of /etc/rc.local.
 set -eu
 
 REPO_URL="https://github.com/OpenVibers/OpenVibe.Node"
 CODE=""
-ROBOT="none"
+DRIVER="none"
+ROBOT_ID=""
+NAME=""
 SERVICE=1
 LOCAL=""
 TAG="latest"
 
 usage() {
-	echo "usage: install.sh [CODE] [--robot adeept|adeept-mecanum|cozmo|none] [--no-service] [--local DIR] [--version TAG]"
-	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- <CODE> --robot adeept"
+	echo "usage: install.sh [--robot rob_…] [--code CODE | CODE] [--name NAME] [--driver adeept|adeept-mecanum|cozmo|none]"
+	echo "                  [--no-service] [--local DIR] [--version TAG]"
+	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
 }
 say() { printf '%s\n' "openvibe-node: $*"; }
 die() { printf '%s\n' "openvibe-node: error: $*" >&2; exit 1; }
+# --robot is the rob_… pairing target; it used to name the driver kind, which still works but is deprecated.
+robot_arg() {
+	case "$1" in
+	rob_*) ROBOT_ID="$1" ;;
+	*) say "warning: --robot $1 is deprecated; use --driver $1 (--robot now takes the rob_… id from openvibe.bot)"; DRIVER="$1" ;;
+	esac
+}
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--robot) ROBOT="${2:-}"; shift 2 ;;
-	--robot=*) ROBOT="${1#*=}"; shift ;;
+	--robot) robot_arg "${2:-}"; shift 2 ;;
+	--robot=*) robot_arg "${1#*=}"; shift ;;
+	--driver) DRIVER="${2:-}"; shift 2 ;;
+	--driver=*) DRIVER="${1#*=}"; shift ;;
+	--code) CODE="${2:-}"; shift 2 ;;
+	--code=*) CODE="${1#*=}"; shift ;;
+	--name) NAME="${2:-}"; shift 2 ;;
+	--name=*) NAME="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
 	--local) LOCAL="${2:-}"; shift 2 ;;
 	--version) TAG="${2:-}"; shift 2 ;;
@@ -45,10 +72,114 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-case "$ROBOT" in adeept|adeept-mecanum|cozmo|none) ;; *) die "--robot must be adeept, adeept-mecanum, cozmo or none" ;; esac
+case "$DRIVER" in adeept|adeept-mecanum|cozmo|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo or none" ;; esac
+case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
 
 # Root for the service, /usr/local/bin and /etc.
 SUDO=""
+
+# ---- the Adeept kit's stock server: never run it (fixed admin:123456 login on 0.0.0.0:8888, MJPEG on :5000) ----
+# Its installer autostarts it from the user's crontab (or root's, with an @reboot line) or from /etc/rc.local,
+# depending on kit version. Besides the systemd unit and any running process, comment out those autostart lines
+# (marked, never deleted) so they cannot start it again.
+STOCK_SERVER_RE='Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py'
+STOCK_SERVER_MARKER='#openvibe-node-disabled:'
+# Root's crontab is always scanned. Scan the invoking user's crontab on the normal install path or through sudo.
+# From a plain root shell (sudo -i, root login), use the kit's usual owner pi when that account exists.
+CRON_USER="${SUDO_USER:-$(id -un 2>/dev/null || printf '%s' root)}"
+if [ "$CRON_USER" = root ] && id pi >/dev/null 2>&1; then CRON_USER=pi; fi
+
+# Comment out the stock-server lines in one crontab-like file: read $1, write $2, print one line per disabled
+# entry. A line whose first non-blank character is "#" is left alone, so our marker makes a second run a no-op.
+disable_stock_lines() {
+	_src="$1" _dst="$2" _where="$3"
+	: > "$_dst"
+	while IFS= read -r _line || [ -n "$_line" ]; do
+		_trim="${_line#"${_line%%[![:space:]]*}"}"
+		if [ "${_trim#\#}" = "$_trim" ] && printf '%s\n' "$_line" | grep -Eq "$STOCK_SERVER_RE"; then
+			printf '%s %s\n' "$STOCK_SERVER_MARKER" "$_line" >> "$_dst"
+			say "disabled the Adeept kit's stock server autostart in $_where"
+		else
+			printf '%s\n' "$_line" >> "$_dst"
+		fi
+	done < "$_src"
+}
+
+# Edit a plain crontab-like file in place (the test-override paths). No crontab command and no sudo.
+disable_stock_file() {
+	_file="$1" _where="$2"
+	[ -f "$_file" ] || return 0
+	_before="$(mktemp)" _after="$(mktemp)"
+	cp "$_file" "$_before"
+	disable_stock_lines "$_before" "$_after" "$_where"
+	if ! cmp -s "$_before" "$_after"; then cp "$_after" "$_file"; fi
+	rm -f "$_before" "$_after"
+}
+
+# Comment out stock-server lines in one user's crontab and reinstall it only if it changed.
+disable_stock_crontab() {
+	_user="$1"
+	command -v crontab >/dev/null 2>&1 || return 0
+	_before="$(mktemp)" _after="$(mktemp)"
+	$SUDO crontab -u "$_user" -l > "$_before" 2>/dev/null || true
+	if [ ! -s "$_before" ]; then rm -f "$_before" "$_after"; return 0; fi
+	disable_stock_lines "$_before" "$_after" "the crontab of $_user"
+	if ! cmp -s "$_before" "$_after"; then $SUDO crontab -u "$_user" "$_after" || true; fi
+	rm -f "$_before" "$_after"
+}
+
+# Comment out stock-server lines in rc.local (the real path; needs root to write it back).
+disable_stock_rc_local() {
+	_rc="$1"
+	[ -f "$_rc" ] || return 0
+	_before="$(mktemp)" _after="$(mktemp)"
+	$SUDO cp "$_rc" "$_before" 2>/dev/null || { rm -f "$_before" "$_after"; return 0; }
+	disable_stock_lines "$_before" "$_after" "$_rc"
+	if ! cmp -s "$_before" "$_after"; then $SUDO cp "$_after" "$_rc" || true; fi
+	rm -f "$_before" "$_after"
+}
+
+disable_stock_server() {
+	# The OPENVIBE_* file overrides are test-only: when any is set they point the crontab/rc.local checks at temp
+	# files, so skip the real systemd and running-process branches too (a test must touch no service or process).
+	if [ -z "${OPENVIBE_CRONTAB_ROOT:-}${OPENVIBE_CRONTAB_USER:-}${OPENVIBE_RC_LOCAL:-}" ]; then
+		if command -v systemctl >/dev/null 2>&1; then
+			unit=Adeept_Robot.service
+			if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
+				say "disabling the Adeept kit's stock server ($unit): it listens on 0.0.0.0:8888 with a fixed password"
+				$SUDO systemctl disable --now "$unit" || true
+			fi
+		fi
+		if command -v pgrep >/dev/null 2>&1 && pgrep -f "$STOCK_SERVER_RE" >/dev/null 2>&1; then
+			say "stopping a running Adeept stock server process"
+			$SUDO pkill -f "$STOCK_SERVER_RE" || true
+		fi
+	fi
+	# Autostart: root's crontab and the invoking user's, then rc.local. OPENVIBE_CRONTAB_* / OPENVIBE_RC_LOCAL
+	# are test-only file overrides so the checks can run without root and without touching the real system.
+	if [ -n "${OPENVIBE_CRONTAB_ROOT:-}" ]; then
+		disable_stock_file "$OPENVIBE_CRONTAB_ROOT" "the root crontab"
+	else
+		disable_stock_crontab root
+	fi
+	if [ -n "${OPENVIBE_CRONTAB_USER:-}" ]; then
+		disable_stock_file "$OPENVIBE_CRONTAB_USER" "the crontab of ${CRON_USER:-$(id -un 2>/dev/null || printf '%s' root)}"
+	elif [ -n "$CRON_USER" ] && [ "$CRON_USER" != root ]; then
+		disable_stock_crontab "$CRON_USER"
+	fi
+	if [ -n "${OPENVIBE_RC_LOCAL:-}" ]; then
+		disable_stock_file "$OPENVIBE_RC_LOCAL" "rc.local ($OPENVIBE_RC_LOCAL)"
+	else
+		disable_stock_rc_local /etc/rc.local
+	fi
+}
+
+# Test hook: run only the stock-server check against the OPENVIBE_* file overrides, then stop.
+if [ "${OPENVIBE_INSTALL_STOCK_ONLY:-0}" = 1 ]; then
+	disable_stock_server
+	exit 0
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
 	command -v sudo >/dev/null 2>&1 || die "run as root (sudo is not installed)"
 	SUDO="sudo"
@@ -137,11 +268,11 @@ $SUDO "$PIP" install --quiet "$STATE/plugins/sdk" "$STATE/plugins/dryrun"
 PLUGINS='[{"name": "dryrun"}]'
 KIND=onboard
 VIDEO='"source": "auto"'
-case "$ROBOT" in
+case "$DRIVER" in
 adeept|adeept-mecanum)
 	[ $IS_PI = 1 ] || say "warning: this is not a Raspberry Pi; the Adeept plugin will report a hardware fault"
 	$SUDO "$PIP" install --quiet "$STATE/plugins/adeept_adr036[pi]"
-	WHEELS=ordinary; [ "$ROBOT" = adeept-mecanum ] && WHEELS=mecanum
+	WHEELS=ordinary; [ "$DRIVER" = adeept-mecanum ] && WHEELS=mecanum
 	PLUGINS="[{\"name\": \"adeept_adr036\", \"config\": {\"backend\": \"real\", \"wheels\": \"$WHEELS\"}}]"
 	;;
 cozmo)
@@ -166,17 +297,7 @@ else
 fi
 
 # ---- the Adeept kit's stock server: never run it (fixed admin:123456 login on 0.0.0.0:8888, MJPEG on :5000) ----
-if command -v systemctl >/dev/null 2>&1; then
-	unit=Adeept_Robot.service
-	if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
-		say "disabling the Adeept kit's stock server ($unit): it listens on 0.0.0.0:8888 with a fixed password"
-		$SUDO systemctl disable --now "$unit" || true
-	fi
-fi
-if command -v pgrep >/dev/null 2>&1 && pgrep -f "Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py" >/dev/null 2>&1; then
-	say "stopping a running Adeept stock server process"
-	$SUDO pkill -f "Server_(Ordinary|Mecanum)Wheels/(WebServer|APPServer|GUIServer|app)\.py" || true
-fi
+disable_stock_server
 
 # ---- service ----
 if [ "$SERVICE" = 1 ]; then
@@ -193,7 +314,10 @@ if [ -n "$CODE" ]; then
 	if $SUDO "$BIN_DIR/openvibe-node" status --json 2>/dev/null | grep -q '"paired":true'; then
 		say "already paired; keeping the credential (to pair again: sudo openvibe-node pair --force <CODE>)"
 	else
-		$SUDO "$BIN_DIR/openvibe-node" pair "$CODE"
+		set -- pair "$CODE"
+		[ -z "$ROBOT_ID" ] || set -- "$@" --robot "$ROBOT_ID"
+		[ -z "$NAME" ] || set -- "$@" --name "$NAME"
+		$SUDO "$BIN_DIR/openvibe-node" "$@"
 	fi
 else
 	say "not paired yet: get a code on openvibe.bot and run: sudo openvibe-node pair <CODE>"

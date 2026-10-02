@@ -13,7 +13,7 @@ import (
 type Limits struct {
 	MaxSpeed     float64 // 0..1, applied to throttle, x, y
 	MaxTurn      float64 // 0..1, applied to steer, rotation
-	MaxCommandMS int     // cap on the time a motion command may run
+	MaxCommandMS int     // cap on deadline_ms
 }
 
 // DefaultLimits apply before the server sends config: full scale, deadlines capped at protocol.DefaultMaxCommandMS.
@@ -43,25 +43,20 @@ func Merge(server protocol.Limits, localSpeed, localTurn *float64, localMaxMS in
 	return l
 }
 
-// Remaining turns a command's absolute deadline (epoch ms, server clock) into the milliseconds left at now (epoch ms,
-// server clock), never above MaxCommandMS. A command without a deadline gets DefaultDeadlineMS. expired is true when
-// now is at or past the deadline: such a command must never reach a plugin.
-func (l Limits) Remaining(deadline, now int64) (ms int, expired bool) {
-	max := int64(l.MaxCommandMS)
+// Deadline returns the deadline in ms for a command: the default when absent, never above MaxCommandMS.
+func (l Limits) Deadline(requested int) int {
+	d := requested
+	if d <= 0 {
+		d = protocol.DefaultDeadlineMS
+	}
+	max := l.MaxCommandMS
 	if max <= 0 {
 		max = protocol.DefaultMaxCommandMS
 	}
-	left := int64(protocol.DefaultDeadlineMS)
-	if deadline > 0 {
-		if now >= deadline {
-			return 0, true
-		}
-		left = deadline - now
+	if d > max {
+		d = max
 	}
-	if left > max {
-		left = max
-	}
-	return int(left), false
+	return d
 }
 
 var speedKeys = map[string]bool{"throttle": true, "x": true, "y": true}

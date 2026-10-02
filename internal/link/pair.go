@@ -30,7 +30,21 @@ func NormalizeCode(code string) (string, error) {
 	return c, nil
 }
 
-// Pair redeems a one-time code at <server>/api/v1/pair.
+// RobotRe matches an OpenVibe.Bot robot id (rob_ + a ULID).
+var RobotRe = regexp.MustCompile(`^rob_[0-9A-Za-z]{6,64}$`)
+
+// pairMessages turns Bot's problem codes into what the person at the terminal should do next.
+var pairMessages = map[string]string{
+	"bot.invalid_pairing_code": "a pairing code is 8 letters and digits, like ABCD-1234",
+	"bot.pairing_code_invalid": "that is not the pairing code for this robot; check it, or ask for a new one on openvibe.bot",
+	"bot.pairing_code_locked":  "too many wrong tries: the code is dead; ask for a new one on openvibe.bot",
+	"bot.pairing_code_used":    "the pairing code was already used; ask for a new one on openvibe.bot",
+	"bot.pairing_code_expired": "the pairing code expired (codes last 10 minutes); ask for a new one on openvibe.bot",
+	"bot.no_pairing_code":      "this robot has no live pairing code; ask for a new one on openvibe.bot",
+	"rate_limited":             "too many pairing attempts from here; wait a minute and try again",
+}
+
+// Pair redeems a one-time code with POST <server>/api/v1/pair.
 func Pair(ctx context.Context, client *http.Client, server string, req protocol.PairRequest) (*credentials.Credentials, error) {
 	u, err := url.Parse(server)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
@@ -63,7 +77,19 @@ func Pair(ctx context.Context, client *http.Client, server string, req protocol.
 		return nil, fmt.Errorf("pairing response: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return nil, pairRefusal(resp.StatusCode, raw)
+		var pe protocol.Problem
+		_ = json.Unmarshal(raw, &pe)
+		if m, ok := pairMessages[pe.Code]; ok {
+			return nil, errors.New(m)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, errors.New("too many pairing attempts from here; wait a minute and try again")
+		}
+		msg := pe.Detail
+		if msg == "" {
+			msg = pe.Title
+		}
+		return nil, fmt.Errorf("pairing refused: HTTP %d %s %s", resp.StatusCode, pe.Code, msg)
 	}
 	var pr protocol.PairResponse
 	if err := json.Unmarshal(raw, &pr); err != nil {
@@ -73,44 +99,10 @@ func Pair(ctx context.Context, client *http.Client, server string, req protocol.
 		return nil, errors.New("pairing response has no device id or credential")
 	}
 	return &credentials.Credentials{
-		DeviceID: pr.DeviceID, Credential: credentials.NewSecret(pr.Credential), PublishKey: credentials.NewSecret(pr.PublishKey),
-		Server: strings.TrimSuffix(server, "/"), DeviceURL: pr.DeviceURL, WHIPURL: pr.WHIPURL, ICEServers: pr.ICEServers,
+		DeviceID: pr.DeviceID, RobotID: pr.RobotID, Credential: credentials.NewSecret(pr.Credential),
+		PublishKey: credentials.NewSecret(pr.PublishKey), WHIPURL: pr.WHIPURL, Server: strings.TrimSuffix(server, "/"),
 		Profile: pr.Profile, PairedAt: time.Now().UTC(),
 	}, nil
-}
-
-// pairRefusal turns Bot's RFC 9457 problem (code, detail) into a message that says what to do next.
-func pairRefusal(status int, raw []byte) error {
-	var p protocol.Problem
-	_ = json.Unmarshal(raw, &p)
-	switch p.Code {
-	case protocol.ProblemCodeInvalid:
-		return errors.New("that is not the pairing code; check it (5 wrong tries end a code) or ask the owner for a new one on openvibe.bot")
-	case protocol.ProblemCodeLocked:
-		return errors.New("too many wrong tries: this pairing code is dead; ask the owner for a new one on openvibe.bot")
-	case protocol.ProblemCodeUsed:
-		return errors.New("this pairing code has already been used; ask the owner for a new one on openvibe.bot")
-	case protocol.ProblemCodeExpired:
-		return errors.New("this pairing code has expired (codes last 10 minutes); ask the owner for a new one on openvibe.bot")
-	case protocol.ProblemNoCode:
-		return errors.New("this robot has no pairing code; ask the owner for a new one on openvibe.bot")
-	case protocol.ProblemCodeShape:
-		return errors.New("a pairing code is 8 letters and digits, like ABCD-1234")
-	}
-	if status == http.StatusTooManyRequests || p.Code == protocol.ProblemRateLimited {
-		return errors.New("too many pairing attempts from this address; wait a minute and try again")
-	}
-	msg := p.Detail
-	if msg == "" {
-		msg = p.Error
-	}
-	if msg == "" {
-		msg = p.Title
-	}
-	if p.Code != "" {
-		return fmt.Errorf("pairing refused: HTTP %d %s: %s", status, p.Code, msg)
-	}
-	return fmt.Errorf("pairing refused: HTTP %d %s", status, msg)
 }
 
 func isLoopback(host string) bool {

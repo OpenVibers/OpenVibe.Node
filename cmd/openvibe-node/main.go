@@ -1,6 +1,7 @@
 // Command openvibe-node connects a computer, server, Raspberry Pi or robot to OpenVibe.
 //
 //	openvibe-node pair <CODE>     redeem a one-time pairing code and store the device credential
+//	openvibe-node credential import  take a rotated credential: reads the rotate response JSON on stdin
 //	openvibe-node run             run in the foreground (this is also what the service runs)
 //	openvibe-node install         install and start the system service
 //	openvibe-node uninstall       stop and remove the system service
@@ -44,7 +45,7 @@ const usage = `openvibe-node %s: connect this device to OpenVibe.
 
 Usage:
   openvibe-node pair <CODE> [--robot rob_…] [--name NAME] [--server URL] [--kind onboard|bridge] [--force]
-  openvibe-node credential set   read a rotated credential (or the rotate answer's JSON) from stdin
+  openvibe-node credential import   store the credential from a rotate response, read as JSON on stdin
   openvibe-node run [--dry-run]
   openvibe-node install [--user NAME]
   openvibe-node uninstall
@@ -71,6 +72,11 @@ type globals struct {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithStdin(args, os.Stdin, stdout, stderr)
+}
+
+// runWithStdin is run with the command's stdin, so tests can feed `credential import`.
+func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		fmt.Fprintf(stdout, usage, version)
 		return 0
@@ -84,8 +90,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var (
 		server  = fs.String("server", "", "OpenVibe.Bot origin (pair)")
 		kind    = fs.String("kind", "", "onboard or bridge (pair)")
-		robot   = fs.String("robot", "", "the robot (rob_…) the pairing code belongs to (pair)")
-		name    = fs.String("name", "", "the name the owner sees for this device; default: the hostname (pair)")
+		robot   = fs.String("robot", "", "the rob_… id of the robot to pair with, from the installer command (pair)")
+		name    = fs.String("name", "", "a name for this device on openvibe.bot; default: the hostname (pair)")
+		codeArg = fs.String("code", "", "the pairing code, instead of the argument (pair)")
 		force   = fs.Bool("force", false, "pair again even if already paired")
 		dryRun  = fs.Bool("dry-run", false, "run only the dry-run plugin and the test pattern (run)")
 		asJSON  = fs.Bool("json", false, "print JSON (status, plugins)")
@@ -109,17 +116,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var err error
 	switch cmd {
 	case "pair":
+		if *codeArg != "" {
+			positional = append(positional, *codeArg)
+		}
 		if len(positional) != 1 {
-			fmt.Fprintln(stderr, "usage: openvibe-node pair <CODE>")
+			fmt.Fprintln(stderr, "usage: openvibe-node pair <CODE> [--robot rob_…] [--name NAME]")
 			return 2
 		}
 		err = cmdPair(g, pairArgs{code: positional[0], robot: *robot, name: *name, server: *server, kind: *kind, force: *force}, stdout)
 	case "credential":
-		if len(positional) != 1 || positional[0] != "set" {
-			fmt.Fprintln(stderr, "usage: openvibe-node credential set < credential")
+		if len(positional) != 1 || positional[0] != "import" {
+			fmt.Fprintln(stderr, "usage: openvibe-node credential import  (reads the rotate response JSON on stdin)")
 			return 2
 		}
-		err = cmdCredentialSet(g, stdin, stdout)
+		err = cmdCredentialImport(g, stdin, stdout)
 	case "run":
 		err = cmdRun(g, *dryRun)
 	case "install":
@@ -199,20 +209,31 @@ func probeAll(cfg *config.Config, paths config.Paths, log *slog.Logger) (map[str
 	return out, failed
 }
 
+// pairArgs are the flags of `openvibe-node pair`.
 type pairArgs struct {
 	code, robot, name, server, kind string
 	force                           bool
 }
+
+// maxNameLen is the longest device name OpenVibe.Bot stores.
+const maxNameLen = 80
 
 func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
 	code, err := link.NormalizeCode(a.code)
 	if err != nil {
 		return err
 	}
-	if a.robot != "" && !strings.HasPrefix(a.robot, "rob_") {
-		return fmt.Errorf("--robot takes the robot's id from openvibe.bot (rob_…), not %q", a.robot)
-	}
 	server, kind, force := a.server, a.kind, a.force
+	if a.robot != "" && !link.RobotRe.MatchString(a.robot) {
+		return fmt.Errorf("--robot must be a robot id like rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X (a driver kind such as %q goes in the config's plugins)", a.robot)
+	}
+	name := strings.TrimSpace(a.name)
+	if name == "" {
+		name, _ = os.Hostname()
+	}
+	if r := []rune(name); len(r) > maxNameLen {
+		name = string(r[:maxNameLen])
+	}
 	if err := g.paths.Ensure(); err != nil {
 		return fmt.Errorf("cannot create %s (run with sudo, or use --home): %w", g.paths.ConfigDir, err)
 	}
@@ -234,11 +255,8 @@ func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
 		return err
 	}
 	descs, _ := probeAll(cfg, g.paths, g.log)
-	req := protocol.PairRequest{Code: code, AgentVersion: version, DeviceKind: cfg.DeviceKind, Drivers: []string{},
-		Capabilities: map[string]any{}, OS: runtime.GOOS, Arch: runtime.GOARCH, Robot: a.robot, Name: a.name}
-	if req.Name == "" {
-		req.Name, _ = os.Hostname()
-	}
+	req := protocol.PairRequest{Robot: a.robot, Code: code, AgentVersion: version, DeviceKind: cfg.DeviceKind, Drivers: []string{},
+		Capabilities: map[string]any{}, Name: name}
 	names := make([]string, 0, len(descs))
 	for n := range descs {
 		names = append(names, n)
@@ -264,7 +282,7 @@ func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
 		}
 		chownLikeDir(g.paths.ConfigFile(), g.paths.ConfigDir)
 	}
-	fmt.Fprintf(stdout, "Paired as %s. Credential saved to %s (mode 600).\n", creds.DeviceID, g.paths.CredentialFile())
+	fmt.Fprintf(stdout, "Paired as %s (robot %s). Credential saved to %s (mode 600).\n", creds.DeviceID, creds.RobotID, g.paths.CredentialFile())
 	fmt.Fprintln(stdout, "Confirm the device on openvibe.bot, then start it: `openvibe-node run` or `sudo openvibe-node install`.")
 	if service.Status(serviceOptions(g, "")) == "running" {
 		_ = service.Control(serviceOptions(g, ""), "restart")
@@ -273,60 +291,55 @@ func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
 	return nil
 }
 
-// stdin is where `credential set` reads the secret; tests replace it.
-var stdin io.Reader = os.Stdin
+// maxRotateJSON caps what `credential import` reads from stdin: Bot's rotate answer is a few hundred bytes.
+const maxRotateJSON = 64 << 10
 
-// cmdCredentialSet stores a rotated credential in credential.json (mode 600) without ever printing it. The input is
-// the credential alone, or the JSON answer of POST /api/v1/devices/<id>/rotate ({device, credential, publish_key}).
-func cmdCredentialSet(g *globals, in io.Reader, stdout io.Writer) error {
-	creds, err := credentials.Load(g.paths.CredentialFile(), nil)
+// cmdCredentialImport replaces the stored credential and publish key with the pair from a credential rotation.
+// It reads OpenVibe.Bot's `POST /api/v1/devices/:id/rotate` response from stdin and keeps every other stored field,
+// so a rotated Node does not have to pair again. Neither secret is ever printed.
+func cmdCredentialImport(g *globals, stdin io.Reader, stdout io.Writer) error {
+	// The rotate answer is small; refuse a huge stream instead of buffering it.
+	b, err := io.ReadAll(io.LimitReader(stdin, maxRotateJSON+1))
 	if err != nil {
-		return fmt.Errorf("not paired yet (pair first with `openvibe-node pair <CODE>`): %w", err)
+		return fmt.Errorf("reading the rotate response from stdin: %w", err)
 	}
-	raw, err := io.ReadAll(io.LimitReader(in, 64<<10))
+	if len(b) > maxRotateJSON {
+		return fmt.Errorf("the rotate response is over %d KiB; pipe just the POST /api/v1/devices/:id/rotate body", maxRotateJSON>>10)
+	}
+	// The plain strings below live only in this function; nothing formats them.
+	var resp struct {
+		Device struct {
+			ID string `json:"id"`
+		} `json:"device"`
+
+		Credential string `json:"credential"`
+		PublishKey string `json:"publish_key"`
+	}
+	// Never wrap the decoder error: it can quote the response body, secrets and all.
+	if err := json.Unmarshal(b, &resp); err != nil {
+		return errors.New("stdin is not the JSON that POST /api/v1/devices/:id/rotate answered with")
+	}
+	if resp.Credential == "" || resp.PublishKey == "" {
+		return errors.New("the rotate response has no credential or publish_key; pipe the whole response body")
+	}
+	old, err := credentials.Load(g.paths.CredentialFile(), nil)
+	if errors.Is(err, credentials.ErrNotPaired) {
+		return errors.New("this Node is not paired yet; run `openvibe-node pair <CODE>` first")
+	}
 	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+		return err
 	}
-	text := strings.TrimSpace(string(raw))
-	var cred, publishKey string
-	if strings.HasPrefix(text, "{") {
-		var r struct {
-			Device struct {
-				ID string `json:"id"`
-			} `json:"device"`
-			Credential string `json:"credential"`
-			PublishKey string `json:"publish_key"`
-		}
-		if err := json.Unmarshal([]byte(text), &r); err != nil {
-			return errors.New("stdin looks like JSON but does not parse; paste the rotate answer or the credential alone")
-		}
-		if r.Device.ID != "" && r.Device.ID != creds.DeviceID {
-			return fmt.Errorf("that credential is for %s, but this device is %s", r.Device.ID, creds.DeviceID)
-		}
-		cred, publishKey = strings.TrimSpace(r.Credential), strings.TrimSpace(r.PublishKey)
-	} else if fields := strings.Fields(text); len(fields) == 1 {
-		cred = fields[0]
+	if resp.Device.ID != old.DeviceID {
+		return fmt.Errorf("this rotation is for device %s, this Node is paired as %s", resp.Device.ID, old.DeviceID)
 	}
-	if cred == "" {
-		return errors.New("no credential on stdin: pipe in the credential alone, or the rotate answer's JSON")
-	}
-	creds.Credential = credentials.NewSecret(cred)
-	if publishKey != "" {
-		creds.PublishKey = credentials.NewSecret(publishKey)
-	}
-	if err := credentials.Save(g.paths.CredentialFile(), creds); err != nil {
+	next := *old
+	next.Credential = credentials.NewSecret(resp.Credential)
+	next.PublishKey = credentials.NewSecret(resp.PublishKey)
+	if err := credentials.Save(g.paths.CredentialFile(), &next); err != nil {
 		return err
 	}
 	chownLikeDir(g.paths.CredentialFile(), g.paths.ConfigDir)
-	what := "Credential"
-	if publishKey != "" {
-		what = "Credential and publish key"
-	}
-	fmt.Fprintf(stdout, "%s updated for %s in %s (mode 600).\n", what, creds.DeviceID, g.paths.CredentialFile())
-	if service.Status(serviceOptions(g, "")) == "running" {
-		_ = service.Control(serviceOptions(g, ""), "restart")
-		fmt.Fprintln(stdout, "The service was running and has been restarted with the new credential.")
-	}
+	fmt.Fprintf(stdout, "Imported the rotated credential for %s. The old credential stops working after 60 s; restart the node (or it reconnects on its own).\n", old.DeviceID)
 	return nil
 }
 

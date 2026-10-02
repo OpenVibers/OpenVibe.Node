@@ -28,7 +28,7 @@ func TestLatchPersistsAcrossRestart(t *testing.T) {
 	l.SetLocal()
 	l.ClearRemote()
 	if st := l.State(); st.Remote || !st.Local {
-		t.Fatalf("the owner's clear must not clear the local stop: %+v", st)
+		t.Fatalf("estop_clear must not clear the local stop: %+v", st)
 	}
 	l.Resume()
 	if l.State().Stopped() {
@@ -76,28 +76,11 @@ func TestMerge(t *testing.T) {
 	}
 }
 
-func TestRemaining(t *testing.T) {
+func TestDeadline(t *testing.T) {
 	l := Limits{MaxCommandMS: 500}
-	const now = int64(1_738_065_600_000)
-	// No deadline gets the default; a deadline due now or earlier (or a relative 300 read as an instant) is expired;
-	// otherwise what is left, capped.
-	for _, c := range []struct {
-		deadline int64
-		want     int
-		expired  bool
-	}{
-		{0, 300, false},
-		{now + 100, 100, false},
-		{now + 500, 500, false},
-		{now + 9000, 500, false},
-		{now, 0, true},
-		{now - 1, 0, true},
-		{300, 0, true},
-		{now + 1, 1, false},
-	} {
-		got, exp := l.Remaining(c.deadline, now)
-		if got != c.want || exp != c.expired {
-			t.Errorf("Remaining(%d)=%d,%v want %d,%v", c.deadline-now, got, exp, c.want, c.expired)
+	for in, want := range map[int]int{0: 300, -5: 300, 100: 100, 500: 500, 9000: 500} {
+		if got := l.Deadline(in); got != want {
+			t.Errorf("Deadline(%d)=%d want %d", in, got, want)
 		}
 	}
 }

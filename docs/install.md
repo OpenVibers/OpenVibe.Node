@@ -5,15 +5,19 @@ ports, works behind any home router), and a local kill switch stops everything i
 
 ## Quick start (Linux, Raspberry Pi, macOS)
 
-1. On openvibe.bot, add a robot. You get a code like `ABCD-1234` (valid 10 minutes).
-2. On the device:
+1. On openvibe.bot, add a robot. You get a code like `ABCD-1234` (valid 10 minutes) and the installer command with
+   the robot's id filled in.
+2. On the device, run that command and add the driver:
 
    ```sh
-   curl -fsSL https://openvibe.bot/install | sh -s -- ABCD-1234 --robot adeept
+   curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X --code ABCD-1234 --driver adeept
    ```
 
-   `--robot` is `adeept` (Adeept 4WD Smart Car, ordinary wheels), `adeept-mecanum`, `cozmo`, or `none` (the dry-run
-   plugin with a test-pattern camera, for trying the Node on a laptop).
+   `--robot` is the robot's `rob_…` id and `--code` the pairing code (both from openvibe.bot; the code may also be the
+   first argument). `--driver` is `adeept` (Adeept 4WD Smart Car, ordinary wheels), `adeept-mecanum`, `cozmo`, or
+   `none` (the default: the dry-run plugin with a test-pattern camera, for trying the Node on a laptop). `--name NAME`
+   names the device on openvibe.bot (default: the hostname). The old form `--robot adeept` (a driver kind after
+   `--robot`) still works but is deprecated: the installer warns and treats it as `--driver adeept`.
 3. Confirm the new device on openvibe.bot.
 
 The installer detects the OS and CPU (linux amd64/arm64/armv7, macOS amd64/arm64), downloads the binary and the plugin
@@ -32,7 +36,7 @@ from plugins that send JPEG frames).
 
 ```sh
 sudo install -m 755 openvibe-node-linux-arm64 /usr/local/bin/openvibe-node
-sudo openvibe-node pair ABCD-1234        # stores /etc/openvibe-node/credential.json (mode 600)
+sudo openvibe-node pair ABCD-1234 --robot rob_…   # stores /etc/openvibe-node/credential.json (mode 600)
 sudo openvibe-node install               # systemd / launchd / Windows service, starts it
 openvibe-node status
 ```
@@ -53,7 +57,7 @@ need Python; set `"python"` in `config.json`.
 
 | command                                   | what it does                                                               |
 |-------------------------------------------|----------------------------------------------------------------------------|
-| `openvibe-node pair <CODE> [--force]`     | redeem a pairing code; `--server`, `--kind onboard\|bridge` override config |
+| `openvibe-node pair <CODE> [--force]`     | redeem a pairing code (or `--code CODE`); `--robot rob_…` the robot it is for, `--name` the device name (default: hostname); `--server`, `--kind onboard\|bridge` override config |
 | `openvibe-node run [--dry-run]`           | run in the foreground (what the service runs)                              |
 | `openvibe-node install [--user NAME]`     | install and start the service                                              |
 | `openvibe-node uninstall`                 | stop and remove the service (config and credential are kept)               |
@@ -96,7 +100,9 @@ macOS: `/Library/Application Support/OpenVibe Node`. Windows: `%ProgramData%\Ope
   test pattern if it asks for one), `test`, `command` (with `video.command`: a program writing H.264 Annex B to stdout,
   e.g. `["ffmpeg", "-f", "v4l2", "-i", "/dev/video0", "-c:v", "libx264", "-preset", "ultrafast", "-tune",
   "zerolatency", "-profile:v", "baseline", "-g", "30", "-f", "h264", "-"]`), `plugin` (with `video.plugin`), `off`.
-  `fps`, `width`, `height`, `ffmpeg` tune the rest.
+  `fps`, `width`, `height`, `ffmpeg` tune the rest. `whip_url`: where the camera publishes, with the publish key from
+  pairing. It overrides the `whip_url` OpenVibe.Bot returns at pairing; with neither (Bot has no ingest configured)
+  video stays off and the log says so.
 - `limits`: local caps on top of the owner's limits from openvibe.bot; the stricter value wins.
 - `python`: interpreter for bundled plugins (default `<state>/venv/bin/python`, then `python3`).
 
@@ -108,11 +114,17 @@ Unknown keys are rejected, so a typo does not silently change behaviour.
 
 Raspberry Pi OS Bookworm (64-bit recommended). Enable I²C and SPI: `sudo raspi-config` → Interface Options, or
 `dtparam=i2c_arm=on` and `dtparam=spi=on` in `/boot/firmware/config.txt`, then reboot. Install with
-`--robot adeept` (or `adeept-mecanum`).
+`--driver adeept` (or `adeept-mecanum`).
 
 The kit's own software (`Adeept_Robot.service`, `WebServer.py` on `0.0.0.0:8888` with the fixed login
-`admin:123456`, MJPEG on `:5000`) must not run: anyone on the network could drive the car. The installer disables it;
-check with `systemctl status Adeept_Robot.service`. The Node replaces it.
+`admin:123456`, MJPEG on `:5000`) must not run: anyone on the network could drive the car. The installer
+(`install/install.sh`) now does this automatically: it stops and disables `Adeept_Robot.service` and comments out the
+kit's autostart lines in the invoking user's crontab, root's crontab and `/etc/rc.local`, prefixing each with the
+marker `#openvibe-node-disabled:` and keeping the original text, so undoing it is removing the marker and a second
+run changes nothing. From a root shell, it checks `pi`'s crontab when that account exists. Verify with
+`systemctl status Adeept_Robot.service`, `crontab -l | grep openvibe-node-disabled` (and
+`sudo crontab -l -u pi | grep openvibe-node-disabled` for a root-shell install) and
+`grep openvibe-node-disabled /etc/rc.local`. The Node replaces it.
 
 If a direction is wrong on your car, fix it in `config.json` → `plugins[0].config`: `motors.<wheel>.direction`,
 `pan.invert`, `tilt.invert`, `line.invert`. See [the plugin README](../plugins/adeept_adr036/README.md).
@@ -121,7 +133,7 @@ If a direction is wrong on your car, fix it in `config.json` → `plugins[0].con
 
 Cozmo makes its own Wi-Fi network without internet. Use a Raspberry Pi or laptop with two network interfaces: one
 joined to Cozmo's network (`Cozmo_…`; raise and lower the lift to see the password on its face), the other to the
-internet (Ethernet, or a second Wi-Fi adapter). Install with `--robot cozmo`; the device kind is `bridge`. See
+internet (Ethernet, or a second Wi-Fi adapter). Install with `--driver cozmo`; the device kind is `bridge`. See
 [the plugin README](../plugins/cozmo/README.md).
 
 ## Troubleshooting

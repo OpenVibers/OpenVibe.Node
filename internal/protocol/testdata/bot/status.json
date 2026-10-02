@@ -1,0 +1,2 @@
+{ "v": 1, "seq": 14, "ts": 1738065600900, "type": "status", "firmware": "adeept-0.1.0",
+  "capabilities": { "drive": { "type": "differential", "axes": ["throttle", "steer"] } }, "faults": [], "estop_latched": false }

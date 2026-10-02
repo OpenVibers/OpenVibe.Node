@@ -268,7 +268,7 @@ func (p *Publisher) session(ctx context.Context) error {
 				p.mu.Unlock()
 				p.requestKeyframe()
 				p.state.Store(StateLive)
-				p.log.Info("video live", "whip", redactURL(p.opt.WHIPURL))
+				p.log.Info("video live", "whip", scrub(redactURL(p.opt.WHIPURL), p.opt.PublishKey))
 			case webrtc.PeerConnectionStateDisconnected:
 				disconnectedAt = time.Now()
 			case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:

@@ -15,8 +15,7 @@ import (
 
 // LatchState is the persisted e-stop state. Two independent latches:
 //
-//   - Remote: set by a server `estop {latched:true}` (or config.estop_latched); cleared by `estop {latched:false}` (the
-//     owner), config.estop_latched:false, or a local `resume`.
+//   - Remote: set by a server `estop`; cleared by a server `estop` with latched:false (the owner) or a local `resume`.
 //   - Local: set by `openvibe-node stop` on the machine itself; cleared only by `openvibe-node resume`.
 //
 // Anything that moves is refused while either is set.
@@ -139,7 +138,7 @@ func (l *Latch) SetRemote(reason string) (LatchState, error) {
 	})
 }
 
-// ClearRemote clears the server e-stop (the owner's estop {latched:false}). The local latch is untouched.
+// ClearRemote clears the server e-stop (the owner's estop latched:false). The local latch is untouched.
 func (l *Latch) ClearRemote() (LatchState, error) {
 	return l.update(func(s *LatchState) { s.Remote, s.RemoteReason, s.RemoteAt = false, "", time.Time{} })
 }

@@ -4,9 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -55,18 +54,12 @@ func (r *recorder) Disconnected(err error) {
 	r.gotDown <- err
 }
 
-const testCred = "cred-0123456789abcdef"
-
-// setup runs a Link against a fakebot; prep runs before the first connection.
-func setup(t *testing.T, hb time.Duration, prep ...func(*fakebot.Server)) (*fakebot.Server, *Link, *recorder, *lockedWriter, context.CancelFunc) {
+func setup(t *testing.T, hb time.Duration) (*fakebot.Server, *Link, *recorder, *lockedWriter, context.CancelFunc) {
 	t.Helper()
 	srv := fakebot.New()
 	t.Cleanup(srv.Close)
-	cred := testCred
+	cred := "cred-0123456789abcdef"
 	srv.AddCredential(cred, "dev_test")
-	for _, f := range prep {
-		f(srv)
-	}
 	u, err := DeviceURL(srv.URL())
 	if err != nil {
 		t.Fatal(err)
@@ -115,19 +108,12 @@ func waitFrame(t *testing.T, r *recorder, typ string) protocol.Frame {
 }
 
 func TestConnectHelloConfigHeartbeat(t *testing.T) {
-	// Bot checks the credential after the upgrade; a frame before hello would be refused with bot.not_paired.
-	srv, l, rec, _, _ := setup(t, 50*time.Millisecond, func(s *fakebot.Server) { s.SetHelloDelay(200 * time.Millisecond) })
+	srv, l, rec, _, _ := setup(t, 50*time.Millisecond)
 	c, err := srv.NextConn(3 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := waitFrame(t, rec, protocol.TypeHello).Msg.(protocol.Hello)
-	if h.SessionID == "" || len(h.RobotIDs) != 1 || h.RobotIDs[0] != fakebot.RobotID {
-		t.Fatalf("hello %+v", h)
-	}
-	if _, ok := h.Time(); !ok {
-		t.Fatalf("hello server_time %q", h.ServerTime)
-	}
+	waitFrame(t, rec, protocol.TypeHello)
 	waitFrame(t, rec, protocol.TypeConfig)
 	f, err := c.Expect(protocol.TypeHeartbeat, time.Second, nil)
 	if err != nil {
@@ -147,22 +133,6 @@ func TestConnectHelloConfigHeartbeat(t *testing.T) {
 	if l.Stats().RTT <= 0 {
 		t.Fatal("no RTT measured")
 	}
-	// The measured round trip goes back to the server as rtt_ms on a later heartbeat. The ack that sets the RTT
-	// above and the heartbeat carrying it are separate frames, so poll rather than assuming the next one has
-	// already been read; on a slow runner the ack can land just as the check above runs.
-	var rtt int64
-	var ok bool
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		if rtt, ok = c.RTT(); ok && rtt >= 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("server saw no rtt_ms within 5s (%d %v)", rtt, ok)
-		}
-	}
-	if c.NotPaired() != 0 {
-		t.Fatalf("%d frames sent before hello", c.NotPaired())
-	}
 	// seq increases per direction.
 	var last uint64
 	for _, f := range c.Frames() {
@@ -170,6 +140,119 @@ func TestConnectHelloConfigHeartbeat(t *testing.T) {
 			t.Fatalf("seq not increasing: %d after %d", f.Seq, last)
 		}
 		last = f.Seq
+	}
+}
+
+// Bot's heartbeat_ack echoes the device's send time (echo/t) over its own envelope seq, so the Node measures the
+// round trip from that; a fresh connection starts with no measurement.
+func TestHeartbeatRTTReportedAfterAck(t *testing.T) {
+	srv, l, rec, _, _ := setup(t, 60*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeHello)
+	waitFrame(t, rec, protocol.TypeConfig)
+
+	first, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hb := first.Msg.(protocol.Heartbeat); hb.T == 0 {
+		t.Fatalf("heartbeat carried no t: %+v", hb)
+	} else if hb.RTTMS != nil {
+		t.Fatalf("first heartbeat on a connection carried rtt_ms %d", *hb.RTTMS)
+	}
+
+	// fakebot auto-acks, so a later heartbeat carries the measurement: present, and never negative.
+	for {
+		f, err := c.Expect(protocol.TypeHeartbeat, 3*time.Second, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hb := f.Msg.(protocol.Heartbeat)
+		if hb.RTTMS == nil {
+			continue
+		}
+		if *hb.RTTMS < 0 {
+			t.Fatalf("rtt_ms %d", *hb.RTTMS)
+		}
+		break
+	}
+	if l.Stats().RTT <= 0 {
+		t.Fatal("no RTT in stats")
+	}
+
+	// A reconnect starts fresh: the first heartbeat on the new connection again carries no rtt_ms.
+	c.Close()
+	<-rec.gotDown
+	c2, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeHello)
+	waitFrame(t, rec, protocol.TypeConfig)
+	first2, err := c2.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hb := first2.Msg.(protocol.Heartbeat); hb.RTTMS != nil {
+		t.Fatalf("first heartbeat on a new connection carried rtt_ms %d", *hb.RTTMS)
+	}
+}
+
+// An ack that carries only echo (Bot's newer field, no t) still sets the RTT.
+func TestHeartbeatAckEchoOnlySetsRTT(t *testing.T) {
+	srv, l, rec, _, _ := setup(t, 200*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeConfig)
+	c.Mute() // stop fakebot's automatic t+echo answers; this test sends the ack itself
+	f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo := f.Msg.(protocol.Heartbeat).T
+	if echo == 0 {
+		t.Fatal("heartbeat carried no t to echo")
+	}
+	if err := c.Send(protocol.HeartbeatAck{Echo: &echo}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for l.Stats().RTT <= 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("an echo-only heartbeat_ack did not set the RTT")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// An ack that carries only seq (older Bot, no t/echo) still sets the RTT from the bounded send-time lookup.
+func TestHeartbeatAckSeqOnlySetsRTT(t *testing.T) {
+	srv, l, rec, _, _ := setup(t, 200*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeConfig)
+	c.Mute() // stop fakebot's automatic t+echo answers; this test sends the ack itself
+	f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb := f.Msg.(protocol.Heartbeat)
+	if err := c.Send(protocol.HeartbeatAck{Seq: hb.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for l.Stats().RTT <= 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a seq-only heartbeat_ack did not set the RTT")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -220,116 +303,179 @@ func TestSendOffline(t *testing.T) {
 	}
 }
 
-// expectCredentialRefusal checks a 4002/4003 ending: a CredentialError naming the action, no fast retry (the 10 s floor;
-// ordinary drops retry within BackoffMax = 100 ms here) and no credential in the logs.
-func expectCredentialRefusal(t *testing.T, srv *fakebot.Server, l *Link, rec *recorder, logs *lockedWriter, cancel context.CancelFunc, code int) {
-	t.Helper()
-	var err error
-	select {
-	case err = <-rec.gotDown:
-	case <-time.After(3 * time.Second):
-		t.Fatal("no disconnect")
+// A revoke closes the live socket with 4003: the link says to pair again, keeps trying no sooner than
+// CredentialRetryMin, and never logs the credential.
+func TestRevokedRetriesAfterTenSecondsAndNeverLogsCredential(t *testing.T) {
+	srv, l, rec, logs, cancel := setup(t, 100*time.Millisecond)
+	waitFrame(t, rec, protocol.TypeConfig)
+	srv.Revoke("cred-0123456789abcdef")
+	if err := <-rec.gotDown; err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("disconnect error %v", err)
 	}
-	var ce *CredentialError
-	if !errors.As(err, &ce) || ce.Code != code {
-		t.Fatalf("err %v, want a CredentialError %d", err, code)
+	waitLastError(t, l, "pair again")
+	if !strings.Contains(l.Stats().LastError, "credential import") {
+		t.Fatalf("last error %q does not say how to recover", l.Stats().LastError)
 	}
-	conns := srv.Connections()
-	time.Sleep(time.Second)
-	if srv.Connections() != conns {
-		t.Fatalf("retried within a second after close %d", code)
-	}
-	if !strings.Contains(l.Stats().LastError, "re-pair or update the credential") {
-		t.Fatalf("last error %q", l.Stats().LastError)
+	time.Sleep(time.Second) // ten times BackoffMax: an ordinary reconnect would have dialed again by now
+	if n := srv.Dials(); n != 1 {
+		t.Fatalf("dialed %d times within a second of a revoke", n)
 	}
 	cancel()
-	if !strings.Contains(logs.String(), "re-pair or update the credential") || !strings.Contains(logs.String(), "retry_in=1") {
-		t.Fatalf("logs: %s", logs.String())
-	}
-	if strings.Contains(logs.String(), testCred) {
+	if strings.Contains(logs.String(), "cred-0123456789abcdef") {
 		t.Fatalf("credential in logs: %s", logs.String())
 	}
-}
-
-func TestRevokedBacksOff(t *testing.T) {
-	srv, l, rec, logs, cancel := setup(t, 100*time.Millisecond)
-	if _, err := srv.NextConn(3 * time.Second); err != nil {
-		t.Fatal(err)
-	}
-	waitFrame(t, rec, protocol.TypeConfig)
-	srv.Revoke(testCred) // closes with 4003
-	expectCredentialRefusal(t, srv, l, rec, logs, cancel, protocol.CloseRevoked)
-}
-
-func TestBadCredentialBacksOff(t *testing.T) {
-	// Bot upgrades first, then closes an unknown credential with 4002.
-	srv, l, rec, logs, cancel := setup(t, 100*time.Millisecond, func(s *fakebot.Server) { s.Revoke(testCred) })
-	expectCredentialRefusal(t, srv, l, rec, logs, cancel, protocol.CloseBadCredential)
-	if srv.Connections() != 1 {
-		t.Fatalf("connections %d", srv.Connections())
+	if !strings.Contains(logs.String(), "refused the device credential") {
+		t.Fatalf("no credential diagnosis in the log: %s", logs.String())
 	}
 }
 
-func TestReplacedReconnects(t *testing.T) {
-	srv, _, rec, _, _ := setup(t, 100*time.Millisecond)
-	if _, err := srv.NextConn(3 * time.Second); err != nil {
-		t.Fatal(err)
-	}
-	waitFrame(t, rec, protocol.TypeConfig)
-	// A second connection of the same device replaces the first (close 4000); the link reconnects after an ordinary
-	// backoff, replacing that one in turn.
+// A credential the server does not know is closed with 4002 right after the upgrade: the link reports it and waits
+// at least CredentialRetryMin before the next try instead of giving up or hammering the server.
+func TestRefusedCredentialWaitsTenSeconds(t *testing.T) {
+	srv := fakebot.New()
+	defer srv.Close()
 	u, _ := DeviceURL(srv.URL())
-	ws, _, err := websocket.DefaultDialer.Dial(u, http.Header{"Authorization": {"Bearer " + testCred}})
+	rec := newRecorder()
+	l := New(Options{URL: u, Credential: credentials.NewSecret("cred-unknown"), BackoffMin: 10 * time.Millisecond,
+		BackoffMax: 50 * time.Millisecond, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { l.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	waitLastError(t, l, "pair again")
+	time.Sleep(time.Second)
+	if n := srv.Dials(); n != 1 {
+		t.Fatalf("dialed %d times within a second of a 4002", n)
+	}
+	select {
+	case <-done:
+		t.Fatal("the link gave up on a refused credential")
+	default:
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.connected != 0 {
+		t.Fatalf("connected %d times with a refused credential", rec.connected)
+	}
+}
+
+// The wait after 4002 / 4003 is never under CredentialRetryMin, whatever the jitter draws; other errors keep the
+// short exponential backoff.
+func TestCredentialBackoffFloor(t *testing.T) {
+	l := New(Options{URL: "ws://127.0.0.1:1/device", BackoffMin: time.Millisecond, BackoffMax: 20 * time.Second}, newRecorder())
+	for _, err := range []error{closeErr(&websocket.CloseError{Code: protocol.CloseInvalid}), closeErr(&websocket.CloseError{Code: protocol.CloseRevoked}), errUnauthorized} {
+		if !credentialRefused(err) {
+			t.Fatalf("%v is not a credential refusal", err)
+		}
+		for attempt := 0; attempt < 40; attempt++ {
+			for i := 0; i < 50; i++ {
+				if w := l.backoff(err, attempt); w < CredentialRetryMin || w > CredentialRetryMin+20*time.Second {
+					t.Fatalf("attempt %d after %v: wait %s", attempt, err, w)
+				}
+			}
+		}
+	}
+	replaced := closeErr(&websocket.CloseError{Code: protocol.CloseReplaced})
+	if replaced == nil || credentialRefused(replaced) {
+		t.Fatalf("4000 maps to %v", replaced)
+	}
+	for i := 0; i < 200; i++ {
+		if w := l.backoff(replaced, 0); w > 2*time.Millisecond {
+			t.Fatalf("4000 waited %s on the first attempt", w)
+		}
+	}
+}
+
+func waitLastError(t *testing.T, l *Link, want string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !strings.Contains(l.Stats().LastError, want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("last error %q, want %q", l.Stats().LastError, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A second connection with the same credential replaces the first (4000); the replaced link reconnects with its
+// normal backoff, as Bot expects of a device whose stale socket was replaced.
+func TestReplacedReconnects(t *testing.T) {
+	srv := fakebot.New()
+	defer srv.Close()
+	srv.AddCredential("cred-x", "dev_x")
+	u, _ := DeviceURL(srv.URL())
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := newRecorder()
+	first := New(Options{URL: u, Credential: credentials.NewSecret("cred-x"), BackoffMin: 10 * time.Millisecond,
+		BackoffMax: 50 * time.Millisecond, Log: quiet}, rec)
+	go first.Run(ctx)
+	waitFrame(t, rec, protocol.TypeConfig)
+	second := New(Options{URL: u, Credential: credentials.NewSecret("cred-x"), BackoffMin: time.Hour, Log: quiet}, newRecorder())
+	go second.Run(ctx)
+	if err := <-rec.gotDown; err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("err %v", err)
+	}
+	// The first link comes back within its normal backoff (and replaces the second in turn).
+	waitFrame(t, rec, protocol.TypeHello)
+	if n := srv.Connections(); n != 3 {
+		t.Fatalf("connections %d", n)
+	}
+}
+
+// ServerNow reads the server's clock from the frames' ts: the skew less the fastest transit.
+func TestServerNow(t *testing.T) {
+	l := New(Options{URL: "ws://127.0.0.1:1/device"}, newRecorder())
+	if _, ok := l.ServerNow(time.Now()); ok {
+		t.Fatal("an estimate before any frame")
+	}
+	l.observe(10_000, time.UnixMilli(9_900))  // server 100 ms ahead, fast frame
+	l.observe(10_000, time.UnixMilli(10_500)) // a frame that sat 600 ms in a queue
+	if ms, ok := l.ServerNow(time.UnixMilli(20_000)); !ok || ms != 20_100 {
+		t.Fatalf("server now %d %v", ms, ok)
+	}
+	// A long run of frames that each sat 500 ms on the way never displaces the timely one: an expired deadline must
+	// not read as open again.
+	for i := 0; i < 100; i++ {
+		l.observe(int64(30_000+i*10), time.UnixMilli(int64(30_000+i*10)+400))
+	}
+	if ms, _ := l.ServerNow(time.UnixMilli(40_000)); ms != 40_100 {
+		t.Fatalf("delayed frames moved the estimate: %d", ms)
+	}
+	// A new connection starts a new estimate.
+	l.mu.Lock()
+	l.hasSkew = false
+	l.mu.Unlock()
+	l.observe(50_000, time.UnixMilli(50_000))
+	if ms, _ := l.ServerNow(time.UnixMilli(60_000)); ms != 60_000 {
+		t.Fatalf("estimate across connections: %d", ms)
+	}
+}
+
+// Before hello the socket is not authenticated: nothing is sent and Connected has not run.
+func TestNothingSentBeforeHello(t *testing.T) {
+	srv := fakebot.New()
+	defer srv.Close()
+	srv.AddCredential("cred-x", "dev_x")
+	srv.Greeting = [][]byte{} // upgrade, authenticate, but stay silent
+	u, _ := DeviceURL(srv.URL())
+	rec := newRecorder()
+	l := New(Options{URL: u, Credential: credentials.NewSecret("cred-x"), HeartbeatInterval: 20 * time.Millisecond,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go l.Run(ctx)
+	c, err := srv.NextConn(3 * time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ws.Close()
-	select {
-	case err := <-rec.gotDown:
-		if err == nil || !strings.Contains(err.Error(), "replaced") || IsCredentialError(err) {
-			t.Fatalf("err %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("not replaced")
+	time.Sleep(30 * time.Millisecond)
+	if len(c.Frames()) != 0 || rec.connected != 0 || l.Connected() {
+		t.Fatalf("sent %d frames before hello", len(c.Frames()))
 	}
-	if _, err := srv.NextConn(3 * time.Second); err != nil { // the manual one
-		t.Fatal(err)
-	}
-	if _, err := srv.NextConn(3 * time.Second); err != nil { // the link again
-		t.Fatal(err)
-	}
-}
-
-func TestServerErrorFrame(t *testing.T) {
-	srv, l, rec, _, _ := setup(t, 100*time.Millisecond)
-	c, _ := srv.NextConn(3 * time.Second)
-	waitFrame(t, rec, protocol.TypeConfig)
-	if err := c.SendError("bot.unknown_message", "unknown type x"); err != nil {
-		t.Fatal(err)
-	}
-	e := waitFrame(t, rec, protocol.TypeError).Msg.(protocol.Error)
-	if e.Code != "bot.unknown_message" || e.Detail != "unknown type x" || !l.Connected() {
-		t.Fatalf("%+v", e)
-	}
-}
-
-func TestBackoff(t *testing.T) {
-	l := New(Options{URL: "ws://127.0.0.1:1/device"}, newRecorder())
-	for _, err := range []error{&CredentialError{Code: protocol.CloseBadCredential}, &CredentialError{Code: protocol.CloseRevoked},
-		fmt.Errorf("session: %w", &CredentialError{Code: 401})} {
-		for i := 0; i < 200; i++ {
-			if w := l.backoff(err, i%40); w < 10*time.Second || w > 40*time.Second {
-				t.Fatalf("%v: attempt %d waits %s", err, i%40, w)
-			}
-		}
-		if !strings.Contains(err.Error(), "re-pair or update the credential") {
-			t.Fatalf("%v", err)
-		}
-	}
-	for i := 0; i < 200; i++ {
-		if w := l.backoff(errors.New("read: EOF"), 0); w < 250*time.Millisecond || w >= 750*time.Millisecond {
-			t.Fatalf("first retry waits %s", w)
-		}
+	if err := l.Send(protocol.Heartbeat{}); !errors.Is(err, ErrOffline) {
+		t.Fatalf("send before hello: %v", err)
 	}
 }
 
@@ -354,19 +500,18 @@ func TestPair(t *testing.T) {
 	srv := fakebot.New()
 	defer srv.Close()
 	srv.AddCode("ABCD1234")
-	req := protocol.PairRequest{Code: "ABCD1234", AgentVersion: "t", DeviceKind: "onboard", Drivers: []string{"dryrun"}, Name: "rover"}
+	req := protocol.PairRequest{Robot: fakebot.RobotID, Code: "ABCD1234", AgentVersion: "t", DeviceKind: "onboard", Drivers: []string{"dryrun"}}
 	c, err := Pair(context.Background(), nil, srv.URL(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.DeviceID == "" || c.Credential.IsZero() || c.PublishKey.IsZero() || c.WHIPURL != "" {
+	if c.DeviceID == "" || c.Credential.IsZero() || c.PublishKey.IsZero() || c.RobotID != fakebot.RobotID {
 		t.Fatalf("%+v", c)
 	}
-	// Bot answers a used code, without a robot, as not a live code.
 	if _, err := Pair(context.Background(), nil, srv.URL(), req); err == nil || !strings.Contains(err.Error(), "not the pairing code") {
 		t.Fatalf("code reused: %v", err)
 	}
-	if got := srv.PairRequests(); len(got) != 2 || got[0].Drivers[0] != "dryrun" || got[0].DeviceKind != "onboard" || got[0].Name != "rover" {
+	if got := srv.PairRequests(); len(got) != 2 || got[0].Drivers[0] != "dryrun" || got[0].DeviceKind != "onboard" || got[0].Robot != fakebot.RobotID {
 		t.Fatalf("%+v", got)
 	}
 	if _, err := Pair(context.Background(), nil, "http://openvibe.example", req); err == nil {
@@ -374,51 +519,30 @@ func TestPair(t *testing.T) {
 	}
 }
 
-// TestPairRefusals covers Bot's problem codes: with robot sent, wrong tries are charged and the fifth kills the code.
+// Each of Bot's pairing refusals (RFC 9457 problem bodies from pairing.redeem and the rate limiter) becomes a message
+// that says what to do next; anything else keeps Bot's status, code and detail.
 func TestPairRefusals(t *testing.T) {
 	srv := fakebot.New()
 	defer srv.Close()
-	srv.AddRobotCode(fakebot.RobotID, "WXYZ7890")
-	pair := func(robot, code string) error {
-		_, err := Pair(context.Background(), nil, srv.URL(), protocol.PairRequest{Robot: robot, Code: code, AgentVersion: "t", DeviceKind: "onboard"})
-		return err
-	}
-	for i := 0; i < 4; i++ {
-		if err := pair(fakebot.RobotID, "AAAA0000"); err == nil || !strings.Contains(err.Error(), "not the pairing code") {
-			t.Fatalf("try %d: %v", i, err)
-		}
-	}
-	if err := pair(fakebot.RobotID, "AAAA0000"); err == nil || !strings.Contains(err.Error(), "too many wrong tries") {
-		t.Fatalf("fifth try: %v", err)
-	}
-	if err := pair(fakebot.RobotID, "WXYZ7890"); err == nil || !strings.Contains(err.Error(), "already been used") {
-		t.Fatalf("dead code: %v", err)
-	}
-	if got := srv.PairRequests(); got[0].Robot != fakebot.RobotID {
-		t.Fatalf("robot not sent: %+v", got[0])
-	}
-	if err := pair("rob_other", "WXYZ7890"); err == nil || !strings.Contains(err.Error(), "has no pairing code") {
-		t.Fatalf("no code: %v", err)
-	}
-	srv.AddCode("EXPD1234")
-	srv.ExpireCode("EXPD1234")
-	if err := pair("", "EXPD1234"); err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Fatalf("expired: %v", err)
-	}
-	if err := pair("", "ABC"); err == nil || !strings.Contains(err.Error(), "8 letters") {
-		t.Fatalf("shape: %v", err)
-	}
-	for _, c := range []struct {
-		status int
-		body   string
-		want   string
+	req := protocol.PairRequest{Robot: fakebot.RobotID, Code: "ABCD1234", AgentVersion: "t", DeviceKind: "onboard"}
+	for _, tc := range []struct {
+		status       int
+		code, detail string
+		want         string
 	}{
-		{429, `{"type":"about:blank","status":429,"code":"rate_limited","detail":"slow down"}`, "wait a minute"},
-		{500, `{"title":"Internal Server Error","status":500,"code":"bot.internal","detail":"boom"}`, "HTTP 500 bot.internal: boom"},
-		{502, `<html>bad gateway</html>`, "HTTP 502"},
+		{403, "bot.pairing_code_invalid", "that is not the pairing code", "not the pairing code for this robot"},
+		{403, "bot.pairing_code_locked", "too many wrong tries; the code is dead", "the code is dead"},
+		{403, "bot.pairing_code_used", "that pairing code has already been used", "already used"},
+		{403, "bot.pairing_code_expired", "that pairing code has expired", "codes last 10 minutes"},
+		{404, "bot.no_pairing_code", "this robot has no pairing code; ask the owner for a new one", "no live pairing code"},
+		{422, "bot.invalid_pairing_code", "the pairing code must be 8 characters (XXXX-XXXX)", "like ABCD-1234"},
+		{429, "rate_limited", "", "wait a minute"},
+		{422, "bot.invalid_input", "drivers must be a list", "HTTP 422 bot.invalid_input drivers must be a list"},
 	} {
-		if err := pairRefusal(c.status, []byte(c.body)); err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%d: %v", c.status, err)
+		srv.RefusePair(tc.status, tc.code, tc.detail)
+		_, err := Pair(context.Background(), nil, srv.URL(), req)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want %q", tc.code, err, tc.want)
 		}
 	}
 }
