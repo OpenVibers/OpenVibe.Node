@@ -24,12 +24,23 @@ jobs:
       - run: pip install av numpy
       - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
-      # The job worker isolates jobs in unprivileged user and network namespaces, which Ubuntu's AppArmor restricts by
-      # default; its tests skip where they cannot run, and OPENVIBE_WORKER_TESTS=require makes them fail here instead.
+      # The job worker's tests skip where jobs cannot run sandboxed: unprivileged, the runner's cgroup is not delegated
+      # (and Ubuntu's AppArmor restricts unprivileged user namespaces).
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: go test -race -count=1 ./...
-        env:
-          OPENVIBE_WORKER_TESTS: require
+      # So they run again as root (jobs as nobody), in a systemd scope with its cgroup delegated, where
+      # OPENVIBE_WORKER_TESTS=require makes them fail instead of skipping. Each test binary lies alone in a directory
+      # nobody can read, as a function's executable must (a job gets a copy of that directory).
+      - name: worker sandbox tests (root)
+        run: |
+          d=$(mktemp -d) && chmod 755 "$d"
+          for t in 'worker .' 'node ^(TestJobRunsOverTheLink|TestLocalStopEndsJobs)$'; do
+            set -- $t
+            mkdir -m 755 "$d/$1"
+            go test -race -c -o "$d/$1/$1.test" ./internal/$1
+            (cd internal/$1 && sudo systemd-run --scope --quiet -p Delegate=yes \
+              env OPENVIBE_WORKER_TESTS=require "$d/$1/$1.test" -test.count=1 -test.v -test.run "$2")
+          done
 
   build:
     name: cross-compile

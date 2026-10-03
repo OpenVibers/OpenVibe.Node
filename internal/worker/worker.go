@@ -1,9 +1,11 @@
 // Package worker runs `function` jobs (OpenVibe.Contracts platform.job@1) from the control link. It runs only the
-// functions the owner declared in the local config, each job as one child process in its own process group and in new
-// user, network and PID namespaces (no network at all), with a scrubbed environment and a fresh working directory, and
-// kills it at its ttl, at its limits, on job_cancel and while the stop latch is set. It never runs a job with less
-// isolation: a job whose namespaces cannot be created fails without running, and a Node whose boot-time Probe fails
-// does not advertise the class. docs/worker.md has the model and its limits.
+// functions the owner declared in the local config, each job as one child process in a sandbox: its own process group,
+// user, mount, network (no network at all), PID, IPC, UTS and cgroup namespaces, a private read-only root holding only
+// the system paths and the function's artifact, its own cgroup v2 (cpu, memory, pids, io), rlimits, no_new_privs and a
+// seccomp allowlist, with a scrubbed environment and a fresh /tmp. It kills a job at its ttl, at its limits, on
+// job_cancel and while the stop latch is set. It never runs a job with less isolation: a job whose sandbox cannot be
+// set up fails without running, and a Node whose boot-time Probe fails does not advertise the class. docs/worker.md
+// has the model and its limits.
 package worker
 
 import (
@@ -14,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -38,8 +41,8 @@ type Worker struct {
 	send func(protocol.Message)
 	log  *slog.Logger
 
-	// isolate puts a job's command in its namespaces; tests replace it to stand for a kernel that cannot.
-	isolate func(*exec.Cmd, config.WorkerConfig) error
+	// isolate puts a job's command in its sandbox; tests replace it to stand for a kernel that cannot.
+	isolate isolateFunc
 
 	mu      sync.Mutex
 	stopped string          // the fault code while the stop latch is set; "" when clear
@@ -47,6 +50,16 @@ type Worker struct {
 	jobs    map[string]*job // admitted, running, or ended with its job_exit not yet acked
 	ended   []string        // ids of ended jobs in jobs, oldest first
 	wg      sync.WaitGroup
+}
+
+// isolateFunc turns a job's command into the start of its sandbox.
+type isolateFunc func(*exec.Cmd, config.WorkerConfig, plan) (*sandbox, error)
+
+// plan is what isolate needs to know of a job besides its command.
+type plan struct {
+	root   string                // the host directory (empty, the job's) its private root is mounted on
+	fn     config.FunctionConfig // zero for the probe
+	limits protocol.JobLimits
 }
 
 type job struct {
@@ -72,8 +85,8 @@ func New(cfg config.WorkerConfig, send func(protocol.Message), log *slog.Logger)
 	return &Worker{cfg: cfg, caps: cfg.Caps.WithDefaults(), send: send, log: log, isolate: isolate, jobs: map[string]*job{}}
 }
 
-// Probe starts a process the way a job is started and checks that it got user, network and PID namespaces of its own
-// and that its CPU limit can be set and its usage read. The class must not be advertised when Probe fails.
+// Probe starts a process the way a job is started and checks every control of the sandbox (docs/worker.md). The class
+// must not be advertised when Probe fails.
 func (w *Worker) Probe() error { return probe(w.cfg, w.isolate) }
 
 // Admit reserves a job, or returns the fault code and reason to nack it with. It runs nothing (Launch does, once the
@@ -344,12 +357,6 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 			return never(protocol.ExitFailed, err)
 		}
 	}
-	cmd := exec.Command(jb.fn.Command[0], jb.fn.Command[1:]...)
-	cmd.Dir, cmd.Env = dir, jobEnv(jb.fn, dir, id)
-	cmd.Stdin = bytes.NewReader(append(append([]byte(nil), jb.req.Args...), '\n'))
-	if err := w.isolate(cmd, w.cfg); err != nil {
-		return never(protocol.ExitFailed, err)
-	}
 	outR, outW, err := os.Pipe()
 	if err != nil {
 		return never(protocol.ExitFailed, err)
@@ -361,7 +368,20 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 		return never(protocol.ExitFailed, err)
 	}
 	defer resR.Close()
+	// dir is only the mount point of the job's private root; it works in a fresh directory of the same name in its
+	// own /tmp.
+	work := "/tmp/" + filepath.Base(dir)
+	cmd := exec.Command(jb.fn.Command[0], jb.fn.Command[1:]...)
+	cmd.Dir, cmd.Env = work, jobEnv(jb.fn, work, id)
+	cmd.Stdin = bytes.NewReader(append(append([]byte(nil), jb.req.Args...), '\n'))
 	cmd.Stdout, cmd.ExtraFiles = outW, []*os.File{resW}
+	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits})
+	if err != nil {
+		outW.Close()
+		resW.Close()
+		return never(protocol.ExitFailed, err)
+	}
+	defer sb.close()
 
 	w.mu.Lock()
 	if jb.reason == "" && time.Since(jb.received) >= jb.ttl {
@@ -379,6 +399,7 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 	w.mu.Unlock()
 	outW.Close()
 	resW.Close()
+	sb.started()
 	if reason != "" {
 		return never(reason, nil)
 	}
@@ -386,14 +407,27 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 		return never(protocol.ExitFailed, err)
 	}
 	pid := cmd.Process.Pid
-	// job_started only once RLIMIT_CPU is set; a job whose limit cannot be set is killed and ends failed without it.
-	if err := limitCPU(pid, jb.limits.CPUMS); err != nil {
+	// job_started only once the function runs confined and RLIMIT_CPU is set (both while the sandbox init waits to
+	// execute it, so it cannot have exited yet); otherwise the job is killed and ends failed (or as it was killed
+	// meanwhile) without it.
+	err = sb.ready(pid)
+	if err == nil {
+		err = limitCPU(pid, jb.limits.CPUMS)
+	}
+	if err == nil {
+		err = sb.run()
+	}
+	if err != nil {
 		w.mu.Lock()
 		killGroup(cmd.Process)
 		jb.proc = nil
+		reason = jb.reason
 		w.mu.Unlock()
 		_ = cmd.Wait()
-		return never(protocol.ExitFailed, fmt.Errorf("its CPU limit could not be set: %w", err))
+		if reason != "" {
+			return never(reason, nil)
+		}
+		return never(protocol.ExitFailed, fmt.Errorf("it could not run confined: %w", err))
 	}
 	w.mu.Lock()
 	jb.started = true
@@ -420,7 +454,7 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 	code, cpuLimit := exitStatus(cmd.ProcessState)
 	if reason == "" {
 		reason = protocol.ExitExited
-		if cpuLimit {
+		if cpuLimit || sb.oomKilled() {
 			reason = protocol.ExitLimit
 		}
 	}

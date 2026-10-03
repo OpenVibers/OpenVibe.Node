@@ -149,7 +149,10 @@ func New(opt Options) (*Node, error) {
 		}
 	}
 	if opt.Config.Worker.Enabled {
-		w := worker.New(opt.Config.Worker, n.sendJobFrame, opt.Log)
+		wcfg := opt.Config.Worker
+		// No job may see the Node's config, credential, state or control socket (they all lie in these).
+		wcfg.NodeDirs = []string{opt.Paths.ConfigDir, opt.Paths.StateDir}
+		w := worker.New(wcfg, n.sendJobFrame, opt.Log)
 		if err := w.Probe(); err != nil {
 			opt.Log.Error("worker off: jobs cannot run isolated here, every job is refused", "err", err)
 		} else {
