@@ -5,8 +5,10 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -25,7 +27,7 @@ import (
 )
 
 // TestWorkerHelperProcess is the job's process when this test binary runs as the `hello` function (`-- job`): it
-// appends a line to the marker file named in its args, prints, holds for hold_ms (1.5 s by default) and writes its
+// tries to append a line to the marker file named in its args (the sandbox must prevent it), prints, holds for hold_ms (1.5 s by default) and writes its
 // result to fd 3.
 func TestWorkerHelperProcess(t *testing.T) {
 	i := slices.Index(os.Args, "--")
@@ -76,8 +78,15 @@ func startWorkerNode(t *testing.T) *env {
 	cfg := config.Default()
 	cfg.Plugins = nil
 	cfg.Video = config.VideoConfig{Source: "off"}
-	cfg.Worker = config.WorkerConfig{Enabled: true, AllowSameUser: true, Caps: config.WorkerCaps{MaxMemBytes: 8 << 30},
-		Functions: []config.FunctionConfig{{Name: "hello", Version: "1.0.0", Command: []string{exe, "-test.run=^TestWorkerHelperProcess$", "--", "job"}}}}
+	// A race-instrumented binary maps terabytes of shadow memory up front: RLIMIT_AS 64 TiB leaves it room. The job
+	// gets a copy of its artifact directory, this test binary, in max_disk_bytes.
+	cfg.Worker = config.WorkerConfig{Enabled: true, AllowSameUser: true, Caps: config.WorkerCaps{MaxMemBytes: 8 << 30, MaxVMBytes: 1 << 46,
+		MaxDiskBytes: 256 << 20},
+		Functions: []config.FunctionConfig{{Name: "hello", Version: "1.0.0", Command: []string{exe, "-test.run=^TestWorkerHelperProcess$", "--", "job"},
+			Env: map[string]string{"GOMAXPROCS": "2"}}}}
+	if os.Geteuid() == 0 { // as root, jobs run as nobody: the test binary must then lie in a directory nobody can read
+		cfg.Worker.AllowSameUser, cfg.Worker.RunAs = false, &config.RunAs{UID: 65534, GID: 65534}
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -205,9 +214,18 @@ func TestJobRunsOverTheLink(t *testing.T) {
 			t.Fatalf("resent job answered %+v, first job_exit %+v", again, ex)
 		}
 	}
-	b, err := os.ReadFile(marker)
-	if err != nil || string(b) != "started\n" {
-		t.Fatalf("the function ran %q (%v), want once", b, err)
+	started = 0
+	for _, f := range e.conn.Frames() {
+		if m, ok := f.Msg.(protocol.JobStarted); ok && m.ID == j.ID {
+			started++
+		}
+	}
+	if started != 1 {
+		t.Fatalf("the function started %d times, want once", started)
+	}
+	// The marker lies in the Node's state directory, which the job cannot see.
+	if _, err := os.Stat(marker); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the job wrote into the Node's state directory: %v", err)
 	}
 }
 

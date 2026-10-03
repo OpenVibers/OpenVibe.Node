@@ -119,11 +119,24 @@ type WorkerConfig struct {
 	// RunAs is the dedicated unprivileged uid/gid jobs run as; it needs the Node to run as root. Without it the Node
 	// refuses to run jobs unless AllowSameUser is set.
 	RunAs *RunAs `json:"run_as,omitempty"`
-	// AllowSameUser runs jobs as the Node's own user (no run_as). A job can then read every file the Node can,
-	// including credential.json, and use the Node user's groups (gpio, dialout, video): for development only.
+	// AllowSameUser runs jobs as the Node's own user (no run_as), with its groups (gpio, dialout, video), on what the
+	// job's private root holds: for development only.
 	AllowSameUser bool       `json:"allow_same_user,omitempty"`
 	Caps          WorkerCaps `json:"caps,omitzero"`
+	// Egress is what a job may reach on the network: none (the default; a network namespace with only a loopback that
+	// is down), public or openvibe-only. Only none is enforced yet: with another value the worker stays off.
+	Egress string `json:"egress,omitempty"`
+	// NodeDirs are the Node's own directories (config, credential, state, control socket), which no job may see; the
+	// Node sets them, the config file does not.
+	NodeDirs []string `json:"-"`
 }
+
+// The worker.egress policies.
+const (
+	EgressNone         = "none"
+	EgressPublic       = "public"
+	EgressOpenVibeOnly = "openvibe-only"
+)
 
 // FunctionConfig is one function a job may run: Command is started with the job's args as JSON on stdin.
 type FunctionConfig struct {
@@ -131,6 +144,20 @@ type FunctionConfig struct {
 	Version string            `json:"version"`
 	Command []string          `json:"command"` // Command[0] is an absolute path
 	Env     map[string]string `json:"env,omitempty"`
+	// ArtifactDir is the directory each job gets a read-only copy of, made as it starts, in its private root (default:
+	// the directory of Command[0]). It must not be / nor hold, or lie inside, the Node's own directories.
+	ArtifactDir string `json:"artifact_dir,omitempty"`
+}
+
+// Artifact is the directory a job of the function gets a read-only copy of.
+func (f FunctionConfig) Artifact() string {
+	if f.ArtifactDir != "" {
+		return filepath.Clean(f.ArtifactDir)
+	}
+	if len(f.Command) == 0 {
+		return ""
+	}
+	return filepath.Dir(f.Command[0])
 }
 
 // RunAs is a uid and gid on this machine.
@@ -148,17 +175,31 @@ type WorkerCaps struct {
 	MaxMemBytes    int64 `json:"max_mem_bytes,omitempty"`
 	MaxOutputBytes int64 `json:"max_output_bytes,omitempty"` // stdout of one job, in bytes
 	MaxJobs        int   `json:"max_jobs,omitempty"`         // jobs running at once
+	// The kernel's limits on every job (cgroup v2 and rlimits): CPU in thousandths of a core (cpu.max), processes and
+	// threads (pids.max and RLIMIT_NPROC), bytes in its /tmp (tmpfs size and RLIMIT_FSIZE), disk I/O per block
+	// device (io.max, bytes and operations per second), and address space (RLIMIT_AS, always set: a runtime that
+	// reserves a large address space up front, such as Node.js, the JVM or a race-instrumented binary, needs a large
+	// value, never none).
+	MaxCPUMillis int64 `json:"max_cpu_millis,omitempty"`
+	MaxPids      int64 `json:"max_pids,omitempty"`
+	MaxDiskBytes int64 `json:"max_disk_bytes,omitempty"`
+	MaxIOBps     int64 `json:"max_io_bps,omitempty"`
+	MaxIOPS      int64 `json:"max_io_iops,omitempty"`
+	MaxVMBytes   int64 `json:"max_vm_bytes,omitempty"`
 }
 
 // DefaultWorkerCaps are the caps for every field the config leaves at zero.
 var DefaultWorkerCaps = WorkerCaps{MaxTTLMS: 600000, MaxWallMS: 300000, MaxCPUMS: 300000, MaxMemBytes: 512 << 20,
-	MaxOutputBytes: 1 << 20, MaxJobs: 1}
+	MaxOutputBytes: 1 << 20, MaxJobs: 1, MaxCPUMillis: 1000, MaxPids: 64, MaxDiskBytes: 64 << 20, MaxIOBps: 64 << 20,
+	MaxIOPS: 1000, MaxVMBytes: 8 << 30}
 
 // WithDefaults fills the zero fields of c from DefaultWorkerCaps.
 func (c WorkerCaps) WithDefaults() WorkerCaps {
 	d := DefaultWorkerCaps
 	for _, f := range []struct{ v, def *int64 }{{&c.MaxTTLMS, &d.MaxTTLMS}, {&c.MaxWallMS, &d.MaxWallMS},
-		{&c.MaxCPUMS, &d.MaxCPUMS}, {&c.MaxMemBytes, &d.MaxMemBytes}, {&c.MaxOutputBytes, &d.MaxOutputBytes}} {
+		{&c.MaxCPUMS, &d.MaxCPUMS}, {&c.MaxMemBytes, &d.MaxMemBytes}, {&c.MaxOutputBytes, &d.MaxOutputBytes},
+		{&c.MaxCPUMillis, &d.MaxCPUMillis}, {&c.MaxPids, &d.MaxPids}, {&c.MaxDiskBytes, &d.MaxDiskBytes},
+		{&c.MaxIOBps, &d.MaxIOBps}, {&c.MaxIOPS, &d.MaxIOPS}, {&c.MaxVMBytes, &d.MaxVMBytes}} {
 		if *f.v <= 0 {
 			*f.v = *f.def
 		}
@@ -321,12 +362,21 @@ func (w WorkerConfig) validate() error {
 		if len(f.Command) == 0 || !filepath.IsAbs(f.Command[0]) {
 			return fmt.Errorf("config: worker function %s@%s needs a command starting with an absolute path", f.Name, f.Version)
 		}
+		if f.ArtifactDir != "" && (!filepath.IsAbs(f.ArtifactDir) || filepath.Clean(f.ArtifactDir) == "/") {
+			return fmt.Errorf("config: worker function %s@%s: artifact_dir must be an absolute path other than /", f.Name, f.Version)
+		}
+	}
+	switch w.Egress {
+	case "", EgressNone, EgressPublic, EgressOpenVibeOnly:
+	default:
+		return fmt.Errorf("config: worker.egress %q is not none, public or openvibe-only", w.Egress)
 	}
 	if w.RunAs != nil && (w.RunAs.UID == 0 || w.RunAs.GID == 0) {
 		return errors.New("config: worker.run_as must not be root (uid or gid 0)")
 	}
 	c := w.Caps
-	if c.MaxTTLMS < 0 || c.MaxWallMS < 0 || c.MaxCPUMS < 0 || c.MaxMemBytes < 0 || c.MaxOutputBytes < 0 || c.MaxJobs < 0 {
+	if c.MaxTTLMS < 0 || c.MaxWallMS < 0 || c.MaxCPUMS < 0 || c.MaxMemBytes < 0 || c.MaxOutputBytes < 0 || c.MaxJobs < 0 ||
+		c.MaxCPUMillis < 0 || c.MaxPids < 0 || c.MaxDiskBytes < 0 || c.MaxIOBps < 0 || c.MaxIOPS < 0 || c.MaxVMBytes < 0 {
 		return errors.New("config: worker.caps must not be negative")
 	}
 	return nil

@@ -3,17 +3,30 @@
 package worker
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
+	"maps"
+	"math/big"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -61,6 +74,127 @@ func TestHelperProcess(t *testing.T) {
 		_, derr := net.DialTimeout("tcp", "192.0.2.1:9", time.Second)
 		_ = json.NewEncoder(result).Encode(map[string]any{"env": os.Environ(), "cwd": cwd, "pid": os.Getpid(),
 			"uid": os.Getuid(), "loopback": fmt.Sprint(lerr), "dial": fmt.Sprint(derr)})
+	case "escape": // every attempt must fail but the write to /tmp; the result is each attempt's error
+		node := os.Getenv("OPENVIBE_TEST_NODE_DIR")
+		try := map[string]error{}
+		_, try["read credential"] = os.ReadFile(node + "/credential.json")
+		_, try["list node dir"] = os.ReadDir(node)
+		if c, err := net.DialTimeout("unix", node+"/node.sock", time.Second); err == nil {
+			c.Close()
+		} else {
+			try["dial node socket"] = err
+		}
+		for _, p := range []string{"/var", "/home", "/root", "/sys", "/etc/shadow", "/etc/ssl/private", "/run"} {
+			_, try["stat "+p] = os.Stat(p)
+		}
+		try["write /"] = os.WriteFile("/x", nil, 0o644)
+		try["write /usr"] = os.WriteFile("/usr/x", nil, 0o644)
+		try["write artifact"] = os.WriteFile(filepath.Join(filepath.Dir(os.Args[0]), "x"), nil, 0o644)
+		try["mount"] = syscall.Mount("tmpfs", "/tmp", "tmpfs", 0, "")
+		try["unshare"] = syscall.Unshare(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET)
+		try["chroot"] = syscall.Chroot("/tmp")
+		if fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, 0); err == nil {
+			syscall.Close(fd)
+		} else {
+			try["packet socket"] = err
+		}
+		try["write /tmp"] = os.WriteFile("/tmp/x", []byte("ok"), 0o600)
+		st, _ := os.ReadFile("/proc/self/status")
+		var keys []string // every file of its /etc that holds a PEM private key (symlinks lead to /usr: not followed)
+		_ = filepath.WalkDir("/etc", func(p string, d fs.DirEntry, err error) error {
+			if err != nil || !d.Type().IsRegular() {
+				return nil
+			}
+			if b, err := os.ReadFile(p); err == nil && bytes.Contains(b, []byte("PRIVATE KEY-----")) {
+				keys = append(keys, p)
+			}
+			return nil
+		})
+		out := map[string]string{"status": string(st), "private keys": strings.Join(keys, " ")}
+		for k, err := range try {
+			out[k] = fmt.Sprint(err)
+		}
+		_ = json.NewEncoder(result).Encode(out)
+	case "quick":
+		fmt.Fprint(result, `{"ok":true}`)
+	case "snapshot": // looks for what TestArtifactSnapshot adds to its artifact directory on the host once it started
+		dir := filepath.Dir(os.Args[0])
+		for end := time.Now().Add(2 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+			if _, err := os.Lstat(filepath.Join(dir, "late")); err == nil {
+				break
+			}
+		}
+		try := map[string]error{}
+		_, try["late file"] = os.Lstat(filepath.Join(dir, "late"))
+		_, try["read through link"] = os.ReadFile(filepath.Join(dir, "link"))
+		_, try["stat unreadable"] = os.Lstat(filepath.Join(dir, "unreadable"))
+		if c, err := net.DialTimeout("unix", filepath.Join(dir, "s"), time.Second); err == nil {
+			c.Close()
+		} else {
+			try["dial socket"] = err
+		}
+		if f, err := os.OpenFile(filepath.Join(dir, "f"), os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			f.Close()
+		} else {
+			try["open FIFO"] = err
+		}
+		try["write artifact"] = os.WriteFile(filepath.Join(dir, "x"), nil, 0o644)
+		out := map[string]string{}
+		for k, err := range try {
+			out[k] = fmt.Sprint(err)
+		}
+		_ = json.NewEncoder(result).Encode(out)
+	case "stage": // not a job: TestStageArtifactInSystemPath's private root, in a user and mount namespace of its own
+		r, sys, dir := os.Args[i+2], os.Args[i+3], os.Args[i+4]
+		out := map[string]string{}
+		err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, "")
+		if err == nil {
+			err = syscall.Mount("tmpfs", r, "tmpfs", 0, "size=1m")
+		}
+		if err == nil {
+			err = bind(r, bindSpec{Path: sys})
+		}
+		var dev uint64
+		if err == nil {
+			dev, err = stageArtifact(r, dir, 1<<20)
+		}
+		if err == nil {
+			err = os.Symlink(sys, r+"/abs")
+		}
+		if err != nil {
+			fmt.Fprintf(result, "setup: %v\n", err)
+			os.Exit(0)
+		}
+		out["in root"], _ = inRoot(r, "/abs/fn")
+		fmt.Fprintln(result, "staged")
+		_, _ = io.ReadAll(os.Stdin) // the test adds a socket, a FIFO and a file to the host's directories
+		var st syscall.Stat_t
+		if err := syscall.Stat(r+dir, &st); err != nil || st.Dev != dev {
+			out["copy"] = fmt.Sprintf("the artifact path does not lead to the copy (%v)", err)
+		}
+		if c, err := net.DialTimeout("unix", r+dir+"/s", time.Second); err == nil {
+			c.Close()
+			out["dial socket"] = "connected"
+		} else {
+			out["dial socket"] = err.Error()
+		}
+		if f, err := os.OpenFile(r+dir+"/f", os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			f.Close()
+			out["open FIFO"] = "opened"
+		} else {
+			out["open FIFO"] = err.Error()
+		}
+		_, err = os.Lstat(r + dir + "/a")
+		out["artifact file"] = fmt.Sprint(err)
+		_, err = os.Lstat(r + sys + "/late")
+		out["system path file"] = fmt.Sprint(err)
+		_ = json.NewEncoder(result).Encode(out)
+	case "forkbomb": // starts processes until the kernel refuses one
+		n, err := 0, error(nil)
+		for ; n < 1000 && err == nil; n++ {
+			err = exec.Command("/bin/sleep", "60").Start()
+		}
+		_ = json.NewEncoder(result).Encode(map[string]any{"started": n - 1, "err": fmt.Sprint(err)})
 	}
 	os.Exit(0)
 }
@@ -72,8 +206,13 @@ func newRunWorker(t *testing.T, caps config.WorkerCaps, modes ...string) (*Worke
 	if caps.MaxMemBytes == 0 {
 		caps.MaxMemBytes = 8 << 30
 	}
+	return newRunWorkerConfig(t, helperConfig(t, caps, modes...))
+}
+
+func newRunWorkerConfig(t *testing.T, cfg config.WorkerConfig) (*Worker, *sink) {
+	t.Helper()
 	s := &sink{}
-	w := New(helperConfig(t, caps, modes...), s.send, quiet())
+	w := New(cfg, s.send, quiet())
 	if err := w.Probe(); err != nil {
 		if os.Getenv("OPENVIBE_WORKER_TESTS") == "require" {
 			t.Fatalf("job isolation unavailable: %v", err)
@@ -169,8 +308,12 @@ func TestIsolation(t *testing.T) {
 	if err := json.Unmarshal(ex.Result, &r); err != nil || ex.Reason != protocol.ExitExited {
 		t.Fatalf("%+v %s: %v", ex, ex.Result, err)
 	}
-	if r.PID != 1 || r.UID != os.Getuid() {
-		t.Fatalf("pid %d uid %d, want 1 and %d", r.PID, r.UID, os.Getuid())
+	uid := os.Getuid()
+	if uid == 0 {
+		uid = 65534 // helperConfig's run_as
+	}
+	if r.PID != 1 || r.UID != uid {
+		t.Fatalf("pid %d uid %d, want 1 and %d", r.PID, r.UID, uid)
 	}
 	if r.Loopback == "<nil>" || r.Dial == "<nil>" {
 		t.Fatalf("network reachable: loopback %s, dial %s", r.Loopback, r.Dial)
@@ -309,5 +452,862 @@ func TestLatchKillsAndRefuses(t *testing.T) {
 	w.Cancel(c.ID)
 	if ex := s.exit(t, c.ID); ex.Reason != protocol.ExitCancelled {
 		t.Fatalf("%+v", ex)
+	}
+}
+
+// TestEscape: the job cannot see the Node's directories (a secret file, the control socket), nor /var, /home, /root,
+// /sys, /run or the rest of /etc (/etc/ssl/private, the host's TLS keys, included); it cannot write / nor its
+// artifact; mount, unshare, chroot and packet sockets are refused; it runs with no_new_privs and the seccomp filter,
+// and only its own /tmp is writable.
+func TestEscape(t *testing.T) {
+	node := t.TempDir()
+	if err := os.WriteFile(filepath.Join(node, "credential.json"), []byte(`{"secret":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", filepath.Join(node, "node.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	cfg := helperConfig(t, config.WorkerCaps{MaxMemBytes: 8 << 30}, "escape")
+	cfg.NodeDirs = []string{node}
+	cfg.Functions[0].Env["OPENVIBE_TEST_NODE_DIR"] = node
+	w, s := newRunWorkerConfig(t, cfg)
+	j := testJob(1, "escape")
+	run(t, w, j)
+	ex := s.exit(t, j.ID)
+	var r map[string]string
+	if err := json.Unmarshal(ex.Result, &r); err != nil || ex.Reason != protocol.ExitExited {
+		t.Fatalf("%+v %s: %v", ex, ex.Result, err)
+	}
+	if !strings.Contains(r["status"], "\nNoNewPrivs:\t1\n") || !strings.Contains(r["status"], "\nSeccomp:\t2\n") {
+		t.Fatalf("not confined: %s", r["status"])
+	}
+	if r["write /tmp"] != "<nil>" {
+		t.Fatalf("its /tmp is not writable: %s", r["write /tmp"])
+	}
+	if r["private keys"] != "" {
+		t.Errorf("its /etc holds private keys: %s", r["private keys"])
+	}
+	delete(r, "write /tmp")
+	delete(r, "status")
+	delete(r, "private keys")
+	if len(r) != 17 {
+		t.Fatalf("%d attempts reported: %v", len(r), r)
+	}
+	for k, v := range r {
+		if v == "<nil>" {
+			t.Errorf("%s succeeded", k)
+		}
+		if strings.Contains(k, "node") || strings.Contains(k, "credential") || strings.HasPrefix(k, "stat ") {
+			if !strings.Contains(v, "no such file or directory") {
+				t.Errorf("%s: %s, want no such file or directory", k, v)
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(cfg.Functions[0].Command[0]), "x")); err == nil {
+		t.Error("the job wrote into its artifact directory")
+	}
+}
+
+// TestArtifactNestedMount: a mount nested in the artifact directory is not copied, be it another filesystem or a bind
+// mount of the artifact's own (a host directory with a secret, here): the job fails without running (as root only:
+// the test mounts on the host).
+func TestArtifactNestedMount(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mounting on the host needs root")
+	}
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.Mkdir(secret, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range []struct{ src, fstype string }{{"tmpfs", "tmpfs"}, {filepath.Dir(secret), ""}} {
+		cfg := helperConfig(t, config.WorkerCaps{MaxMemBytes: 8 << 30}, "quick")
+		nested := filepath.Join(cfg.Functions[0].Artifact(), "nested")
+		if err := os.Mkdir(nested, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		flags := uintptr(0)
+		if m.fstype == "" {
+			flags = syscall.MS_BIND
+		}
+		if err := syscall.Mount(m.src, nested, m.fstype, flags, "mode=0755,size=1m"); err != nil {
+			os.Remove(nested)
+			t.Fatal(err)
+		}
+		w, s := newRunWorkerConfig(t, cfg)
+		log := &logBuf{}
+		w.log = slog.New(slog.NewTextHandler(log, nil))
+		j := testJob(i+1, "quick")
+		run(t, w, j)
+		ex := s.exit(t, j.ID)
+		_ = syscall.Unmount(nested, syscall.MNT_DETACH)
+		os.Remove(nested)
+		if ex.Reason != protocol.ExitFailed || ex.Usage.StartedMS != nil || s.count(protocol.TypeJobStarted, j.ID) != 0 {
+			t.Fatalf("%s mounted in the artifact directory: %+v", m.src, ex)
+		}
+		if !strings.Contains(log.String(), "is a mount point") {
+			t.Fatalf("%s mounted in the artifact directory: the job failed for another reason:\n%s", m.src, log.String())
+		}
+	}
+}
+
+// logBuf is a worker's log, written while its jobs run.
+type logBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// TestArtifactSnapshot: a job runs on a copy of its artifact directory made as it started. A file, a Unix socket and a
+// FIFO the host adds to the directory once the job started never appear in it, so a socket or FIFO there cannot reach
+// a host process however late it appears; the copy is read-only and the host's directory untouched. A symlink is
+// copied as a symlink (one to a host file leads nowhere in the job's root) and a file the job's user may not read is
+// left out. That holds for an artifact directory in a system path too (as /usr/local/bin, the default for a command
+// there): the copy covers what the bind of that path shows of the host's directory.
+func TestArtifactSnapshot(t *testing.T) {
+	t.Run("own directory", func(t *testing.T) { artifactSnapshot(t, t.TempDir()) })
+	t.Run("in a system path", func(t *testing.T) {
+		sys := t.TempDir() // bound in every private root as /usr is
+		saved := systemPaths
+		systemPaths = append(slices.Clip(systemPaths), sys)
+		t.Cleanup(func() { systemPaths = saved })
+		dir := filepath.Join(sys, "fn")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Dir(sys), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		artifactSnapshot(t, dir)
+	})
+}
+
+func artifactSnapshot(t *testing.T, dir string) {
+	cfg := helperConfig(t, config.WorkerCaps{MaxMemBytes: 8 << 30}, "snapshot")
+	for _, d := range []string{filepath.Dir(dir), dir} { // as root, jobs run as nobody and reach their artifact as nobody
+		if err := os.Chmod(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moveHelper(t, &cfg, dir)
+	host := filepath.Join(t.TempDir(), "host-secret")
+	if err := os.WriteFile(host, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(host, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "unreadable"), []byte("x"), 0); err != nil {
+		t.Fatal(err)
+	}
+	w, s := newRunWorkerConfig(t, cfg)
+	j := testJob(1, "snapshot")
+	run(t, w, j)
+	s.wait(t, protocol.TypeJobStarted, j.ID, 1, 10*time.Second)
+	l, err := net.Listen("unix", filepath.Join(dir, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := syscall.Mkfifo(filepath.Join(dir, "f"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"s", "f"} { // a job that could see them could use them
+		if err := os.Chmod(filepath.Join(dir, p), 0o777); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifo, err := os.OpenFile(filepath.Join(dir, "f"), os.O_RDONLY|syscall.O_NONBLOCK, 0) // a reader, so a writer could open it
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fifo.Close()
+	if err := os.WriteFile(filepath.Join(dir, "late"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ex := s.exit(t, j.ID)
+	var r map[string]string
+	if err := json.Unmarshal(ex.Result, &r); err != nil || ex.Reason != protocol.ExitExited {
+		t.Fatalf("%+v %s: %v", ex, ex.Result, err)
+	}
+	for _, k := range []string{"late file", "dial socket", "open FIFO", "read through link", "stat unreadable"} {
+		if !strings.Contains(r[k], "no such file or directory") {
+			t.Errorf("%s: %s, want no such file or directory", k, r[k])
+		}
+	}
+	if !strings.Contains(r["write artifact"], "read-only file system") {
+		t.Errorf("write artifact: %s, want read-only file system", r["write artifact"])
+	}
+	if _, err := os.Stat(filepath.Join(dir, "x")); err == nil {
+		t.Error("the job wrote into its artifact directory")
+	}
+}
+
+// TestStageArtifactInSystemPath: an artifact directory a bound system path holds is copied over what the bind shows
+// there, at the path it leads to in the private root (through an absolute symlink too), so a socket or FIFO the host
+// adds to it once the copy is made is out of reach, while the rest of the bound path still shows the host's directory.
+// It needs only a user and a mount namespace, no cgroup: it runs where the sandboxed jobs cannot.
+func TestStageArtifactInSystemPath(t *testing.T) {
+	r, sys := t.TempDir(), t.TempDir()
+	dir := filepath.Join(sys, "fn")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	art, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer art.Close()
+	rr, rw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rr.Close()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$", "--", "stage", r, sys, dir)
+	cmd.ExtraFiles = []*os.File{rw, nil, nil, art} // fd 3, the result; fd 6, artifactFD
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Geteuid(), Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getegid(), Size: 1}}}
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		rw.Close()
+		if os.Getenv("OPENVIBE_WORKER_TESTS") == "require" {
+			t.Fatal(err)
+		}
+		t.Skipf("no user and mount namespace here: %v", err)
+	}
+	rw.Close()
+	defer func() { in.Close(); _ = cmd.Wait() }()
+	res := bufio.NewReader(rr)
+	if line, err := res.ReadString('\n'); line != "staged\n" {
+		t.Fatalf("staging: %q %v", line, err)
+	}
+	l, err := net.Listen("unix", filepath.Join(dir, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := syscall.Mkfifo(filepath.Join(dir, "f"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	fifo, err := os.OpenFile(filepath.Join(dir, "f"), os.O_RDONLY|syscall.O_NONBLOCK, 0) // a reader, so a writer could open it
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fifo.Close()
+	if err := os.WriteFile(filepath.Join(sys, "late"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in.Close()
+	var out map[string]string
+	if err := json.NewDecoder(res).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out["copy"] != "" {
+		t.Fatal(out["copy"])
+	}
+	if want := r + dir; out["in root"] != want {
+		t.Errorf("/abs/fn, a symlink to %s/fn, leads to %q in the root, want %s", sys, out["in root"], want)
+	}
+	for _, k := range []string{"dial socket", "open FIFO"} {
+		if !strings.Contains(out[k], "no such file or directory") {
+			t.Errorf("%s: %s, want no such file or directory", k, out[k])
+		}
+	}
+	if out["artifact file"] != "<nil>" || out["system path file"] != "<nil>" {
+		t.Errorf("the copy lacks the artifact's file (%s), or the bound system path does not show the host's (%s)",
+			out["artifact file"], out["system path file"])
+	}
+}
+
+// TestArtifactRoute: an artifact directory whose path crosses a directory of a bound system path that a host user
+// other than root or the Node's own could change is refused, as the Node opens it for a job and at boot: in such a
+// directory a host writer could, after every check, switch a symlink on the path (or rename a directory on it) so that
+// the job's path leads to a live host directory holding a socket or FIFO. A path that leaves the bound paths is the
+// private root's own, writable by anyone on the host or not.
+func TestArtifactRoute(t *testing.T) {
+	sys := t.TempDir() // bound in every private root as /usr is
+	for _, d := range []string{"real", "pub"} {
+		if err := os.Mkdir(filepath.Join(sys, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(sys, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(sys, "fn")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../real", filepath.Join(sys, "pub", "fn")); err != nil {
+		t.Fatal(err)
+	}
+	binds, links := []hostBind{{path: sys}}, []linkSpec{{"/abs", sys}}
+	for _, a := range []string{sys + "/real", sys + "/fn", "/abs/fn", "/abs/pub/../real", sys + "/pub/fn"} {
+		if err := checkRoute(binds, links, a, trustedUIDs()); err != nil {
+			t.Errorf("artifact %s on a path only its owner may change: %v", a, err)
+		}
+	}
+	if err := checkRoute(binds, links, sys+"/real", []uint32{uint32(os.Geteuid()) + 1}); err == nil ||
+		!strings.Contains(err.Error(), "crosses "+sys+",") {
+		t.Errorf("artifact in a directory another user owns: %v, want refused", err)
+	}
+	if err := os.Chmod(filepath.Join(sys, "pub"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []string{sys + "/pub/fn", "/abs/pub/fn", sys + "/pub/fn/sub"} {
+		if err := checkRoute(binds, links, a, trustedUIDs()); err == nil || !strings.Contains(err.Error(), "crosses "+sys+"/pub,") {
+			t.Errorf("artifact %s through a symlink in a world-writable directory: %v, want refused", a, err)
+		}
+	}
+	if f, err := openArtifact(nil, binds, links, sys+"/pub/fn"); err == nil || !strings.Contains(err.Error(), "could change") {
+		if f != nil {
+			f.Close()
+		}
+		t.Errorf("openArtifact %s/pub/fn: %v, want refused", sys, err)
+	}
+	priv := t.TempDir()
+	if err := os.Chmod(priv, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkRoute(binds, links, priv+"/fn", trustedUIDs()); err != nil {
+		t.Errorf("artifact outside the bound paths: %v", err)
+	}
+	binds, links, err := rootPlan(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkRoute(binds, links, "/usr/bin", trustedUIDs()); err != nil {
+		t.Errorf("/usr/bin: %v", err)
+	}
+	cfg := helperConfig(t, config.WorkerCaps{}, "env")
+	cfg.Functions[0].ArtifactDir = sys + "/pub/fn"
+	saved := systemPaths
+	systemPaths = append(slices.Clip(systemPaths), sys)
+	t.Cleanup(func() { systemPaths = saved })
+	w := New(cfg, (&sink{}).send, quiet())
+	t.Cleanup(w.Close)
+	if err := w.Probe(); err == nil || !strings.Contains(err.Error(), "could change") {
+		t.Fatalf("probe with artifact_dir %s/pub/fn: %v, want refused", sys, err)
+	}
+}
+
+// TestArtifactRouteSwitched: a directory on a job's path to its artifact, in a bound system path, became
+// world-writable after boot, and the host switches the symlink there to a host directory holding a socket and a FIFO
+// once the job was submitted: the job never runs, so it reaches neither.
+func TestArtifactRouteSwitched(t *testing.T) {
+	sys := t.TempDir() // bound in every private root as /usr is
+	saved := systemPaths
+	systemPaths = append(slices.Clip(systemPaths), sys)
+	t.Cleanup(func() { systemPaths = saved })
+	cfg := helperConfig(t, config.WorkerCaps{MaxMemBytes: 8 << 30}, "snapshot")
+	real, other, pub := filepath.Join(sys, "real"), filepath.Join(sys, "other"), filepath.Join(sys, "pub")
+	for _, d := range []string{real, other, pub} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, d := range []string{filepath.Dir(sys), sys} {
+		if err := os.Chmod(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moveHelper(t, &cfg, real)
+	if err := os.Link(cfg.Functions[0].Command[0], filepath.Join(other, "worker.test")); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(pub, "fn")
+	if err := os.Symlink("../real", link); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Functions[0].ArtifactDir, cfg.Functions[0].Command[0] = link, filepath.Join(link, "worker.test")
+	w, s := newRunWorkerConfig(t, cfg) // the probe passes: only the Node's user may change the path yet
+	if err := os.Chmod(pub, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	log := &logBuf{}
+	w.log = slog.New(slog.NewTextHandler(log, nil))
+	j := testJob(1, "snapshot")
+	run(t, w, j)
+	l, err := net.Listen("unix", filepath.Join(other, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := syscall.Mkfifo(filepath.Join(other, "f"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(other, "s"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../other", link+".new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(link+".new", link); err != nil {
+		t.Fatal(err)
+	}
+	ex := s.exit(t, j.ID)
+	if ex.Reason != protocol.ExitFailed || ex.Usage.StartedMS != nil || s.count(protocol.TypeJobStarted, j.ID) != 0 {
+		t.Fatalf("a job whose artifact path a host user could switch: %+v %s", ex, ex.Result)
+	}
+	if !strings.Contains(log.String(), "could change") {
+		t.Fatalf("the job failed for another reason:\n%s", log.String())
+	}
+}
+
+// moveHelper makes the directory dir the artifact directory of cfg's function: the test binary is linked (or copied)
+// there and run from there.
+func moveHelper(t *testing.T, cfg *config.WorkerConfig, dir string) {
+	t.Helper()
+	exe := filepath.Join(dir, "worker.test")
+	if err := os.Link(cfg.Functions[0].Command[0], exe); err != nil {
+		b, err := os.ReadFile(cfg.Functions[0].Command[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(exe, b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg.Functions[0].Command[0] = exe
+}
+
+// TestArtifactUnreachable: a job's user must reach its artifact directory by its path: one under a directory it may
+// not search fails the job without running, though the Node (root) opens it; once that directory may be searched, the
+// job runs (as root only: otherwise jobs run as the Node's own user, who could not open it either).
+func TestArtifactUnreachable(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("jobs run as the Node's own user unless it is root")
+	}
+	cfg := helperConfig(t, config.WorkerCaps{MaxMemBytes: 8 << 30}, "quick")
+	top := t.TempDir()
+	if err := os.Chmod(filepath.Dir(top), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(top, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(top, "fn")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	moveHelper(t, &cfg, dir)
+	w, s := newRunWorkerConfig(t, cfg)
+	log := &logBuf{}
+	w.log = slog.New(slog.NewTextHandler(log, nil))
+	j := testJob(1, "quick")
+	run(t, w, j)
+	ex := s.exit(t, j.ID)
+	if ex.Reason != protocol.ExitFailed || ex.Usage.StartedMS != nil || s.count(protocol.TypeJobStarted, j.ID) != 0 {
+		t.Fatalf("an artifact directory its user may not reach: %+v", ex)
+	}
+	if !strings.Contains(log.String(), "permission denied") {
+		t.Fatalf("an artifact directory its user may not reach: the job failed for another reason:\n%s", log.String())
+	}
+	if err := os.Chmod(top, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	j = testJob(2, "quick")
+	run(t, w, j)
+	if ex := s.exit(t, j.ID); ex.Reason != protocol.ExitExited || string(ex.Result) != `{"ok":true}` {
+		t.Fatalf("an artifact directory its user may reach: %+v %s", ex, ex.Result)
+	}
+}
+
+// TestIOMaxVerified: a job's cgroup holds io.max for every whole block device with a medium, read back from the
+// kernel, and a device whose io.max is not the job's (as when the kernel ignores a value) keeps the job from running.
+func TestIOMaxVerified(t *testing.T) {
+	newRunWorker(t, config.WorkerCaps{}, "quick") // skips where jobs cannot run sandboxed
+	caps := config.WorkerCaps{MaxIOBps: 3 << 20, MaxIOPS: 300}.WithDefaults()
+	cg, err := newJobCgroup(caps, protocol.JobLimits{MemBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cg.remove()
+	devs, err := blockDevices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(cg.dir, "io.max"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range devs {
+		if !strings.Contains(string(b), d+" rbps=3145728 wbps=3145728 riops=300 wiops=300\n") {
+			t.Errorf("block device %s is not limited in io.max:\n%s", d, b)
+		}
+	}
+	if len(devs) == 0 {
+		t.Skip("no block device to limit")
+	}
+	cg.io = "rbps=3145728 wbps=3145728 riops=301 wiops=300"
+	if err := cg.checkIO(); err == nil || !strings.Contains(err.Error(), devs[0]) {
+		t.Fatalf("io.max that is not the job's: %v, want refused", err)
+	}
+}
+
+// TestBlockDevicesUnreadable: a disk whose dev (or size) cannot be read is an error, never a disk left without io.max;
+// an empty disk and a hidden one are not limited; a disk without a hidden attribute (an older kernel) is.
+func TestBlockDevicesUnreadable(t *testing.T) {
+	sys := t.TempDir()
+	disk := func(name string, attrs map[string]string) {
+		if err := os.Mkdir(filepath.Join(sys, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range attrs {
+			if err := os.WriteFile(filepath.Join(sys, name, k), []byte(v+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	disk("sda", map[string]string{"dev": "8:0", "size": "100", "hidden": "0"})
+	disk("sr0", map[string]string{"dev": "11:0", "size": "0", "hidden": "0"})
+	disk("nvme0c0n1", map[string]string{"dev": "259:1", "size": "100", "hidden": "1"})
+	disk("vda", map[string]string{"dev": "252:0", "size": "100"})
+	devs, err := blockDevicesIn(sys)
+	if err != nil || !slices.Equal(devs, []string{"8:0", "252:0"}) {
+		t.Fatalf("block devices %v, %v; want [8:0 252:0]", devs, err)
+	}
+	// dev a directory: unreadable even by root.
+	disk("sdb", map[string]string{"size": "100", "hidden": "0"})
+	if err := os.Mkdir(filepath.Join(sys, "sdb", "dev"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if devs, err := blockDevicesIn(sys); err == nil || !strings.Contains(err.Error(), "sdb") {
+		t.Fatalf("a disk whose dev cannot be read: %v, %v; want an error", devs, err)
+	}
+	if err := os.Remove(filepath.Join(sys, "sdb", "dev")); err != nil {
+		t.Fatal(err)
+	}
+	if devs, err := blockDevicesIn(sys); err == nil || !strings.Contains(err.Error(), "sdb") {
+		t.Fatalf("a disk without dev: %v, %v; want an error", devs, err)
+	}
+}
+
+// TestCAStaged: of the CA directories, a job's root gets only the X.509 certificates, each file rewritten with its
+// CERTIFICATE blocks alone: a private key filed with them (alone, in a bundle, in a subdirectory or in a mount nested
+// there, as root) and a file holding no certificate never reach it; symlinks are kept as they are.
+func TestCAStaged(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test CA"},
+		NotBefore: time.Now(), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kder, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	priv := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kder})
+	fake := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: kder}) // a key labelled a certificate
+	src := t.TempDir()
+	certs := filepath.Join(src, "certs")
+	write := func(p string, b []byte) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(certs, "ca.pem"), cert)
+	write(filepath.Join(certs, "bundle.crt"), slices.Concat([]byte("# a comment\n"), cert, priv, fake, []byte("MIIB...raw\n"), cert))
+	write(filepath.Join(certs, "server.key"), priv)
+	write(filepath.Join(certs, "java", "cacerts"), kder)
+	write(filepath.Join(certs, "sub", "ca.pem"), cert)
+	write(filepath.Join(certs, "sub", "server.key"), slices.Concat(priv, fake))
+	if err := os.Symlink("ca.pem", filepath.Join(certs, "1a2b3c4d.0")); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		mnt := filepath.Join(certs, "mnt")
+		if err := os.Mkdir(mnt, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mount("tmpfs", mnt, "tmpfs", 0, "mode=0755,size=1m"); err != nil {
+			t.Fatal(err)
+		}
+		defer syscall.Unmount(mnt, syscall.MNT_DETACH)
+		write(filepath.Join(mnt, "server.key"), priv)
+		write(filepath.Join(mnt, "server.pem"), slices.Concat(cert, priv))
+	}
+	r := t.TempDir()
+	if err := stageCA(r, []string{certs, filepath.Join(src, "absent.pem")}); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	err = filepath.WalkDir(r, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(r+certs, p)
+		if d.Type()&fs.ModeSymlink != 0 {
+			l, err := os.Readlink(p)
+			got[rel] = "-> " + l
+			return err
+		}
+		b, err := os.ReadFile(p)
+		got[rel] = string(b)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"ca.pem": string(cert), "bundle.crt": string(cert) + string(cert),
+		"sub/ca.pem": string(cert), "1a2b3c4d.0": "-> ca.pem"}
+	if os.Geteuid() == 0 {
+		want["mnt/server.pem"] = string(cert)
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("staged %v\nwant %v", got, want)
+	}
+}
+
+// TestShortLivedJob: a function that exits at once still starts, and its result and code arrive: the Node checks its
+// confinement and sets RLIMIT_CPU while the sandbox init waits to execute it, never once it may have ended.
+func TestShortLivedJob(t *testing.T) {
+	w, s := newRunWorker(t, config.WorkerCaps{}, "quick")
+	for i := 1; i <= 10; i++ {
+		j := testJob(i, "quick")
+		run(t, w, j)
+		ex := s.exit(t, j.ID)
+		if ex.Reason != protocol.ExitExited || ex.Code == nil || *ex.Code != 0 || string(ex.Result) != `{"ok":true}` ||
+			s.count(protocol.TypeJobStarted, j.ID) != 1 {
+			t.Fatalf("%s: %+v %s", j.ID, ex, ex.Result)
+		}
+	}
+}
+
+// TestForkBomb: pids.max and RLIMIT_NPROC stop a job that starts processes without end; the Node is untouched and the
+// job ends when its first process exits, taking the others with it.
+func TestForkBomb(t *testing.T) {
+	const pids = 32
+	w, s := newRunWorker(t, config.WorkerCaps{MaxPids: pids}, "forkbomb")
+	j := testJob(1, "forkbomb")
+	begin := time.Now()
+	run(t, w, j)
+	ex := s.exit(t, j.ID)
+	var r struct {
+		Started int
+		Err     string
+	}
+	if err := json.Unmarshal(ex.Result, &r); err != nil || ex.Reason != protocol.ExitExited {
+		t.Fatalf("%+v %s: %v", ex, ex.Result, err)
+	}
+	if r.Err == "<nil>" || r.Started >= pids {
+		t.Fatalf("started %d processes (max_pids %d), last error %s", r.Started, pids, r.Err)
+	}
+	if d := time.Since(begin); d > 30*time.Second {
+		t.Fatalf("the job's processes outlived it: it ended after %s", d)
+	}
+}
+
+// TestEgressPolicy: only egress none is enforced; with another policy the probe fails (the class is not advertised)
+// and a job fails without running.
+func TestEgressPolicy(t *testing.T) {
+	for _, e := range []string{config.EgressPublic, config.EgressOpenVibeOnly} {
+		s := &sink{}
+		cfg := helperConfig(t, config.WorkerCaps{}, "env")
+		cfg.Egress = e
+		w := New(cfg, s.send, quiet())
+		t.Cleanup(w.Close)
+		if err := w.Probe(); err == nil || !strings.Contains(err.Error(), "egress") {
+			t.Fatalf("%s: probe %v, want refused", e, err)
+		}
+		j := testJob(1, "env")
+		run(t, w, j)
+		if ex := s.exit(t, j.ID); ex.Reason != protocol.ExitFailed || ex.Usage.StartedMS != nil || s.count(protocol.TypeJobStarted, j.ID) != 0 {
+			t.Fatalf("%s: %+v", e, ex)
+		}
+	}
+}
+
+// TestRootPlan: the private root holds the device nodes; no bind is, holds or lies in /etc/ssl, /etc/pki (whose CA
+// certificates are copied, not bound), the Node's directories nor /var; a system path holding a Node directory is
+// refused.
+func TestRootPlan(t *testing.T) {
+	if _, _, err := rootPlan([]string{"/usr/local/openvibe-node"}); err == nil {
+		t.Error("a Node directory in /usr was not refused")
+	}
+	binds, _, err := rootPlan([]string{"/var/lib/openvibe-node", "/etc/openvibe-node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range binds {
+		if _, ok := overlaps(b.path, []string{"/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/shadow"}); ok ||
+			under(b.path, []string{"/var", "/etc/openvibe-node", "/home", "/root", "/run"}) {
+			t.Errorf("%s is bound", b.path)
+		}
+	}
+	if !slices.ContainsFunc(binds, func(b hostBind) bool { return b.path == "/dev/null" && b.dev }) {
+		t.Error("/dev/null is not bound")
+	}
+}
+
+// TestArtifactRefused: an artifact directory that is, holds or lies in the host's kernel interfaces, runtime sockets,
+// configuration or the Node's directories, or that is or holds a shared directory, is refused; one whose tree holds a
+// Unix socket or a FIFO is refused at boot; a function with one keeps the probe from passing; and the directory a job
+// opens is checked where its path leads at that moment.
+func TestArtifactRefused(t *testing.T) {
+	for _, a := range []string{"/", "/run", "/run/user", "/var/run", "/var", "/proc/1/root", "/sys", "/dev", "/etc",
+		"/tmp", "/var/tmp", "/home"} {
+		if err := checkArtifact(nil, a); err == nil {
+			t.Errorf("artifact %s was not refused", a)
+		}
+	}
+	for _, c := range []struct{ node, artifact string }{{"/srv/ov/state", "/srv/ov"}, {"/srv/ov", "/srv/ov/bin"},
+		{"/srv/ov", "/srv/ov"}} {
+		if err := checkArtifact([]string{c.node}, c.artifact); err == nil {
+			t.Errorf("artifact %s with the Node in %s was not refused", c.artifact, c.node)
+		}
+	}
+	dir := t.TempDir()
+	if err := checkArtifact(nil, dir); err != nil {
+		t.Fatalf("artifact %s: %v", dir, err)
+	}
+	if err := scanArtifact(dir); err != nil {
+		t.Fatalf("artifact %s: %v", dir, err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("unix", filepath.Join(dir, "sub", "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scanArtifact(dir); err == nil || !strings.Contains(err.Error(), "socket") {
+		t.Errorf("artifact holding a Unix socket: %v", err)
+	}
+	l.Close()
+	if err := syscall.Mkfifo(filepath.Join(dir, "f"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanArtifact(dir); err == nil || !strings.Contains(err.Error(), "FIFO") {
+		t.Errorf("artifact holding a FIFO: %v", err)
+	}
+	// A path swapped for a symlink to a host-only directory after boot: the directory opened is refused.
+	link := filepath.Join(t.TempDir(), "fn")
+	if err := os.Symlink("/run", link); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := openArtifact(nil, nil, nil, link); err == nil || !strings.Contains(err.Error(), "/run") {
+		if f != nil {
+			f.Close()
+		}
+		t.Errorf("artifact %s leading to /run: %v, want refused", link, err)
+	}
+	binds, links, err := rootPlan(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, err := openArtifact(nil, binds, links, "/usr/bin"); f == nil || err != nil {
+		t.Errorf("artifact in a system path: %v %v, want it copied as any other", f, err)
+	} else {
+		f.Close()
+	}
+	cfg := helperConfig(t, config.WorkerCaps{}, "env")
+	cfg.Functions[0].ArtifactDir = "/run"
+	w := New(cfg, (&sink{}).send, quiet())
+	t.Cleanup(w.Close)
+	if err := w.Probe(); err == nil || !strings.Contains(err.Error(), "/run") {
+		t.Fatalf("probe with artifact_dir /run: %v, want refused", err)
+	}
+}
+
+// TestUsageSecondsContiguous: a function that holds for several whole wall-clock seconds after job_started sends
+// exactly one job_usage for each fully elapsed second, `second` 0 then 1 then ... with no gap and no duplicate, and
+// its job_exit's usage is never smaller than the seconds already sent (wall_ms >= (n+1)*1000 for every second n).
+func TestUsageSecondsContiguous(t *testing.T) {
+	// A job runs only sandboxed (there is no unconfined mode, even for a test): this runs where the sandbox can.
+	cfg := helperConfig(t, config.WorkerCaps{MaxMemBytes: 8 << 30})
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Functions = []config.FunctionConfig{{Name: "meter", Version: "1.0.0",
+		Command: []string{exe, "-test.run=^TestUsageHelperProcess$", "--", "meter"}, Env: map[string]string{"GOMAXPROCS": "2"}}}
+	w, s := newRunWorkerConfig(t, cfg)
+
+	const holdMS = 2500 // two whole seconds, so seconds 0 and 1 are sent before the exit
+	j := testJob(1, "meter")
+	j.Args = json.RawMessage(fmt.Sprintf(`{"hold_ms":%d}`, holdMS))
+	if f, r := w.Admit(j); f != "" {
+		t.Fatalf("%s %s", f, r)
+	}
+	w.Launch(j.ID)
+	ex := s.exit(t, j.ID)
+	if ex.Reason != protocol.ExitExited || ex.Code == nil || *ex.Code != 0 || ex.Usage.StartedMS == nil {
+		t.Fatalf("%+v", ex)
+	}
+	if n := s.count(protocol.TypeJobStarted, j.ID); n != 1 {
+		t.Fatalf("job_started sent %d times, want 1", n)
+	}
+	started := s.wait(t, protocol.TypeJobStarted, j.ID, 1, 5*time.Second).(protocol.JobStarted)
+	if started.StartedMS != *ex.Usage.StartedMS {
+		t.Fatalf("job_started at %d, job_exit usage at %d", started.StartedMS, *ex.Usage.StartedMS)
+	}
+	var seconds []int64
+	for _, m := range s.all() {
+		u, ok := m.(protocol.JobUsage)
+		if !ok || u.ID != j.ID {
+			continue
+		}
+		if u.StartedMS != *ex.Usage.StartedMS || u.CPUMS == nil {
+			t.Fatalf("usage %+v", u)
+		}
+		seconds = append(seconds, u.Second)
+	}
+	if len(seconds) < 2 {
+		t.Fatalf("usage seconds %v, want 0..n-1 for a job that held %d ms", seconds, holdMS)
+	}
+	for n, second := range seconds {
+		if second != int64(n) {
+			t.Fatalf("usage seconds %v, want 0..%d with no gap or duplicate", seconds, len(seconds)-1)
+		}
+		if ex.Usage.WallMS < (second+1)*1000 {
+			t.Fatalf("usage second %d sent but wall_ms is %d, want at least %d", second, ex.Usage.WallMS, (second+1)*1000)
+		}
+	}
+}
+
+// TestSeccompFilter: the program fits the kernel's limit and every jump lands inside it.
+func TestSeccompFilter(t *testing.T) {
+	p, err := seccompFilter()
+	if err != nil {
+		t.Skip(err)
+	}
+	if len(p) > 4096 {
+		t.Fatalf("%d instructions", len(p))
+	}
+	for i, ins := range p {
+		if ins.Code&0x07 == 0x05 && (i+1+int(ins.Jt) >= len(p) || i+1+int(ins.Jf) >= len(p)) {
+			t.Fatalf("instruction %d jumps out of the program: %+v", i, ins)
+		}
+	}
+	if last := p[len(p)-1]; last.Code != 0x06 {
+		t.Fatalf("the program does not end in a return: %+v", last)
 	}
 }
