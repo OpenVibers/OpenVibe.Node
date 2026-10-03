@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -97,12 +98,21 @@ func startWorkerNode(t *testing.T) *env {
 	e := &env{t: t, srv: srv, node: n, paths: paths, cancel: cancel, done: done}
 	t.Cleanup(e.stop)
 	e.conn = e.nextConn()
-	_, err = e.conn.Expect(protocol.TypeStatus, 10*time.Second, func(m protocol.Message) bool {
+	f, err := e.conn.Expect(protocol.TypeStatus, 10*time.Second, func(m protocol.Message) bool {
 		_, ok := m.(protocol.Status).Capabilities[protocol.CapWorker]
 		return ok
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	caps := cfg.Worker.Caps.WithDefaults()
+	want := map[string]any{"runtime_classes": []any{protocol.ClassFunction}, "max_jobs": float64(caps.MaxJobs),
+		"max_ttl_ms": float64(caps.MaxTTLMS), "max_wall_ms": float64(caps.MaxWallMS),
+		"max_cpu_ms": float64(caps.MaxCPUMS), "max_mem_bytes": float64(caps.MaxMemBytes),
+		"max_output_bytes": float64(caps.MaxOutputBytes)}
+	got := f.Msg.(protocol.Status).Capabilities[protocol.CapWorker]
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("worker capability = %#v, want %#v", got, want)
 	}
 	return e
 }

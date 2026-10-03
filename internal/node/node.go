@@ -815,7 +815,10 @@ func (n *Node) sendStatus() {
 		}
 	}
 	if c := n.jobs.runtimeClasses(); len(c) > 0 {
-		s.Capabilities[protocol.CapWorker] = protocol.WorkerCapabilities{RuntimeClasses: c}
+		caps := n.opt.Config.Worker.Caps.WithDefaults()
+		s.Capabilities[protocol.CapWorker] = protocol.WorkerCapabilities{RuntimeClasses: c, MaxJobs: caps.MaxJobs,
+			MaxTTLMS: caps.MaxTTLMS, MaxWallMS: caps.MaxWallMS, MaxCPUMS: caps.MaxCPUMS,
+			MaxMemBytes: caps.MaxMemBytes, MaxOutputBytes: caps.MaxOutputBytes}
 	}
 	if n.pub != nil {
 		s.Video = n.pub.State()
