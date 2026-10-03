@@ -7,17 +7,17 @@ ports, works behind any home router), and a local kill switch stops everything i
 
 1. On openvibe.bot, add a robot. You get a code like `ABCD-1234` (valid 10 minutes) and the installer command with
    the robot's id filled in.
-2. On the device, run that command and add the driver:
+2. On the device, run that command, adding `--driver` for your robot:
 
    ```sh
    curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X --code ABCD-1234 --driver adeept
    ```
 
-   `--robot` is the robot's `rob_…` id and `--code` the pairing code (both from openvibe.bot; the code may also be the
-   first argument). `--driver` is `adeept` (Adeept 4WD Smart Car, ordinary wheels), `adeept-mecanum`, `cozmo`, or
+   The shape is `--robot rob_… --code CODE [--driver adeept|adeept-mecanum|cozmo|none]`. `--robot` is the robot's
+   `rob_…` id and `--code` the pairing code (both from openvibe.bot; the code may also be the first argument).
+   `--driver` names the plugin: `adeept` (Adeept 4WD Smart Car, ordinary wheels), `adeept-mecanum`, `cozmo`, or
    `none` (the default: the dry-run plugin with a test-pattern camera, for trying the Node on a laptop). `--name NAME`
-   names the device on openvibe.bot (default: the hostname). The old form `--robot adeept` (a driver kind after
-   `--robot`) still works but is deprecated: the installer warns and treats it as `--driver adeept`.
+   names the device on openvibe.bot (default: the hostname).
 3. Confirm the new device on openvibe.bot.
 
 The installer detects the OS and CPU (linux amd64/arm64/armv7, macOS amd64/arm64), downloads the binary and the plugin
