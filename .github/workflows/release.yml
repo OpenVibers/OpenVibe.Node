@@ -23,6 +23,14 @@ jobs:
       - run: |
           for p in sdk dryrun adeept_adr036 cozmo; do python -m pytest -q plugins/$p/tests; done
       - run: scripts/dist.sh "${GITHUB_REF_NAME}"
+      # Every release must carry the installer OpenVibe.Bot's GET /install route and BOT_INSTALLER_SOURCE_URL are
+      # documented to serve (releases/latest/download/install.sh), the plugin bundle the installer downloads, and the
+      # checksums it verifies them against.
+      - name: the release carries the assets the installer and OpenVibe.Bot depend on
+        run: |
+          test -s dist/install.sh
+          test -s dist/openvibe-node-plugins.tar.gz
+          test -s dist/SHA256SUMS
       - name: publish the release
         env:
           GH_TOKEN: ${{ github.token }}
