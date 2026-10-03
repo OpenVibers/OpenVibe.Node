@@ -115,7 +115,8 @@ func pidNS(pid int) (string, error) { return os.Readlink("/proc/" + strconv.Itoa
 // sampleProcs sums the CPU time and resident memory of every process in the job's PID namespace ns (the leader alone
 // while ns is unknown), so a process that left the process group is still counted.
 func sampleProcs(pid int, ns string) (cpuMS, rssBytes int64, err error) {
-	if ns == "" {
+	if mine, err := pidNS(os.Getpid()); ns == "" || err != nil || ns == mine {
+		// A job in the Node's own PID namespace (no isolation) shares it with the whole host: count the leader only.
 		return statOf(pid)
 	}
 	ents, err := os.ReadDir("/proc")
