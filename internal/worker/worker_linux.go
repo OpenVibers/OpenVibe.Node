@@ -110,7 +110,18 @@ func limitCPU(pid int, cpuMS int64) error {
 	return nil
 }
 
-func pidNS(pid int) (string, error) { return os.Readlink("/proc/" + strconv.Itoa(pid) + "/ns/pid") }
+// pidNS is the PID namespace of pid, or "" when it is the Node's own: a job that did not get a namespace of its own
+// must not be metered as every process on the host.
+func pidNS(pid int) (string, error) {
+	ns, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/ns/pid")
+	if err != nil {
+		return "", err
+	}
+	if self, err := os.Readlink("/proc/self/ns/pid"); err == nil && self == ns {
+		return "", nil
+	}
+	return ns, nil
+}
 
 // sampleProcs sums the CPU time and resident memory of every process in the job's PID namespace ns (the leader alone
 // while ns is unknown), so a process that left the process group is still counted.
