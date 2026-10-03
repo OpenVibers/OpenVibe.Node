@@ -64,6 +64,10 @@ Enable I2C and SPI (`raspi-config`), then `pip install './plugins/sdk' './plugin
 Telemetry (2 Hz): `battery {volts, percent, low}`, `sensors {distance_cm, line {left, middle, right}}` and `faults`
 (sensors that failed to open or read; driving keeps working). A PCA9685 failure is a `hardware` fault at setup.
 
+**OLED / `display`:** not supported (deferred). The plugin advertises no `display` capability and drives no OLED; the
+`adeept.adr036` profile has no display widget either, so this waits on a profile change rather than shipping a
+capability the panel cannot use. A `display` command is nacked like any other unsupported kind.
+
 ## Test
 
 ```

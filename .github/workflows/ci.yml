@@ -51,6 +51,8 @@ jobs:
         with:
           go-version-file: go.mod
       - run: scripts/dist.sh ci
+      # OpenVibe.Bot's /install route and BOT_INSTALLER_SOURCE_URL are documented to serve this exact release asset.
+      - run: test -s dist/install.sh && cmp -s install/install.sh dist/install.sh
       - run: ls -l dist && cat dist/SHA256SUMS
 
   go-other-os:

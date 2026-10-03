@@ -71,8 +71,11 @@ describes itself and waits for EOF without opening any hardware.
 | `video`     | `format` (`jpeg`), `path`, optional `width`, `height`, `seq`                                |
 
 For `video`, the plugin writes each frame to a file (write to a temporary name, then rename, and rotate a few names so
-a slow reader never sees a partial file) and announces it. The core reads the file at once and encodes it: with
-`ffmpeg` if installed, otherwise with its built-in encoder at up to 5 frames per second.
+a slow reader never sees a partial file) and announces it with `{"op": "video", "format": "jpeg", "path": …}`
+(`emit_video` in [`plugins/sdk`](../plugins/sdk)). The core reads the file at once and encodes it: with `ffmpeg` if
+installed, otherwise with its built-in encoder at up to 5 frames per second. The core side of this contract is
+`JPEGSource` in [`internal/video/sources.go`](../internal/video/sources.go#L298), selected when the plugin's
+`describe` advertises `camera.jpeg: true` (`internal/node/node.go`).
 
 ## Safety rules (every plugin)
 
