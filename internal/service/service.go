@@ -84,6 +84,7 @@ func config(opt Options) *ks.Config {
 			"OnFailure":              "restart", // Windows
 			"OnFailureDelayDuration": "5s",
 			"DelayedAutoStart":       false,
+			"SystemdScript":          systemdScript,
 		},
 	}
 	if runtime.GOOS == "darwin" {
@@ -92,6 +93,36 @@ func config(opt Options) *ks.Config {
 	}
 	return c
 }
+
+// systemdScript is kardianos/service's systemd unit with Delegate=yes: the worker makes a cgroup per job inside the
+// Node's own (internal/worker), which systemd allows only in a delegated cgroup.
+const systemdScript = `[Unit]
+Description={{Description}}
+ConditionFileIsExecutable={{Path | cmdEscape}}
+{{range Dependencies}}{{.}}
+{{end}}
+[Service]
+StartLimitInterval=5
+StartLimitBurst=10
+ExecStart={{Path | cmdEscape}}{{range Arguments}} {{. | cmd}}{{end}}
+{{if ChRoot}}RootDirectory={{ChRoot | cmd}}
+{{end}}{{if WorkingDirectory}}WorkingDirectory={{WorkingDirectory | cmdEscape}}
+{{end}}{{if UserName}}User={{UserName}}
+{{end}}{{if ReloadSignal}}ExecReload=/bin/kill -{{ReloadSignal}} "$MAINPID"
+{{end}}{{if PIDFile}}PIDFile={{PIDFile | cmd}}
+{{end}}{{if OutputFileSupport}}StandardOutput=file:{{LogDirectory}}/{{Name}}.out
+StandardError=file:{{LogDirectory}}/{{Name}}.err
+{{end}}{{if LimitNOFILE}}LimitNOFILE={{LimitNOFILE}}
+{{end}}{{if Restart}}Restart={{Restart}}
+{{end}}{{if SuccessExitStatus}}SuccessExitStatus={{SuccessExitStatus}}
+{{end}}RestartSec=120
+Delegate=yes
+EnvironmentFile=-/etc/sysconfig/{{Name}}
+
+{{range EnvVars}}{{.}}
+{{end}}[Install]
+WantedBy=multi-user.target
+`
 
 // Run runs program under the service manager, or in the foreground when started from a terminal.
 func Run(opt Options, run Program) error {

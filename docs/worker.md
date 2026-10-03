@@ -56,7 +56,8 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   to in the job's root, and the job fails unless its own path to it leads to the copy: point `artifact_dir` at the
   function's own directory, since a copy of all of `/usr/bin` does not fit `max_disk_bytes`. Every directory of a
   system path that its path crosses (as the job follows it: through `/lib` to `/usr/lib` or a symlink in `/usr`, say)
-  must belong to root (or the Node's own user) and be writable by no other user or group but root's, or the probe and
+  must belong to root (or the Node's own user) and be writable by no other user, nor by a group with any other member
+  (listed in `/etc/group` or by primary group in `/etc/passwd`; a group not in `/etc/group` counts as untrusted), or the probe and
   each job refuse it: there a host user could switch a symlink or rename a directory on the path while the job runs,
   and lead the job to a live host directory instead of its copy.
 - `run_as`: the unprivileged uid and gid jobs run as (not 0; no supplementary groups). It needs the Node to run as
@@ -94,9 +95,11 @@ exactly as with the worker off: there is no weaker mode. A job whose sandbox fai
 its function having run.
 
 Requirements: Linux 5.14 or later with cgroup v2; the Node's cgroup **delegated** to it (`Delegate=yes` on its
-systemd unit: `sudo systemctl edit openvibe-node`, add `[Service]` and `Delegate=yes`, restart; the service the
-install writes does not set it yet). The Node moves itself into an `openvibe-node` leaf of that cgroup and makes one
-`openvibe-job-*` cgroup per job beside it. On Ubuntu 24.04 and later, unprivileged user namespaces are restricted by
+systemd unit, which the service `openvibe-node install` writes sets; running `install.sh` again rewrites an older
+install's service, or add it by hand: `sudo systemctl edit openvibe-node`, add `[Service]` and `Delegate=yes`,
+restart). The Node moves itself into an `openvibe-node` leaf of that cgroup and makes one `openvibe-job-*` cgroup per
+job beside it; a cgroup that holds any process other than the Node and its children (a login session's, say) is not
+rearranged, and the worker stays off. On Ubuntu 24.04 and later, unprivileged user namespaces are restricted by
 AppArmor; a Node running as root with `run_as` is not affected.
 
 ## How a job runs

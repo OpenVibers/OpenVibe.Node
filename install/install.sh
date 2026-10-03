@@ -301,6 +301,9 @@ disable_stock_server
 
 # ---- service ----
 if [ "$SERVICE" = 1 ]; then
+	# An upgrade rewrites the service definition (this version's adds Delegate=yes, which the worker needs): the
+	# service manager refuses to install over an existing one. Config and credential are kept.
+	$SUDO "$BIN_DIR/openvibe-node" uninstall >/dev/null 2>&1 || true
 	if [ -n "$SVC_USER" ]; then
 		$SUDO "$BIN_DIR/openvibe-node" install --user "$SVC_USER" >/dev/null 2>&1 || $SUDO "$BIN_DIR/openvibe-node" install --user "$SVC_USER"
 	else

@@ -110,7 +110,9 @@ func setupCgroupBase() (string, error) {
 	}
 }
 
-// moveProcs moves every process of base into its openvibe-node leaf (none from the root cgroup).
+// moveProcs moves every process of base into its openvibe-node leaf (none from the root cgroup). They must all be the
+// Node and its descendants: a cgroup holding other processes (a login session's scope, the parent of a Node that
+// was moved into a leaf it does not own) is not the Node's to rearrange, and nothing moves.
 func moveProcs(base string) error {
 	if base == cgroupFS {
 		return nil
@@ -119,13 +121,41 @@ func moveProcs(base string) error {
 	if err != nil {
 		return err
 	}
-	for _, pid := range strings.Fields(string(b)) {
+	pids := strings.Fields(string(b))
+	for _, pid := range pids {
+		if n, _ := strconv.Atoi(pid); !ownProcess(n) {
+			return fmt.Errorf("%s holds process %s, which is not the Node's: run the Node as its own systemd service "+
+				"with Delegate=yes", base, pid)
+		}
+	}
+	for _, pid := range pids {
 		err := os.WriteFile(filepath.Join(base, nodeLeaf, "cgroup.procs"), []byte(pid), 0)
 		if err != nil && !errors.Is(err, syscall.ESRCH) {
 			return err
 		}
 	}
 	return nil
+}
+
+// ownProcess reports whether pid is the Node or one of its descendants. A process that has exited counts as the
+// Node's: moving it fails ESRCH, which moveProcs ignores.
+func ownProcess(pid int) bool {
+	self := os.Getpid()
+	for hops := 0; pid > 1 && hops < 4096; hops++ {
+		if pid == self {
+			return true
+		}
+		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if err != nil {
+			return errors.Is(err, fs.ErrNotExist) && hops == 0
+		}
+		f := strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:])) // after the comm, which may hold spaces
+		if len(f) < 2 {
+			return false
+		}
+		pid, _ = strconv.Atoi(f[1]) // ppid
+	}
+	return false
 }
 
 func hasWord(s, w string) bool {

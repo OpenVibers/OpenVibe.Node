@@ -798,10 +798,10 @@ func checkRoute(binds []hostBind, links []linkSpec, artifact string, trusted []u
 			if err := syscall.Stat(cur, &st); err != nil {
 				return fmt.Errorf("artifact directory %s: %s: %w", artifact, cur, err)
 			}
-			if !slices.Contains(trusted, st.Uid) || st.Mode&0o002 != 0 || st.Mode&0o020 != 0 && st.Gid != 0 {
+			if !slices.Contains(trusted, st.Uid) || st.Mode&0o002 != 0 || st.Mode&0o020 != 0 && !trustedGroup(st.Gid, trusted) {
 				return fmt.Errorf("artifact directory %s: its path crosses %s, which a host user could change while "+
-					"a job runs (owner %d, mode %#o): its directories in a system path must be root's and writable by "+
-					"root only", artifact, cur, st.Uid, st.Mode&0o7777)
+					"a job runs (owner %d, group %d, mode %#o): its directories in a system path must be root's and "+
+					"writable by root only", artifact, cur, st.Uid, st.Gid, st.Mode&0o7777)
 			}
 			fi, err := os.Lstat(next)
 			if err != nil {
@@ -826,6 +826,56 @@ func checkRoute(binds []hostBind, links []linkSpec, artifact string, trusted []u
 		rest = append(strings.Split(target, "/"), rest...)
 	}
 	return nil
+}
+
+// The account files trustedGroup reads.
+var passwdFile, groupFile = "/etc/passwd", "/etc/group"
+
+// trustedGroup reports whether every member of group gid is a trusted user: each user listed in it in groupFile and
+// each whose primary group it is in passwdFile. A group groupFile does not list (one from a directory service, whose
+// members the Node cannot see) or a member it cannot resolve is not trusted.
+func trustedGroup(gid uint32, trusted []uint32) bool {
+	g, err := os.ReadFile(groupFile)
+	if err != nil {
+		return false
+	}
+	p, err := os.ReadFile(passwdFile)
+	if err != nil {
+		return false
+	}
+	uids := map[string]uint32{}
+	for _, l := range strings.Split(string(p), "\n") {
+		f := strings.Split(l, ":") // name:password:uid:gid:...
+		if len(f) < 4 {
+			continue
+		}
+		uid, err1 := strconv.ParseUint(f[2], 10, 32)
+		pg, err2 := strconv.ParseUint(f[3], 10, 32)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		uids[f[0]] = uint32(uid)
+		if uint32(pg) == gid && !slices.Contains(trusted, uint32(uid)) {
+			return false
+		}
+	}
+	listed := false
+	for _, l := range strings.Split(string(g), "\n") {
+		f := strings.Split(l, ":") // name:password:gid:members
+		if len(f) < 4 || f[2] != strconv.FormatUint(uint64(gid), 10) {
+			continue
+		}
+		listed = true
+		for _, m := range strings.Split(f[3], ",") {
+			if m == "" {
+				continue
+			}
+			if uid, ok := uids[m]; !ok || !slices.Contains(trusted, uid) {
+				return false
+			}
+		}
+	}
+	return listed
 }
 
 // trustedUIDs are the host users who may change the path to an artifact directory (checkRoute): root and the Node's.

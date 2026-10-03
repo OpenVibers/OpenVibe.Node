@@ -739,6 +739,61 @@ func TestStageArtifactInSystemPath(t *testing.T) {
 	}
 }
 
+// TestOwnProcess: the Node moves only itself and its descendants out of its cgroup (moveProcs).
+func TestOwnProcess(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Wait()
+	defer cmd.Process.Kill()
+	if !ownProcess(os.Getpid()) || !ownProcess(cmd.Process.Pid) {
+		t.Error("the Node or its child is not the Node's")
+	}
+	if ownProcess(1) || ownProcess(os.Getppid()) {
+		t.Error("init or the Node's parent is the Node's")
+	}
+}
+
+// accounts points trustedGroup at these passwd and group files for the rest of the test.
+func accounts(t *testing.T, passwd, group string) {
+	dir := t.TempDir()
+	p, g := filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
+	if err := os.WriteFile(p, []byte(passwd), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(g, []byte(group), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	op, og := passwdFile, groupFile
+	passwdFile, groupFile = p, g
+	t.Cleanup(func() { passwdFile, groupFile = op, og })
+}
+
+// TestTrustedGroup: a group is trusted only when every member, listed or by primary group, is a trusted user.
+func TestTrustedGroup(t *testing.T) {
+	passwd := "root:x:0:0::/root:/bin/sh\nnode:x:1000:1000::/:/bin/sh\nops:x:1001:0::/:/bin/sh\nbob:x:1002:1002::/:/bin/sh\n"
+	accounts(t, passwd, "root:x:0:\nnode:x:1000:\nwheel:x:10:root,bob\nstaff:x:50:node,ghost\nbob:x:1002:\n")
+	for _, c := range []struct {
+		gid  uint32
+		want bool
+	}{
+		{0, false},    // ops (1001) has root's group as its primary group
+		{1000, true},  // the Node's own
+		{10, false},   // bob is listed
+		{50, false},   // ghost is no known user
+		{1002, false}, // bob's primary group
+		{77, false},   // not listed
+	} {
+		if got := trustedGroup(c.gid, []uint32{0, 1000}); got != c.want {
+			t.Errorf("trustedGroup(%d) = %v, want %v", c.gid, got, c.want)
+		}
+	}
+	if !trustedGroup(0, []uint32{0, 1000, 1001}) {
+		t.Error("root's group with trusted members only: not trusted")
+	}
+}
+
 // TestArtifactRoute: an artifact directory whose path crosses a directory of a bound system path that a host user
 // other than root or the Node's own could change is refused, as the Node opens it for a job and at boot: in such a
 // directory a host writer could, after every check, switch a symlink on the path (or rename a directory on it) so that
@@ -769,6 +824,27 @@ func TestArtifactRoute(t *testing.T) {
 	if err := checkRoute(binds, links, sys+"/real", []uint32{uint32(os.Geteuid()) + 1}); err == nil ||
 		!strings.Contains(err.Error(), "crosses "+sys+",") {
 		t.Errorf("artifact in a directory another user owns: %v, want refused", err)
+	}
+	// A group-writable directory: refused while a member of its group is not trusted, root's group included.
+	if err := os.Chmod(sys, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(sys, &st); err != nil {
+		t.Fatal(err)
+	}
+	gid, me := int(st.Gid), os.Geteuid()
+	accounts(t, fmt.Sprintf("root:x:0:0::/root:/bin/sh\nnode:x:%d:%d::/:/bin/sh\nmallory:x:%d:100::/:/bin/sh\n", me, gid, me+1),
+		fmt.Sprintf("root:x:0:\nnodes:x:%d:node,mallory\n", gid))
+	if err := checkRoute(binds, links, sys+"/real", trustedUIDs()); err == nil || !strings.Contains(err.Error(), "crosses "+sys+",") {
+		t.Errorf("artifact in a directory a group with an untrusted member may write: %v, want refused", err)
+	}
+	accounts(t, fmt.Sprintf("root:x:0:0::/root:/bin/sh\nnode:x:%d:%d::/:/bin/sh\n", me, gid), fmt.Sprintf("root:x:0:\nnodes:x:%d:node\n", gid))
+	if err := checkRoute(binds, links, sys+"/real", trustedUIDs()); err != nil {
+		t.Errorf("artifact in a directory only trusted users' group may write: %v", err)
+	}
+	if err := os.Chmod(sys, 0o755); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Chmod(filepath.Join(sys, "pub"), 0o777); err != nil {
 		t.Fatal(err)
