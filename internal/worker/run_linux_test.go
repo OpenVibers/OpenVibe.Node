@@ -795,7 +795,7 @@ func TestArtifactRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := checkRoute(binds, links, "/usr/bin", trustedUIDs()); err != nil {
+	if err := checkRoute(binds, links, "/usr/bin", trustedUIDs()); usrTrusted(t) != (err == nil) {
 		t.Errorf("/usr/bin: %v", err)
 	}
 	cfg := helperConfig(t, config.WorkerCaps{}, "env")
@@ -1223,7 +1223,11 @@ func TestArtifactRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f, err := openArtifact(nil, binds, links, "/usr/bin"); f == nil || err != nil {
+	if f, err := openArtifact(nil, binds, links, "/usr/bin"); !usrTrusted(t) {
+		if err == nil || !strings.Contains(err.Error(), "could change") {
+			t.Errorf("artifact in a system path whose owner is not mapped here: %v, want refused", err)
+		}
+	} else if f == nil || err != nil {
 		t.Errorf("artifact in a system path: %v %v, want it copied as any other", f, err)
 	} else {
 		f.Close()
@@ -1310,4 +1314,16 @@ func TestSeccompFilter(t *testing.T) {
 	if last := p[len(p)-1]; last.Code != 0x06 {
 		t.Fatalf("the program does not end in a return: %+v", last)
 	}
+}
+
+// usrTrusted reports whether /usr is root's (or this user's) as seen here. In a user namespace that does not map
+// the host's root, as some test sandboxes run, /usr shows the overflow owner (65534) and checkRoute refuses a path
+// through it: it cannot tell root from any other unmapped host user.
+func usrTrusted(t *testing.T) bool {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Stat("/usr", &st); err != nil {
+		t.Fatal(err)
+	}
+	return slices.Contains(trustedUIDs(), st.Uid)
 }
