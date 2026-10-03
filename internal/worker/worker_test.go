@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -217,5 +219,81 @@ func TestCloseEndsUnlaunched(t *testing.T) {
 	}
 	if f, _ := w.Admit(testJob(2, "sleep")); f != protocol.FaultShuttingDown {
 		t.Fatalf("admitted after Close: %q", f)
+	}
+}
+
+// TestUsageHelperProcess is the job's process for TestUsageSecondsContiguous when this test binary runs as the `meter`
+// function (`-- meter`): it holds for hold_ms from its args and exits 0 without writing a result.
+func TestUsageHelperProcess(t *testing.T) {
+	i := slices.Index(os.Args, "--")
+	if i < 0 || i+1 >= len(os.Args) || os.Args[i+1] != "meter" {
+		return
+	}
+	var args struct {
+		HoldMS int64 `json:"hold_ms"`
+	}
+	_ = json.NewDecoder(os.Stdin).Decode(&args)
+	time.Sleep(time.Duration(args.HoldMS) * time.Millisecond)
+	os.Exit(0)
+}
+
+// TestUsageSecondsContiguous: a function that holds for several whole wall-clock seconds after job_started sends
+// exactly one job_usage for each fully elapsed second, `second` 0 then 1 then ... with no gap and no duplicate, and
+// its job_exit's usage is never smaller than the seconds already sent (wall_ms >= (n+1)*1000 for every second n).
+func TestUsageSecondsContiguous(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("function jobs run on Linux only")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Isolation is not what this test measures: run the helper directly, without the job namespaces.
+	s := &sink{}
+	w := New(config.WorkerConfig{Enabled: true, AllowSameUser: true,
+		Functions: []config.FunctionConfig{{Name: "meter", Version: "1.0.0",
+			Command: []string{exe, "-test.run=^TestUsageHelperProcess$", "--", "meter"}}}}, s.send, quiet())
+	w.isolate = func(*exec.Cmd, config.WorkerConfig) error { return nil }
+	t.Cleanup(w.Close)
+
+	const holdMS = 2500 // two whole seconds, so seconds 0 and 1 are sent before the exit
+	j := testJob(1, "meter")
+	j.Args = json.RawMessage(fmt.Sprintf(`{"hold_ms":%d}`, holdMS))
+	if f, r := w.Admit(j); f != "" {
+		t.Fatalf("%s %s", f, r)
+	}
+	w.Launch(j.ID)
+	ex := s.exit(t, j.ID)
+	if ex.Reason != protocol.ExitExited || ex.Code == nil || *ex.Code != 0 || ex.Usage.StartedMS == nil {
+		t.Fatalf("%+v", ex)
+	}
+	if n := s.count(protocol.TypeJobStarted, j.ID); n != 1 {
+		t.Fatalf("job_started sent %d times, want 1", n)
+	}
+	started := s.wait(t, protocol.TypeJobStarted, j.ID, 1, 5*time.Second).(protocol.JobStarted)
+	if started.StartedMS != *ex.Usage.StartedMS {
+		t.Fatalf("job_started at %d, job_exit usage at %d", started.StartedMS, *ex.Usage.StartedMS)
+	}
+	var seconds []int64
+	for _, m := range s.all() {
+		u, ok := m.(protocol.JobUsage)
+		if !ok || u.ID != j.ID {
+			continue
+		}
+		if u.StartedMS != *ex.Usage.StartedMS || u.CPUMS == nil {
+			t.Fatalf("usage %+v", u)
+		}
+		seconds = append(seconds, u.Second)
+	}
+	if len(seconds) < 2 {
+		t.Fatalf("usage seconds %v, want 0..n-1 for a job that held %d ms", seconds, holdMS)
+	}
+	for n, second := range seconds {
+		if second != int64(n) {
+			t.Fatalf("usage seconds %v, want 0..%d with no gap or duplicate", seconds, len(seconds)-1)
+		}
+		if ex.Usage.WallMS < (second+1)*1000 {
+			t.Fatalf("usage second %d sent but wall_ms is %d, want at least %d", second, ex.Usage.WallMS, (second+1)*1000)
+		}
 	}
 }

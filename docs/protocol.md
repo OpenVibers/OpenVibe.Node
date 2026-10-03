@@ -219,11 +219,19 @@ An accepted job runs once the `ack` is out: `job_started` (`started_ms` anchors 
 `job_stdout` chunks (at most 16 KiB each as sent and `max_output_bytes` in all, valid UTF-8 with invalid bytes as
 U+FFFD, `chunk_seq` from 1; best effort, not resent), one `job_usage` for
 every wall-clock second once it has fully elapsed (`second` from 0, `cpu_ms` that second's CPU time), then
-`job_exit`. Its `usage` is authoritative for metering (Bot writes `usage-sample` readings `service:"run"`,
-`operation:"function.invoke"`, unit `s`, idempotency key `run:<job id>:<n>`; none of those fields changes on a
-resend). The Node resends `job_started` for running jobs and `job_exit` for ended ones after every reconnect, and
-`job_exit` again on a `job` or `job_cancel` for that id, until `job_exit_ack`. `job_started` goes out only once the
-job's CPU limit is set; a job that fails before (no namespaces, spawn or CPU limit failed) ends `failed` without it.
+`job_exit`. Second `n` is sent once `started_ms + (n + 1) s` has passed (`second` 0 at one whole second, 1 at two,
+and so on): the seconds are contiguous, with no duplicate and no gap, while the job runs.
+
+`job_exit.usage` is **authoritative for metering**. Bot turns each `job_usage` into one `usage-sample`
+(`service:"run"`, `operation:"function.invoke"`, unit `s`) whose idempotency key is `run:<job id>:<n>`, where `<n>`
+is the 0-based wall second — the `second` of the `job_usage` it covers, both counted from `started_ms`. A resent
+`job` or `job_cancel` repeats the same `job_exit` and so the same keys, never a second reading and never a `:<n>`
+for a second already metered. `job_exit.usage.wall_ms` is at least `(n + 1) * 1000` for every second `n` already
+sent, so the exit's own usage covers everything the per-second frames announced — it is never corrected downward
+by the resent `job_exit`. The Node resends `job_started` for running jobs and `job_exit` for ended ones after every
+reconnect, and `job_exit` again on a `job` or `job_cancel` for that id, until `job_exit_ack`. `job_started` goes out
+only once the job's CPU limit is set; a job that fails before (no namespaces, spawn or CPU limit failed) ends
+`failed` without it.
 A Node shutting down sends `job_exit` (`stopped`) also for a job acked but not started yet. `job_exit.reason`:
 
 | `reason`    | `code`  | when                                                                                                |
