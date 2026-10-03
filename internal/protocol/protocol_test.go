@@ -248,6 +248,21 @@ func TestJobFrameFixtures(t *testing.T) {
 	}
 }
 
+func TestWorkerCapabilityNames(t *testing.T) {
+	for _, tc := range []struct {
+		classes []string
+		want    []string
+	}{
+		{nil, []string{}},
+		{[]string{ClassFunction}, []string{"worker:function"}},
+		{[]string{ClassFunction, ClassCode}, []string{"worker:function", "worker:code"}},
+	} {
+		if got := WorkerCapabilityNames(tc.classes); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("WorkerCapabilityNames(%v) = %v, want %v", tc.classes, got, tc.want)
+		}
+	}
+}
+
 func TestJobCheck(t *testing.T) {
 	const id = "job_01JAB2C3D4E5F6G7H8J9K0MNPQ"
 	valid := func() Job {

@@ -245,10 +245,14 @@ A Node shutting down sends `job_exit` (`stopped`) also for a job acked but not s
 
 `job_cancel` for an id that is not running (unknown, refused or ended) and `job_exit_ack` for an unknown id are
 ignored, with no answer: an `ack` keyed by a job id means the job was accepted.
-A Node that runs jobs lists its classes and effective local worker caps in `status.capabilities.worker`:
-`{"runtime_classes":["function"],"max_jobs":1,"max_ttl_ms":600000,"max_wall_ms":300000,"max_cpu_ms":300000,"max_mem_bytes":536870912,"max_output_bytes":1048576}`.
-The limits are `worker.caps` with defaults applied; the key is absent while the worker is off, and `worker` is
-reserved as a plugin name.
+A Node that runs jobs lists its classes, the reserved Fabric capability names they advertise, and its effective local
+worker caps in `status.capabilities.worker`:
+`{"capabilities":["worker:function"],"runtime_classes":["function"],"max_jobs":1,"max_ttl_ms":600000,"max_wall_ms":300000,"max_cpu_ms":300000,"max_mem_bytes":536870912,"max_output_bytes":1048576}`.
+`capabilities` holds one `worker:<class>` name per entry in `runtime_classes` (the `platform.resource-offer@1`
+capabilities namespace OpenVibe.Run routes on; the names are reserved in OpenVibe.Contracts and no schema change
+was needed), so only classes this Node actually runs are advertised: `worker:function` today, `worker:code` once the
+`code` class ships. The limits are `worker.caps` with defaults applied; the key is absent while the worker is off,
+and `worker` is reserved as a plugin name.
 
 ### Fault codes
 

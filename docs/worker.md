@@ -39,11 +39,12 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   each clamped to them (the stricter value wins, as with `max_command_ms`). `max_output_bytes` caps the stdout bytes
   one job sends (counted on the wire, after invalid UTF-8 became U+FFFD); `max_jobs` how many run at once.
 
-The class `function` is advertised in `status.capabilities.worker` only when `enabled` is true, the OS is Linux and a
-**boot-time probe** passes: it starts `/bin/sh` the way a job is started and checks that the process got user,
-network and PID namespaces of its own, that its CPU limit can be set and that its CPU and memory can be read. If the
-probe fails the Node logs why (`worker off: …`) and refuses every job, exactly as with the worker off. On Ubuntu 24.04
-and later, unprivileged user namespaces are restricted by AppArmor; a Node running as root with `run_as` is not
+The class `function` — advertised as the reserved Fabric capability `worker:function` in `status.capabilities.worker`
+(the `platform.resource-offer@1` namespace OpenVibe.Run routes on) — is offered only when `enabled` is true, the OS is
+Linux and a **boot-time probe** passes: it starts `/bin/sh` the way a job is started and checks that the process got
+user, network and PID namespaces of its own, that its CPU limit can be set and that its CPU and memory can be read. If
+the probe fails the Node logs why (`worker off: …`) and refuses every job, exactly as with the worker off. On Ubuntu
+24.04 and later, unprivileged user namespaces are restricted by AppArmor; a Node running as root with `run_as` is not
 affected.
 
 ## How a job runs
