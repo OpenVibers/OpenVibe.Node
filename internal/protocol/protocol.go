@@ -393,9 +393,15 @@ type JobExit struct {
 	Usage  JobExitUsage    `json:"usage"`
 }
 
-// WorkerCapabilities is status.capabilities[CapWorker]: the runtime classes this Node runs.
+// WorkerCapabilities is status.capabilities[CapWorker]: the runtime classes this Node runs and its local job caps.
 type WorkerCapabilities struct {
 	RuntimeClasses []string `json:"runtime_classes"`
+	MaxJobs        int      `json:"max_jobs"`
+	MaxTTLMS       int64    `json:"max_ttl_ms"`
+	MaxWallMS      int64    `json:"max_wall_ms"`
+	MaxCPUMS       int64    `json:"max_cpu_ms"`
+	MaxMemBytes    int64    `json:"max_mem_bytes"`
+	MaxOutputBytes int64    `json:"max_output_bytes"`
 }
 
 type DriverStatus struct {

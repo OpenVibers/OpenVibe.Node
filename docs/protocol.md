@@ -237,8 +237,10 @@ A Node shutting down sends `job_exit` (`stopped`) also for a job acked but not s
 
 `job_cancel` for an id that is not running (unknown, refused or ended) and `job_exit_ack` for an unknown id are
 ignored, with no answer: an `ack` keyed by a job id means the job was accepted.
-A Node that runs jobs lists its classes in `status.capabilities.worker` as `{"runtime_classes": ["function"]}`; the
-key is absent while it runs none, and `worker` is reserved as a plugin name.
+A Node that runs jobs lists its classes and effective local worker caps in `status.capabilities.worker`:
+`{"runtime_classes":["function"],"max_jobs":1,"max_ttl_ms":600000,"max_wall_ms":300000,"max_cpu_ms":300000,"max_mem_bytes":536870912,"max_output_bytes":1048576}`.
+The limits are `worker.caps` with defaults applied; the key is absent while the worker is off, and `worker` is
+reserved as a plugin name.
 
 ### Fault codes
 
