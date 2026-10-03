@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -284,5 +285,105 @@ func TestLocalStopEndsJobs(t *testing.T) {
 	}
 	if jobs := e.statusJobs(); len(jobs) != 0 {
 		t.Fatalf("status jobs after the end: %+v", jobs)
+	}
+}
+
+// TestResendAndCancelShareOneUsageSet: a job that runs for whole wall-clock seconds sends one job_usage per elapsed
+// second (0 then 1, no gap and no duplicate); a resent job and a job_cancel after it ended both answer with the same
+// job_exit, never a second job_started, a repeated usage second, or a second run of the function.
+func TestResendAndCancelShareOneUsageSet(t *testing.T) {
+	e := startWorkerNode(t)
+	marker := filepath.Join(e.paths.StateDir, "starts")
+	j := testJob(jobID(1))
+	j.Artifact = &protocol.Artifact{Name: "hello", Version: "1.0.0"}
+	j.Args = json.RawMessage(fmt.Sprintf(`{"marker":%q,"hold_ms":2500}`, marker))
+	j.Limits.MemBytes = 4 << 30
+	isExit := func(m protocol.Message) bool {
+		ex, ok := m.(protocol.JobExit)
+		return ok && ex.ID == j.ID
+	}
+
+	if r := e.jobReply(j); r != (protocol.Ack{ID: j.ID}) {
+		t.Fatalf("%+v", r)
+	}
+	f, err := e.conn.Expect(protocol.TypeJobExit, 15*time.Second, isExit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex := f.Msg.(protocol.JobExit)
+	if ex.Reason != protocol.ExitExited || ex.Code == nil || *ex.Code != 0 || ex.Usage.StartedMS == nil {
+		t.Fatalf("%+v", ex)
+	}
+
+	// usageSeconds is the `second` of every job_usage for this job, in arrival order, checking each names the same
+	// started_ms as its job_exit and carries a cpu_ms.
+	usageSeconds := func() []int64 {
+		var seconds []int64
+		for _, fr := range e.conn.Frames() {
+			u, ok := fr.Msg.(protocol.JobUsage)
+			if !ok || u.ID != j.ID {
+				continue
+			}
+			if u.StartedMS != *ex.Usage.StartedMS || u.CPUMS == nil {
+				t.Fatalf("usage %+v", u)
+			}
+			seconds = append(seconds, u.Second)
+		}
+		return seconds
+	}
+	jobStarts := func() int {
+		n := 0
+		for _, fr := range e.conn.Frames() {
+			if s, ok := fr.Msg.(protocol.JobStarted); ok && s.ID == j.ID {
+				n++
+			}
+		}
+		return n
+	}
+
+	first := usageSeconds()
+	if len(first) < 2 {
+		t.Fatalf("usage seconds %v, want 0..n-1 for a job that held 2.5 s", first)
+	}
+	for n, second := range first {
+		if second != int64(n) || ex.Usage.WallMS < (second+1)*1000 {
+			t.Fatalf("usage seconds %v, wall_ms %d, want 0..%d contiguous and covering each second sent", first, ex.Usage.WallMS, len(first)-1)
+		}
+	}
+	if n := jobStarts(); n != 1 {
+		t.Fatalf("job_started sent %d times, want 1", n)
+	}
+
+	// A resent job and a job_cancel of the ended job each answer with the same job_exit (same result and usage).
+	for _, resend := range []struct {
+		name string
+		send func() error
+	}{
+		{"resent job", func() error { return e.conn.Job(j) }},
+		{"job_cancel", func() error { return e.conn.JobCancel(j.ID) }},
+	} {
+		if err := resend.send(); err != nil {
+			t.Fatal(err)
+		}
+		f, err := e.conn.Expect(protocol.TypeJobExit, 5*time.Second, isExit)
+		if err != nil {
+			t.Fatalf("%s: %v", resend.name, err)
+		}
+		again := f.Msg.(protocol.JobExit)
+		if again.Reason != ex.Reason || !reflect.DeepEqual(again.Code, ex.Code) || !reflect.DeepEqual(again.Usage, ex.Usage) || string(again.Result) != string(ex.Result) {
+			t.Fatalf("%s answered %+v, first job_exit %+v", resend.name, again, ex)
+		}
+	}
+
+	// No second process, job_started or usage second, and one usage set only.
+	if n := jobStarts(); n != 1 {
+		t.Fatalf("job_started sent %d times after the resends, want 1", n)
+	}
+	if again := usageSeconds(); !slices.Equal(again, first) {
+		t.Fatalf("usage seconds %v after the resends, first %v", again, first)
+	}
+	b, err := os.ReadFile(marker)
+	if err != nil || string(b) != "started\n" {
+		t.Fatalf("the function ran %q (%v), want once", b, err)
 	}
 }
