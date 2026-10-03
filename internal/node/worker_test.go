@@ -106,7 +106,7 @@ func startWorkerNode(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	caps := cfg.Worker.Caps.WithDefaults()
-	want := map[string]any{"runtime_classes": []any{protocol.ClassFunction}, "max_jobs": float64(caps.MaxJobs),
+	want := map[string]any{"capabilities": []any{"worker:function"}, "runtime_classes": []any{protocol.ClassFunction}, "max_jobs": float64(caps.MaxJobs),
 		"max_ttl_ms": float64(caps.MaxTTLMS), "max_wall_ms": float64(caps.MaxWallMS),
 		"max_cpu_ms": float64(caps.MaxCPUMS), "max_mem_bytes": float64(caps.MaxMemBytes),
 		"max_output_bytes": float64(caps.MaxOutputBytes)}

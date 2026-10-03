@@ -816,7 +816,7 @@ func (n *Node) sendStatus() {
 	}
 	if c := n.jobs.runtimeClasses(); len(c) > 0 {
 		caps := n.opt.Config.Worker.Caps.WithDefaults()
-		s.Capabilities[protocol.CapWorker] = protocol.WorkerCapabilities{RuntimeClasses: c, MaxJobs: caps.MaxJobs,
+		s.Capabilities[protocol.CapWorker] = protocol.WorkerCapabilities{Capabilities: protocol.WorkerCapabilityNames(c), RuntimeClasses: c, MaxJobs: caps.MaxJobs,
 			MaxTTLMS: caps.MaxTTLMS, MaxWallMS: caps.MaxWallMS, MaxCPUMS: caps.MaxCPUMS,
 			MaxMemBytes: caps.MaxMemBytes, MaxOutputBytes: caps.MaxOutputBytes}
 	}

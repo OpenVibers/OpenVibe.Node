@@ -88,6 +88,20 @@ const NetDeny = "deny"
 // present only when the Node runs at least one class.
 const CapWorker = "worker"
 
+// WorkerCapPrefix is the namespace of the reserved Fabric capability names (platform.resource-offer@1.capabilities)
+// a Node's runtime classes map to, one name per class: "worker:function", "worker:code", …. A name matches the
+// offer's capabilities pattern ^[a-z][a-z0-9-]*:[a-z0-9.-]+$ with no schema change needed.
+const WorkerCapPrefix = "worker:"
+
+// WorkerCapabilityNames returns the reserved Fabric capability names for the given runtime classes, in order.
+func WorkerCapabilityNames(classes []string) []string {
+	names := make([]string, 0, len(classes))
+	for _, c := range classes {
+		names = append(names, WorkerCapPrefix+c)
+	}
+	return names
+}
+
 // Job refusal reasons, carried in nack.message (nack.fault_code is bad_value, bad_frame or unsupported).
 const (
 	JobBadID          = "missing or malformed job id"
@@ -395,6 +409,7 @@ type JobExit struct {
 
 // WorkerCapabilities is status.capabilities[CapWorker]: the runtime classes this Node runs and its local job caps.
 type WorkerCapabilities struct {
+	Capabilities   []string `json:"capabilities"` // the reserved Fabric names these classes advertise: worker:function, …
 	RuntimeClasses []string `json:"runtime_classes"`
 	MaxJobs        int      `json:"max_jobs"`
 	MaxTTLMS       int64    `json:"max_ttl_ms"`
