@@ -59,7 +59,8 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   must belong to root (or the Node's own user) and be writable by no other user, nor by a group with any other member
   (listed in `/etc/group` or by primary group in `/etc/passwd`; a group not in `/etc/group` counts as untrusted), or the probe and
   each job refuse it: there a host user could switch a symlink or rename a directory on the path while the job runs,
-  and lead the job to a live host directory instead of its copy.
+  and lead the job to a live host directory instead of its copy. A missing `artifact_dir` does not fail the probe; its
+  jobs end `failed`.
 - `run_as`: the unprivileged uid and gid jobs run as (not 0; no supplementary groups). It needs the Node to run as
   root, which the system install does. Create a dedicated user for it with no login and no groups.
 - `allow_same_user`: run jobs as the Node's own (non-root) user instead, with its groups (`gpio`, `dialout`,
@@ -76,7 +77,8 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   over them reaches: read back from the kernel when the job's cgroup is made and again once its sandbox stands; a device that
   cannot be limited, or whose `io.max` is not the job's, fails the job and the probe), `max_vm_bytes`
   (`RLIMIT_AS`, always set: there is no "none"; a runtime that reserves a large address space up front, such as
-  Node.js, the JVM or race-instrumented Go, needs a large value, e.g. 64 TiB for the last). `mem_bytes` is the job cgroup's `memory.max` (swap off; an OOM kills the whole job).
+  Node.js, the JVM or race-instrumented Go, needs a large value, e.g. 64 TiB for the last). `mem_bytes` is the job cgroup's `memory.max` (swap off: `memory.swap.max` is set to 0 and read back; without swap accounting, which makes that
+  control, the probe and each job are refused unless the host has no swap at all; an OOM kills the whole job).
 - `egress`: what a job may reach on the network. `none` (the default) is the only policy enforced: a network
   namespace with nothing but a loopback that is down. `public` (internet but no private, link-local or Node
   addresses) and `openvibe-only` (the platform's endpoints only) need an egress proxy in the job's namespace that is
@@ -109,7 +111,9 @@ AppArmor; a Node running as root with `run_as` is not affected.
    `max_jobs` jobs run. An id the worker already holds is answered from it (`ack` while it runs, its `job_exit` once
    it ended) and never starts a second process.
 2. **Start**: the Node makes the job's cgroup and starts itself again (`/proc/self/exe`) as the **sandbox init**,
-   straight into that cgroup (`clone3` `CLONE_INTO_CGROUP`), in its own process group and in new user, mount,
+   with its name as its only argument and its spec (the function's command and environment included) in a memfd, so
+   that no host user reads the environment in its `/proc/<pid>/cmdline` (the Node checks that it shows the name
+   alone), straight into that cgroup (`clone3` `CLONE_INTO_CGROUP`), in its own process group and in new user, mount,
    network, PID, IPC, UTS and cgroup namespaces, with `PR_SET_PDEATHSIG` SIGKILL. The init builds a private root (see
    below) and `pivot_root`s into it, detaching the host's; sets `RLIMIT_CPU` (at `cpu_ms`, rounded up to a second),
    `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 1024, `RLIMIT_NPROC`, `RLIMIT_FSIZE` and `RLIMIT_AS`; drops every capability; sets
@@ -199,8 +203,7 @@ What it does **not** protect against:
   it is the function's job.
 
 Not built yet (follow-ups): the `public` and `openvibe-only` egress policies (an egress proxy reached through a veth
-or a socket bound into the job's namespace, filtering by destination), and a `Delegate=yes` in the service the
-installer writes.
+or a socket bound into the job's namespace, filtering by destination).
 
 ## Refusals and exit reasons
 

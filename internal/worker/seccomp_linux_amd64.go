@@ -5,11 +5,12 @@ package worker
 // The seccomp allowlist on amd64, numbered as in the kernel's asm/unistd_64.h: the system calls a job may
 // make. clone, clone3 and socket are judged apart in seccompFilter.
 const (
-	auditArch = 0xc000003e // AUDIT_ARCH_X86_64
-	x32ABI    = true
-	sysClone  = 56
-	sysClone3 = 435
-	sysSocket = 41
+	auditArch      = 0xc000003e // AUDIT_ARCH_X86_64
+	x32ABI         = true
+	sysClone       = 56
+	sysClone3      = 435
+	sysSocket      = 41
+	sysMemfdCreate = 319 // the Node's own call, for the sandbox spec
 )
 
 var allowedSyscalls = []uint32{

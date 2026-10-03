@@ -200,26 +200,24 @@ func newJobCgroup(caps config.WorkerCaps, lim protocol.JobLimits) (*jobCgroup, e
 }
 
 func (c *jobCgroup) limit(caps config.WorkerCaps, lim protocol.JobLimits) error {
-	set := func(file, v string, optional bool) error {
-		err := os.WriteFile(filepath.Join(c.dir, file), []byte(v), 0)
-		if err != nil && !(optional && errors.Is(err, os.ErrNotExist)) {
+	set := func(file, v string) error {
+		if err := os.WriteFile(filepath.Join(c.dir, file), []byte(v), 0); err != nil {
 			return fmt.Errorf("cgroup %s: %w", file, err)
 		}
 		return nil
 	}
-	for _, s := range []struct {
-		file, v  string
-		optional bool // memory.swap.max exists only with swap accounting
-	}{
-		{"memory.max", strconv.FormatInt(lim.MemBytes, 10), false},
-		{"memory.swap.max", "0", true},
-		{"memory.oom.group", "1", false},
-		{"pids.max", strconv.FormatInt(caps.MaxPids, 10), false},
-		{"cpu.max", fmt.Sprintf("%d %d", caps.MaxCPUMillis*cpuPeriodUS/1000, cpuPeriodUS), false},
+	for _, s := range []struct{ file, v string }{
+		{"memory.max", strconv.FormatInt(lim.MemBytes, 10)},
+		{"memory.oom.group", "1"},
+		{"pids.max", strconv.FormatInt(caps.MaxPids, 10)},
+		{"cpu.max", fmt.Sprintf("%d %d", caps.MaxCPUMillis*cpuPeriodUS/1000, cpuPeriodUS)},
 	} {
-		if err := set(s.file, s.v, s.optional); err != nil {
+		if err := set(s.file, s.v); err != nil {
 			return err
 		}
+	}
+	if err := limitSwap(c.dir, "/proc/swaps"); err != nil {
+		return err
 	}
 	c.io = fmt.Sprintf("rbps=%d wbps=%d riops=%d wiops=%d", caps.MaxIOBps, caps.MaxIOBps, caps.MaxIOPS, caps.MaxIOPS)
 	devs, err := blockDevices()
@@ -227,7 +225,7 @@ func (c *jobCgroup) limit(caps config.WorkerCaps, lim protocol.JobLimits) error 
 		return err
 	}
 	for _, d := range devs {
-		if err := set("io.max", d+" "+c.io, false); err != nil {
+		if err := set("io.max", d+" "+c.io); err != nil {
 			// ENODEV for a disk that is still there is a disk the job's I/O would not be limited on: no job runs.
 			if _, serr := os.Stat("/sys/dev/block/" + d); errors.Is(err, syscall.ENODEV) && errors.Is(serr, os.ErrNotExist) {
 				continue // unplugged meanwhile: nothing to limit
@@ -236,6 +234,39 @@ func (c *jobCgroup) limit(caps config.WorkerCaps, lim protocol.JobLimits) error 
 		}
 	}
 	return c.checkIO()
+}
+
+// limitSwap sets the job cgroup dir's memory.swap.max to 0 and reads it back. The control exists only with swap
+// accounting: without it a job could swap past memory.max, which is accepted only while the host has no swap at all
+// (procSwaps, /proc/swaps, lists none).
+func limitSwap(dir, procSwaps string) error {
+	file := filepath.Join(dir, "memory.swap.max")
+	f, err := os.OpenFile(file, os.O_WRONLY|os.O_TRUNC, 0) // no O_CREATE: a missing control must show as missing
+	if errors.Is(err, os.ErrNotExist) {
+		b, err := os.ReadFile(procSwaps)
+		if err != nil {
+			return fmt.Errorf("cgroup memory.swap.max is missing and the host's swap is unknown: %w", err)
+		}
+		if lines := strings.Split(strings.TrimSpace(string(b)), "\n"); len(lines) > 1 {
+			return errors.New("cgroup memory.swap.max is missing (no swap accounting) while the host has swap: a job " +
+				"could swap past memory.max (turn swap accounting on, or swap off)")
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cgroup memory.swap.max: %w", err)
+	}
+	_, err = f.WriteString("0")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("cgroup memory.swap.max: %w", err)
+	}
+	if b, err := os.ReadFile(file); err != nil || strings.TrimSpace(string(b)) != "0" {
+		return fmt.Errorf("cgroup memory.swap.max reads %q, not 0 (%v)", b, err)
+	}
+	return nil
 }
 
 // checkIO reads io.max back and checks that every whole block device with a medium has the job's limits: the kernel

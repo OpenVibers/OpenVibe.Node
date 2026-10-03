@@ -75,7 +75,6 @@ func isolate(cmd *exec.Cmd, cfg config.WorkerConfig, p plan) (*sandbox, error) {
 	spec := sandboxSpec{Root: p.root, Work: cmd.Dir, Disk: caps.MaxDiskBytes, Links: links,
 		Argv: append([]string{cmd.Path}, cmd.Args[1:]...), Env: cmd.Env}
 	if art != nil {
-		files = append(files, art) // artifactFD
 		spec.Artifact = p.fn.Artifact()
 	}
 	for _, b := range binds {
@@ -89,17 +88,47 @@ func isolate(cmd *exec.Cmd, cfg config.WorkerConfig, p plan) (*sandbox, error) {
 		return fail(errors.New("isolate: worker.caps.max_vm_bytes must be set"))
 	}
 	spec.Limits = append(spec.Limits, rlimit{rlimitAS, uint64(caps.MaxVMBytes), uint64(caps.MaxVMBytes)})
-	arg, err := json.Marshal(spec)
+	sf, err := specFile(spec)
 	if err != nil {
 		return fail(err)
+	}
+	sb.child = append(sb.child, sf)
+	files = append(files, sf) // specFD
+	if art != nil {
+		files = append(files, art) // artifactFD
 	}
 	if sb.cg, err = newJobCgroup(caps, p.limits); err != nil {
 		return fail(err)
 	}
 	attr.UseCgroupFD, attr.CgroupFD = true, sb.cg.fd
-	cmd.Path, cmd.Args, cmd.Env, cmd.Dir = "/proc/self/exe", []string{sandboxArg0, string(arg)}, []string{}, "/"
+	cmd.Path, cmd.Args, cmd.Env, cmd.Dir = "/proc/self/exe", []string{sandboxArg0}, []string{}, "/"
 	cmd.ExtraFiles, cmd.SysProcAttr = files, attr
 	return sb, nil
+}
+
+// specFile is spec in a memfd, for the sandbox init to read on specFD. Its environment may hold the function's
+// secrets: unlike argv (/proc/<pid>/cmdline), a descriptor is open only to who may ptrace the process.
+func specFile(spec sandboxSpec) (*os.File, error) {
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return nil, err
+	}
+	const mfdCloexec = 1
+	name := []byte("openvibe-sandbox-spec\x00")
+	fd, _, e := syscall.Syscall(sysMemfdCreate, uintptr(unsafe.Pointer(&name[0])), mfdCloexec, 0)
+	if e != 0 {
+		return nil, fmt.Errorf("memfd_create: %w", e)
+	}
+	f := os.NewFile(fd, "sandbox spec")
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // policy refuses what the sandbox cannot enforce: an egress other than none, an architecture without a seccomp
@@ -170,6 +199,10 @@ func (s *sandbox) ready(pid int) error {
 	if b[0] != 0 {
 		msg, _ := io.ReadAll(s.status)
 		return fmt.Errorf("the sandbox could not be set up: %s%s", b[:], msg)
+	}
+	// The spec, the function's environment included, must not show to every host user in the init's argv.
+	if c, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); err != nil || string(c) != sandboxArg0+"\x00" {
+		return fmt.Errorf("the sandbox init's command line is not its name alone (%q, %v)", c, err)
 	}
 	st, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")
 	if err != nil {

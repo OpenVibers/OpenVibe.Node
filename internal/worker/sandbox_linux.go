@@ -21,8 +21,9 @@ import (
 	"unsafe"
 )
 
-// A job starts as the Node's own executable (/proc/self/exe) with argv[0] sandboxArg0 and its sandboxSpec as argv[1],
-// already in its namespaces and its cgroup, holding CAP_SYS_ADMIN of its user namespace only (an ambient capability).
+// A job starts as the Node's own executable (/proc/self/exe) with sandboxArg0 as its only argument and its sandboxSpec
+// on specFD (a memfd: in argv, the function's environment would show in /proc/<pid>/cmdline to every host user until
+// the function executes), already in its namespaces and its cgroup, holding CAP_SYS_ADMIN of its user namespace only (an ambient capability).
 // It builds the job's private root, sets the rlimits, gives up every capability, sets no_new_privs and the seccomp
 // filter, and only then executes the function. It reports a failure on statusFD as text. Once confined it writes one
 // NUL byte there and waits for one byte on goFD: the Node checks the confinement and sets RLIMIT_CPU meanwhile, while
@@ -32,7 +33,8 @@ const (
 	sandboxArg0 = "openvibe-node-sandbox"
 	statusFD    = 4 // fd 3 is the function's result
 	goFD        = 5
-	artifactFD  = 6
+	specFD      = 6
+	artifactFD  = 7
 )
 
 // sandboxSpec is everything the sandbox init needs, from the Node.
@@ -78,25 +80,31 @@ const (
 )
 
 func init() {
-	if len(os.Args) == 2 && os.Args[0] == sandboxArg0 {
-		sandboxMain(os.Args[1])
+	if len(os.Args) == 1 && os.Args[0] == sandboxArg0 {
+		sandboxMain()
 	}
 }
 
 // sandboxMain never returns: it executes the function or exits 126 after writing why it could not to statusFD.
-func sandboxMain(arg string) {
+func sandboxMain() {
 	// no_new_privs, the seccomp filter and the capabilities belong to this thread, the one that calls execve.
 	runtime.LockOSThread()
-	err := enterSandbox(arg)
+	err := enterSandbox()
 	status := os.NewFile(statusFD, "status")
 	_, _ = status.WriteString(err.Error())
 	os.Exit(126)
 }
 
-func enterSandbox(arg string) error {
+func enterSandbox() error {
+	f := os.NewFile(specFD, "spec")
+	arg, err := io.ReadAll(f)
+	f.Close()
+	if err != nil {
+		return fmt.Errorf("reading the sandbox spec: %w", err)
+	}
 	var s sandboxSpec
-	if err := json.Unmarshal([]byte(arg), &s); err != nil {
-		return err
+	if err := json.Unmarshal(arg, &s); err != nil {
+		return fmt.Errorf("reading the sandbox spec: %w", err)
 	}
 	if len(s.Argv) == 0 {
 		return errors.New("no command")
@@ -767,7 +775,8 @@ func scanArtifact(artifact string) error {
 
 // checkRoute refuses an artifact directory whose path, followed as the job follows it in its private root (binds and
 // links as rootPlan makes them), crosses a directory of a bound host path that a host user other than one of trusted
-// could change: one owned by another user, writable by a group other than root's, or writable by others. In such a
+// could change: one owned by another user, writable by a group with a member not among trusted (trustedGroup), or
+// writable by others. In such a
 // directory a host user could, once the job runs, swap a symlink on the path or rename a directory on it (the copy's
 // mount goes with it) and leave the job's path to its artifact leading to a live host directory, a socket or FIFO
 // added there included. The rest of the path, outside the bound paths, is the private root's own.
@@ -804,7 +813,11 @@ func checkRoute(binds []hostBind, links []linkSpec, artifact string, trusted []u
 					"writable by root only", artifact, cur, st.Uid, st.Gid, st.Mode&0o7777)
 			}
 			fi, err := os.Lstat(next)
-			if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// Nothing past cur exists: only its owner, trusted, could make it. The job fails without its
+				// artifact directory, as scanArtifact says; a job's own check runs on the path as it is then.
+				return nil
+			} else if err != nil {
 				return fmt.Errorf("artifact directory %s: %w", artifact, err)
 			}
 			if isLink = fi.Mode()&fs.ModeSymlink != 0; isLink {

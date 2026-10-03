@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -679,7 +680,7 @@ func TestStageArtifactInSystemPath(t *testing.T) {
 	}
 	defer rr.Close()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$", "--", "stage", r, sys, dir)
-	cmd.ExtraFiles = []*os.File{rw, nil, nil, art} // fd 3, the result; fd 6, artifactFD
+	cmd.ExtraFiles = []*os.File{rw, nil, nil, nil, art} // fd 3, the result; fd 7, artifactFD
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
 		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Geteuid(), Size: 1}},
@@ -821,6 +822,11 @@ func TestArtifactRoute(t *testing.T) {
 			t.Errorf("artifact %s on a path only its owner may change: %v", a, err)
 		}
 	}
+	for _, a := range []string{sys + "/missing", sys + "/real/missing/deeper"} {
+		if err := checkRoute(binds, links, a, trustedUIDs()); err != nil {
+			t.Errorf("missing artifact %s (the job fails, the probe does not): %v", a, err)
+		}
+	}
 	if err := checkRoute(binds, links, sys+"/real", []uint32{uint32(os.Geteuid()) + 1}); err == nil ||
 		!strings.Contains(err.Error(), "crosses "+sys+",") {
 		t.Errorf("artifact in a directory another user owns: %v, want refused", err)
@@ -887,8 +893,9 @@ func TestArtifactRoute(t *testing.T) {
 }
 
 // TestArtifactRouteSwitched: a directory on a job's path to its artifact, in a bound system path, became
-// world-writable after boot, and the host switches the symlink there to a host directory holding a socket and a FIFO
-// once the job was submitted: the job never runs, so it reaches neither.
+// world-writable after boot (the probe passed): the job is refused before it starts, so when the host then switches
+// the symlink there to a host directory holding a socket and a FIFO, nothing reaches them. A switch while a job runs
+// meets its private copy instead (TestArtifactSnapshot, TestStageArtifactInSystemPath).
 func TestArtifactRouteSwitched(t *testing.T) {
 	sys := t.TempDir() // bound in every private root as /usr is
 	saved := systemPaths
@@ -1402,4 +1409,110 @@ func usrTrusted(t *testing.T) bool {
 		t.Fatal(err)
 	}
 	return slices.Contains(trustedUIDs(), st.Uid)
+}
+
+// TestLimitSwap: memory.swap.max is set to 0 and read back; a missing control (no swap accounting) is refused while
+// the host has swap, or when whether it has some is unknown, and never created.
+func TestLimitSwap(t *testing.T) {
+	dir, cg := t.TempDir(), t.TempDir()
+	const header = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
+	none, some := filepath.Join(dir, "none"), filepath.Join(dir, "some")
+	if err := os.WriteFile(none, []byte(header), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(some, []byte(header+"/swap.img\tfile\t\t2097148\t\t0\t\t-2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := limitSwap(cg, some); err == nil || !strings.Contains(err.Error(), "while the host has swap") {
+		t.Errorf("no memory.swap.max, host swap on: %v, want refused", err)
+	}
+	if err := limitSwap(cg, filepath.Join(dir, "missing")); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("no memory.swap.max, host swap unknown: %v, want refused", err)
+	}
+	if err := limitSwap(cg, none); err != nil {
+		t.Errorf("no memory.swap.max, no host swap: %v", err)
+	}
+	ctl := filepath.Join(cg, "memory.swap.max")
+	if _, err := os.Stat(ctl); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a missing memory.swap.max was created: %v", err)
+	}
+	if err := os.WriteFile(ctl, []byte("max\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := limitSwap(cg, some); err != nil {
+		t.Errorf("memory.swap.max there: %v", err)
+	}
+	if b, _ := os.ReadFile(ctl); string(b) != "0" {
+		t.Errorf("memory.swap.max = %q, want 0", b)
+	}
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(ctl, 0o444); err != nil {
+			t.Fatal(err)
+		}
+		if err := limitSwap(cg, none); err == nil {
+			t.Error("memory.swap.max not writable: no error")
+		}
+	}
+}
+
+// TestSpecNotInCmdline: the sandbox init gets its spec, the function's environment included, on specFD and never in
+// its argv: while it waits for the Node's go, its /proc/<pid>/cmdline is its name alone. It needs only user, mount and
+// PID namespaces, no cgroup: it runs where the sandboxed jobs cannot.
+func TestSpecNotInCmdline(t *testing.T) {
+	const envMarker = "marker-from-the-environment"
+	sf, err := specFile(sandboxSpec{Root: t.TempDir(), Work: "/tmp/w", Disk: 1 << 20, Argv: []string{"/bin/true"},
+		Env: []string{"OPENVIBE_MARKER=" + envMarker}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sf.Close()
+	sr, sw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sr.Close()
+	gr, gw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw.Close()
+	cmd := &exec.Cmd{Path: "/proc/self/exe", Args: []string{sandboxArg0}, Env: []string{}, Dir: "/", Stderr: os.Stderr,
+		ExtraFiles: []*os.File{nil, sw, gr, sf}, // statusFD, goFD, specFD
+		SysProcAttr: &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL,
+			Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWPID,
+			UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Geteuid(), Size: 1}},
+			GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getegid(), Size: 1}}}}
+	err = cmd.Start()
+	sw.Close()
+	gr.Close()
+	if err != nil {
+		if os.Getenv("OPENVIBE_WORKER_TESTS") == "require" {
+			t.Fatal(err)
+		}
+		t.Skipf("no user, mount and PID namespace here: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	_ = sr.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var b [1]byte
+	if _, err := io.ReadFull(sr, b[:]); err != nil {
+		t.Fatalf("the sandbox init did not report: %v", err)
+	}
+	if b[0] != 0 {
+		msg, _ := io.ReadAll(sr)
+		if strings.Contains(string(msg), "spec") || os.Getenv("OPENVIBE_WORKER_TESTS") == "require" {
+			t.Fatalf("the sandbox init failed: %s%s", b[:], msg)
+		}
+		t.Skipf("the sandbox init cannot stand here: %s%s", b[:], msg)
+	}
+	c, err := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/cmdline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(c) != sandboxArg0+"\x00" || strings.Contains(string(c), envMarker) {
+		t.Errorf("the sandbox init's command line is %q, want its name alone", c)
+	}
+	gw.Close() // no go: the init exits instead of executing the function
+	if msg, _ := io.ReadAll(sr); !strings.Contains(string(msg), "did not let the function start") {
+		t.Errorf("the init after no go: %q", msg)
+	}
 }
