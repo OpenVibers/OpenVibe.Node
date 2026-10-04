@@ -56,6 +56,12 @@ func TestWorkerHelperProcess(t *testing.T) {
 // status that advertises it. It is skipped where the kernel does not let this user create the job namespaces.
 func startWorkerNode(t *testing.T) *env {
 	t.Helper()
+	return startHelloNode(t, helloWorker(t))
+}
+
+// helloWorker is a worker config whose one function, hello@1.0.0, runs this test binary's TestWorkerHelperProcess.
+func helloWorker(t *testing.T) config.WorkerConfig {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -69,9 +75,21 @@ func startWorkerNode(t *testing.T) *env {
 	if os.Geteuid() == 0 { // as root, jobs run as nobody: the test binary must then lie in a directory nobody can read
 		cfg.AllowSameUser, cfg.RunAs = false, &config.RunAs{UID: 65534, GID: 65534}
 	}
+	return cfg
+}
+
+// startHelloNode starts a worker Node with cfg and checks its status advertises the classes its entries implement.
+func startHelloNode(t *testing.T, cfg config.WorkerConfig) *env {
+	t.Helper()
 	e, status := startWorkerNodeWith(t, cfg, true)
 	caps := cfg.Caps.WithDefaults()
-	want := map[string]any{"capabilities": []any{"worker:function"}, "runtime_classes": []any{protocol.ClassFunction}, "max_jobs": float64(caps.MaxJobs),
+	var names, classes []any
+	for _, c := range []string{protocol.ClassFunction, protocol.ClassCode} {
+		if slices.ContainsFunc(cfg.Functions, func(f config.FunctionConfig) bool { return f.EffectiveClass() == c }) {
+			names, classes = append(names, "worker:"+c), append(classes, c)
+		}
+	}
+	want := map[string]any{"capabilities": names, "runtime_classes": classes, "max_jobs": float64(caps.MaxJobs),
 		"max_ttl_ms": float64(caps.MaxTTLMS), "max_wall_ms": float64(caps.MaxWallMS),
 		"max_cpu_ms": float64(caps.MaxCPUMS), "max_mem_bytes": float64(caps.MaxMemBytes),
 		"max_output_bytes": float64(caps.MaxOutputBytes)}
@@ -149,7 +167,8 @@ func TestWorkerWithNoFunctions(t *testing.T) {
 
 func TestWorkerFailedProbeDoesNotAdvertiseFunctions(t *testing.T) {
 	e, status := startWorkerNodeWith(t, config.WorkerConfig{Enabled: true,
-		Functions: []config.FunctionConfig{{Name: "hello", Version: "1.0.0", Command: []string{"/bin/true"}}}}, false)
+		Functions: []config.FunctionConfig{{Name: "hello", Version: "1.0.0", Command: []string{"/bin/true"}},
+			{Name: "script", Version: "1.0.0", Class: config.ClassCode, Command: []string{"/bin/true"}}}}, false)
 	if classes := e.node.jobs.runtimeClasses(); len(classes) != 0 {
 		t.Fatalf("runtime classes after failed probe = %v, want none", classes)
 	}
@@ -158,6 +177,57 @@ func TestWorkerFailedProbeDoesNotAdvertiseFunctions(t *testing.T) {
 	}
 	if nk := e.jobNack(testJob(jobID(1)), protocol.JobNotAvailable); nk.FaultCode != protocol.FaultUnsupported {
 		t.Fatalf("job after failed probe: %+v", nk)
+	}
+}
+
+// TestCodeJobRunsOverTheLink: a declared code entry advertises worker:code next to worker:function, and a code job
+// runs it in the same sandbox, while a code job naming the function entry is an unknown artifact.
+func TestCodeJobRunsOverTheLink(t *testing.T) {
+	cfg := helloWorker(t)
+	script := cfg.Functions[0]
+	script.Name, script.Class = "script", config.ClassCode
+	cfg.Functions = append(cfg.Functions, script)
+	e := startHelloNode(t, cfg)
+	if c := e.node.jobs.runtimeClasses(); !slices.Equal(c, []string{protocol.ClassFunction, protocol.ClassCode}) {
+		t.Fatalf("runtime classes %v", c)
+	}
+
+	j := testJob(jobID(1))
+	j.Class, j.Artifact = protocol.ClassCode, &protocol.Artifact{Name: "hello", Version: "1.0.0"}
+	if nk := e.jobNack(j, protocol.JobUnknownArtifact); nk.FaultCode != protocol.FaultUnsupported {
+		t.Fatalf("code job naming a function entry: %+v", nk)
+	}
+
+	j = testJob(jobID(2))
+	j.Class, j.Artifact = protocol.ClassCode, &protocol.Artifact{Name: "script", Version: "1.0.0"}
+	j.Args = json.RawMessage(fmt.Sprintf(`{"marker":%q,"hold_ms":1}`, filepath.Join(e.paths.StateDir, "starts")))
+	j.Limits.MemBytes = 4 << 30
+	if r := e.jobReply(j); r != (protocol.Ack{ID: j.ID}) {
+		t.Fatalf("%+v", r)
+	}
+	f, err := e.conn.Expect(protocol.TypeJobExit, 15*time.Second, func(m protocol.Message) bool {
+		ex, ok := m.(protocol.JobExit)
+		return ok && ex.ID == j.ID
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex := f.Msg.(protocol.JobExit); ex.Reason != protocol.ExitExited || ex.Code == nil || *ex.Code != 0 || string(ex.Result) != `{"ok":true}` {
+		t.Fatalf("%+v %s", ex, ex.Result)
+	}
+	if _, err := os.Stat(filepath.Join(e.paths.StateDir, "starts")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the code job wrote outside its sandbox: %v", err)
+	}
+}
+
+// TestCodeJobRefusedByFunctionWorker: a worker with only function entries does not advertise code, and a code job is
+// refused class not available before it reaches the worker.
+func TestCodeJobRefusedByFunctionWorker(t *testing.T) {
+	e := startWorkerNode(t)
+	j := testJob(jobID(1))
+	j.Class, j.Artifact = protocol.ClassCode, &protocol.Artifact{Name: "hello", Version: "1.0.0"}
+	if nk := e.jobNack(j, protocol.JobNotAvailable); nk.FaultCode != protocol.FaultUnsupported {
+		t.Fatalf("code job on a function-only worker: %+v", nk)
 	}
 }
 

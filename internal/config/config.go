@@ -107,12 +107,12 @@ type Config struct {
 	// Python is the interpreter for plugins without an explicit command (default: <state>/venv/bin/python, then python3).
 	Python   string `json:"python,omitempty"`
 	LogLevel string `json:"log_level,omitempty"`
-	// Worker runs `function` jobs from the control link (docs/worker.md). Off unless enabled.
+	// Worker runs `function` and `code` jobs from the control link (docs/worker.md). Off unless enabled.
 	Worker WorkerConfig `json:"worker,omitzero"`
 }
 
 // WorkerConfig is the job worker. Disabled (the default), every job is refused "class not available". Only the
-// functions listed here ever run: a job names one by name and exact version, and nothing is downloaded.
+// entries listed here ever run: a job names one by name, exact version and class, and nothing is downloaded.
 type WorkerConfig struct {
 	Enabled   bool             `json:"enabled,omitempty"`
 	Functions []FunctionConfig `json:"functions,omitempty"`
@@ -138,15 +138,32 @@ const (
 	EgressOpenVibeOnly = "openvibe-only"
 )
 
-// FunctionConfig is one function a job may run: Command is started with the job's args as JSON on stdin.
+// FunctionConfig is one artifact a job may run: Command is started with the job's args as JSON on stdin.
 type FunctionConfig struct {
-	Name    string            `json:"name"`
-	Version string            `json:"version"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	// Class is the runtime class this entry implements: function (the default) or code. A job runs it only when its
+	// class matches; browser, linux, desktop and gpu are refused at load.
+	Class   string            `json:"class,omitempty"`
 	Command []string          `json:"command"` // Command[0] is an absolute path
 	Env     map[string]string `json:"env,omitempty"`
 	// ArtifactDir is the directory each job gets a read-only copy of, made as it starts, in its private root (default:
 	// the directory of Command[0]). It must not be / nor hold, or lie inside, the Node's own directories.
 	ArtifactDir string `json:"artifact_dir,omitempty"`
+}
+
+// The classes a declared entry may implement.
+const (
+	ClassFunction = "function"
+	ClassCode     = "code"
+)
+
+// EffectiveClass is the entry's runtime class, function when none is set.
+func (f FunctionConfig) EffectiveClass() string {
+	if f.Class == "" {
+		return ClassFunction
+	}
+	return f.Class
 }
 
 // Artifact is the directory a job of the function gets a read-only copy of.
@@ -355,10 +372,14 @@ func (w WorkerConfig) validate() error {
 		if !functionNameRe.MatchString(f.Name) || !functionVersionRe.MatchString(f.Version) {
 			return fmt.Errorf("config: worker function %q version %q: name or version is not a valid artifact name or exact version", f.Name, f.Version)
 		}
-		if seen[f.Name+"@"+f.Version] {
-			return fmt.Errorf("config: worker function %s@%s listed twice", f.Name, f.Version)
+		if c := f.EffectiveClass(); c != ClassFunction && c != ClassCode {
+			return fmt.Errorf("config: worker function %s@%s has class %q: only function or code are implemented", f.Name, f.Version, f.Class)
 		}
-		seen[f.Name+"@"+f.Version] = true
+		key := f.Name + "@" + f.Version + "@" + f.EffectiveClass()
+		if seen[key] {
+			return fmt.Errorf("config: worker function %s@%s (class %s) listed twice", f.Name, f.Version, f.EffectiveClass())
+		}
+		seen[key] = true
 		if len(f.Command) == 0 || !filepath.IsAbs(f.Command[0]) {
 			return fmt.Errorf("config: worker function %s@%s needs a command starting with an absolute path", f.Name, f.Version)
 		}
