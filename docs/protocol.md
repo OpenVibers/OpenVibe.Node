@@ -255,6 +255,19 @@ was needed), so only classes this Node actually runs are advertised: `worker:fun
 declares no `functions` (a probe that passes with none advertises nothing, so Fabric places no job this Node would
 refuse), and `worker` is reserved as a plugin name.
 
+### Node descriptor → Fabric offers
+
+When OpenVibe.Run turns a Node descriptor into `platform.resource-offer@1` / `platform.runtime-offer@1`, it applies
+this mapping:
+
+| Node descriptor field | Fabric offer | Example |
+| --- | --- | --- |
+| capabilities.worker.runtime_classes | resource-offer.capabilities item `worker:<class>` | worker:function, worker:code |
+| capabilities.worker.max_jobs | runtime-offer.limits.concurrency | 1 |
+| capabilities.worker.max_ttl_ms | runtime-offer.limits.duration_seconds | 600 |
+| device node_id / cell | resource-offer.node_id / resource-offer.cell | node_01H… / wnam-1 |
+| worker trust (local policy) | resource-offer.trust | user-owned for a user's own Node |
+
 ### Fault codes
 
 `bad_frame`, `bad_value`, `unsupported`, `not_allowed`, `estopped`, `local_stop`, `expired`, `no_heartbeat`,

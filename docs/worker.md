@@ -37,7 +37,9 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
 ```
 
 - `functions`: `name` and `version` match a job's `artifact` exactly (the contract's patterns; listed once each);
-  `command[0]` is an absolute path. `env` is added to the job's environment. `artifact_dir` (default: the directory
+  `command[0]` is an absolute path. `env` is added to the job's environment. A per-entry `class` (`function`, the
+  default, or `code`) is planned and not accepted yet: the config loader refuses unknown keys, so leave it out
+  until the `code` class ships; only `function` is advertised in `status.capabilities.worker` today. `artifact_dir` (default: the directory
   of `command[0]`) is the one host directory a job gets besides the system paths, as a **copy** made as the job
   starts, read-only, at the same path: nothing the host adds to it or changes in it later reaches the job (a Unix
   socket or a FIFO that appears there, say, through which a job could reach a host process). The Node opens the
