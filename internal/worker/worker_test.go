@@ -288,3 +288,17 @@ func TestUsageHelperProcess(t *testing.T) {
 	time.Sleep(time.Duration(args.HoldMS) * time.Millisecond)
 	os.Exit(0)
 }
+
+// TestEgressFor: a job runs under the stricter of its net and the host's egress: net "deny" is none whatever the host
+// allows; without net, the host's policy.
+func TestEgressFor(t *testing.T) {
+	for _, c := range []struct{ host, net, want string }{
+		{"", "", ""}, {config.EgressNone, "", ""}, {config.EgressPublic, "", config.EgressPublic},
+		{config.EgressOpenVibeOnly, "", config.EgressOpenVibeOnly}, {config.EgressPublic, protocol.NetDeny, ""},
+		{config.EgressOpenVibeOnly, protocol.NetDeny, ""}, {config.EgressPublic, "allow", ""},
+	} {
+		if got := egressFor(c.host, c.net); got != c.want {
+			t.Errorf("egressFor(%q, %q) = %q, want %q", c.host, c.net, got, c.want)
+		}
+	}
+}

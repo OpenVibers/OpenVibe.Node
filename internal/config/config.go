@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -123,9 +124,18 @@ type WorkerConfig struct {
 	// job's private root holds: for development only.
 	AllowSameUser bool       `json:"allow_same_user,omitempty"`
 	Caps          WorkerCaps `json:"caps,omitzero"`
-	// Egress is what a job may reach on the network: none (the default; a network namespace with only a loopback that
-	// is down), public or openvibe-only. Only none is enforced yet: with another value the worker stays off.
+	// Egress is the most a job may reach on the network, all three enforced (docs/worker.md): none (the default; a
+	// network namespace with only a loopback that is down), public (IPv4 to public addresses, through a veth the Node
+	// NATs; private, shared, link-local and reserved ranges, EgressDeny and the host itself refused) or openvibe-only
+	// (public restricted to EgressAllow). A job runs under the stricter of its own net and this: net "deny" is none
+	// whatever Egress says. A policy the host cannot enforce fails the probe, so the worker stays off.
 	Egress string `json:"egress,omitempty"`
+	// EgressAllow is the IPv4 CIDRs an openvibe-only job may reach (the OpenVibe network's own ranges, configured
+	// rather than guessed); required with openvibe-only and refused with any other policy.
+	EgressAllow []string `json:"egress_allow,omitempty"`
+	// EgressDeny is more IPv4 CIDRs a public or openvibe-only job is refused (the Node's cell, WireGuard peers with
+	// public addresses), on top of the ranges always refused.
+	EgressDeny []string `json:"egress_deny,omitempty"`
 	// NodeDirs are the Node's own directories (config, credential, state, control socket), which no job may see; the
 	// Node sets them, the config file does not.
 	NodeDirs []string `json:"-"`
@@ -391,6 +401,19 @@ func (w WorkerConfig) validate() error {
 	case "", EgressNone, EgressPublic, EgressOpenVibeOnly:
 	default:
 		return fmt.Errorf("config: worker.egress %q is not none, public or openvibe-only", w.Egress)
+	}
+	for key, cidrs := range map[string][]string{"egress_allow": w.EgressAllow, "egress_deny": w.EgressDeny} {
+		for _, c := range cidrs {
+			if p, err := netip.ParsePrefix(c); err != nil || !p.Addr().Is4() || p != p.Masked() {
+				return fmt.Errorf("config: worker.%s %q is not an IPv4 CIDR such as 203.0.113.0/24 (jobs have no IPv6)", key, c)
+			}
+		}
+	}
+	switch {
+	case w.Egress == EgressOpenVibeOnly && len(w.EgressAllow) == 0:
+		return errors.New("config: worker.egress openvibe-only needs worker.egress_allow, the CIDRs a job may reach")
+	case w.Egress != EgressOpenVibeOnly && len(w.EgressAllow) > 0:
+		return errors.New("config: worker.egress_allow applies to egress openvibe-only only")
 	}
 	if w.RunAs != nil && (w.RunAs.UID == 0 || w.RunAs.GID == 0) {
 		return errors.New("config: worker.run_as must not be root (uid or gid 0)")

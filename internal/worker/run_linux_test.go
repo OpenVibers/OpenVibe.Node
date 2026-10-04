@@ -75,6 +75,32 @@ func TestHelperProcess(t *testing.T) {
 		_, derr := net.DialTimeout("tcp", "192.0.2.1:9", time.Second)
 		_ = json.NewEncoder(result).Encode(map[string]any{"env": os.Environ(), "cwd": cwd, "pid": os.Getpid(),
 			"uid": os.Getuid(), "loopback": fmt.Sprint(lerr), "dial": fmt.Sprint(derr)})
+	case "egress": // how each address answers a TCP connect: connected, refused, unreachable or the error
+		got := map[string]string{}
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, a := range []string{"10.0.0.1:80", "169.254.169.254:80", "169.254.240.1:22", "1.1.1.1:53"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c, err := net.DialTimeout("tcp", a, 3*time.Second)
+				r := fmt.Sprint(err)
+				switch {
+				case err == nil:
+					c.Close()
+					r = "connected"
+				case errors.Is(err, syscall.ECONNREFUSED):
+					r = "refused"
+				case errors.Is(err, syscall.ENETUNREACH):
+					r = "unreachable"
+				}
+				mu.Lock()
+				got[a] = r
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+		_ = json.NewEncoder(result).Encode(got)
 	case "escape": // every attempt must fail but the write to /tmp; the result is each attempt's error
 		node := os.Getenv("OPENVIBE_TEST_NODE_DIR")
 		try := map[string]error{}
@@ -1208,16 +1234,23 @@ func TestForkBomb(t *testing.T) {
 	}
 }
 
-// TestEgressPolicy: only egress none is enforced; with another policy the probe fails (the class is not advertised)
-// and a job fails without running.
-func TestEgressPolicy(t *testing.T) {
+// TestEgressUnenforceable: an egress policy the host cannot enforce (here ip, nsenter and nft are not found, or the
+// Node is not root) fails the probe, so the class is not advertised, and a job fails without running: never a silent
+// none nor an open network.
+func TestEgressUnenforceable(t *testing.T) {
+	dirs := egressToolDirs
+	egressToolDirs = []string{t.TempDir()}
+	t.Cleanup(func() { egressToolDirs = dirs })
 	for _, e := range []string{config.EgressPublic, config.EgressOpenVibeOnly} {
 		s := &sink{}
 		cfg := helperConfig(t, config.WorkerCaps{}, "env")
 		cfg.Egress = e
+		if e == config.EgressOpenVibeOnly {
+			cfg.EgressAllow = []string{"9.9.9.9/32"}
+		}
 		w := New(cfg, s.send, quiet())
 		t.Cleanup(w.Close)
-		if err := w.Probe(); err == nil || !strings.Contains(err.Error(), "egress") {
+		if err := w.Probe(); err == nil || !strings.Contains(err.Error(), "worker.egress "+e) {
 			t.Fatalf("%s: probe %v, want refused", e, err)
 		}
 		j := testJob(1, "env")
@@ -1225,6 +1258,83 @@ func TestEgressPolicy(t *testing.T) {
 		if ex := s.exit(t, j.ID); ex.Reason != protocol.ExitFailed || ex.Usage.StartedMS != nil || s.count(protocol.TypeJobStarted, j.ID) != 0 {
 			t.Fatalf("%s: %+v", e, ex)
 		}
+	}
+}
+
+// TestEgress: under none a job has no route at all; under public it has one, but 10.0.0.1, 169.254.169.254 (cloud
+// metadata) and the host's end of its veth are refused by the Node's table (refused, not unreachable nor a timeout);
+// under openvibe-only an unlisted public host is refused too; a job naming net "deny" under public gets none. It needs
+// root, ip, nsenter, nft and IPv4 forwarding: it skips without the programs even where OPENVIBE_WORKER_TESTS=require.
+func TestEgress(t *testing.T) {
+	none := map[string]string{"10.0.0.1:80": "unreachable", "169.254.169.254:80": "unreachable",
+		"169.254.240.1:22": "unreachable", "1.1.1.1:53": "unreachable"}
+	refused := map[string]string{"10.0.0.1:80": "refused", "169.254.169.254:80": "refused", "169.254.240.1:22": "refused"}
+	for _, c := range []struct {
+		name, egress string
+		allow        []string
+		net          string
+		want         map[string]string
+	}{
+		{"none", "", nil, "", none},
+		{"public", config.EgressPublic, nil, "", refused},
+		{"openvibe-only", config.EgressOpenVibeOnly, []string{"9.9.9.9/32"}, "",
+			map[string]string{"10.0.0.1:80": "refused", "169.254.169.254:80": "refused", "1.1.1.1:53": "refused"}},
+		{"deny under public", config.EgressPublic, nil, protocol.NetDeny, none},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := helperConfig(t, config.WorkerCaps{}, "egress")
+			cfg.Egress, cfg.EgressAllow = c.egress, c.allow
+			if c.egress != "" {
+				if _, err := egressReady(); errors.Is(err, errEgressTool) {
+					t.Skip(err)
+				}
+			}
+			w, s := newRunWorkerConfig(t, cfg)
+			j := testJob(1, "egress")
+			j.Net = c.net
+			run(t, w, j)
+			ex := s.exit(t, j.ID)
+			var got map[string]string
+			if err := json.Unmarshal(ex.Result, &got); err != nil || ex.Reason != protocol.ExitExited {
+				t.Fatalf("%+v %s: %v", ex, ex.Result, err)
+			}
+			for a, want := range c.want {
+				if got[a] != want {
+					t.Errorf("%s: %s, want %s (all: %v)", a, got[a], want, got)
+				}
+			}
+		})
+	}
+}
+
+// TestEgressRuleset: the table refuses IPv6, other routes than the default one, the private, shared, link-local and
+// reserved ranges and egress_deny before anything is accepted; openvibe-only then accepts egress_allow alone.
+func TestEgressRuleset(t *testing.T) {
+	cfg := config.WorkerConfig{Egress: config.EgressPublic, EgressDeny: []string{"203.0.113.0/24", "198.51.100.0/24"}}
+	pub := ruleset(cfg, []string{"eth0", "wlan0"})
+	cfg.Egress, cfg.EgressAllow = config.EgressOpenVibeOnly, []string{"9.9.9.9/32"}
+	ovo := ruleset(cfg, []string{"eth0"})
+	for _, r := range []string{pub, ovo} {
+		job := r[strings.Index(r, "chain job {"):]
+		job = job[:strings.Index(job, "\n\t}")]
+		accept := strings.Index(job, "accept")
+		for _, want := range []string{"meta nfproto != ipv4 goto refuse", "ip daddr 10.0.0.0/8 goto refuse",
+			"ip daddr 100.64.0.0/10 goto refuse", "ip daddr 169.254.0.0/16 goto refuse",
+			"ip daddr 172.16.0.0/12 goto refuse", "ip daddr 192.168.0.0/16 goto refuse",
+			"ip daddr 203.0.113.0/24 goto refuse", "ip daddr 198.51.100.0/24 goto refuse"} {
+			if i := strings.Index(job, want); i < 0 || i > accept {
+				t.Fatalf("%q missing or after the first accept in\n%s", want, job)
+			}
+		}
+		if !strings.Contains(r, "iifname \"ovw*\" goto refuse") || !strings.Contains(r, "delete table inet openvibe_worker") {
+			t.Fatalf("the host itself is not refused, or the table is not replaced whole:\n%s", r)
+		}
+	}
+	if !strings.Contains(pub, `oifname != { "eth0", "wlan0" } goto refuse`) || strings.Contains(pub, "9.9.9.9") {
+		t.Fatalf("public:\n%s", pub)
+	}
+	if !strings.Contains(ovo, "ip daddr 9.9.9.9/32 accept\n\t\tgoto refuse\n\t\taccept") {
+		t.Fatalf("openvibe-only does not refuse what egress_allow does not list:\n%s", ovo)
 	}
 }
 

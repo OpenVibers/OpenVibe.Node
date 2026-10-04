@@ -60,6 +60,17 @@ type plan struct {
 	root   string                // the host directory (empty, the job's) its private root is mounted on
 	fn     config.FunctionConfig // zero for the probe
 	limits protocol.JobLimits
+	egress string // the job's network policy (egressFor); "" is none
+}
+
+// egressFor is the network policy a job runs under: the stricter of its net and the host's worker.egress. A job
+// naming net "deny" (the only value it may name) runs under none whatever the host allows; without net, the host's
+// policy applies.
+func egressFor(host, net string) string {
+	if net != "" || host == config.EgressNone {
+		return ""
+	}
+	return host
 }
 
 type job struct {
@@ -391,7 +402,7 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 	cmd.Dir, cmd.Env = work, jobEnv(jb.fn, work, id)
 	cmd.Stdin = bytes.NewReader(append(append([]byte(nil), jb.req.Args...), '\n'))
 	cmd.Stdout, cmd.ExtraFiles = outW, []*os.File{resW}
-	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits})
+	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits, egress: egressFor(w.cfg.Egress, jb.req.Net)})
 	if err != nil {
 		outW.Close()
 		resW.Close()
