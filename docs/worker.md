@@ -29,7 +29,9 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
 ```
 
 - `functions`: `name` and `version` match a job's `artifact` exactly (the contract's patterns; listed once each);
-  `command[0]` is an absolute path. `env` is added to the job's environment.
+  `command[0]` is an absolute path. `env` is added to the job's environment. A per-entry `class` (`function`, the
+  default, or `code`) is planned and not accepted yet: the config loader refuses unknown keys, so leave it out
+  until the `code` class ships; only `function` is advertised in `status.capabilities.worker` today.
 - `run_as`: the unprivileged uid and gid jobs run as (not 0; no supplementary groups). It needs the Node to run as
   root, which the system install does. Create a dedicated user for it with no login and no groups.
 - `allow_same_user`: run jobs as the Node's own (non-root) user instead. A job can then read every file the Node can,
