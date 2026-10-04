@@ -30,8 +30,10 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.ne
 ```
 
 Then check the written config (`cat /etc/openvibe-node/config.json`): `plugins` names `adeept_adr036` with backend
-`real` and `wheels: "ordinary"`, and `video.whip_url` is set (the ingest URL + publish key the pairing returned; O30:
-`https://ingest.openre.stream/whip/<key>`). `openvibe-node status --json` should show `link.connected: true` and
+`real` and `wheels: "ordinary"`, and `video.source` is `auto`. The config has no `video.whip_url`: the ingest URL +
+publish key the pairing returned (O30: `https://ingest.openre.stream/whip/<key>`) is stored in
+`/etc/openvibe-node/credential.json`, and video publishes there unless a `video.whip_url` in the config overrides it.
+`openvibe-node status --json` should show `link.connected: true` and
 `video.state` at `connecting` or `live`.
 
 ## 3. Panel checklist
