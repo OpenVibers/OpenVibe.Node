@@ -19,6 +19,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install pytest pillow numpy
+      # Ubuntu's AppArmor restricts unprivileged user namespaces, which the worker sandbox tests need; relax it as ci.yml does.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: go vet ./... && go test -count=1 ./...
       - run: |
           for p in sdk dryrun adeept_adr036 cozmo; do python -m pytest -q plugins/$p/tests; done
