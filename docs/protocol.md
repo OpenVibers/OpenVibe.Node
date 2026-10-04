@@ -251,8 +251,9 @@ worker caps in `status.capabilities.worker`:
 `capabilities` holds one `worker:<class>` name per entry in `runtime_classes` (the `platform.resource-offer@1`
 capabilities namespace OpenVibe.Run routes on; the names are reserved in OpenVibe.Contracts and no schema change
 was needed), so only classes this Node actually runs are advertised: `worker:function` today, `worker:code` once the
-`code` class ships. The limits are `worker.caps` with defaults applied; the key is absent while the worker is off,
-and `worker` is reserved as a plugin name.
+`code` class ships. The limits are `worker.caps` with defaults applied; the key is absent while the worker is off or
+declares no `functions` (a probe that passes with none advertises nothing, so Fabric places no job this Node would
+refuse), and `worker` is reserved as a plugin name.
 
 ### Fault codes
 
