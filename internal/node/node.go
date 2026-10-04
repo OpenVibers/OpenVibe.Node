@@ -158,9 +158,11 @@ func New(opt Options) (*Node, error) {
 		} else {
 			n.worker = w
 			w.SetStopped(stopFault(n.latch.State()))
-			// The only class advertised (status.capabilities.worker), and only with a worker to run it; with none,
-			// every job is refused "class not available".
-			n.jobs.admit, n.jobs.classes = w.Admit, []string{protocol.ClassFunction}
+			n.jobs.admit = w.Admit
+			// Advertise function jobs only when the worker has a function to run.
+			if len(opt.Config.Worker.Functions) > 0 {
+				n.jobs.classes = []string{protocol.ClassFunction}
+			}
 			opt.Log.Info("worker on", "functions", len(opt.Config.Worker.Functions))
 		}
 	}

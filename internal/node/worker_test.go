@@ -60,6 +60,30 @@ func startWorkerNode(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A race-instrumented binary maps terabytes of shadow memory up front: RLIMIT_AS 64 TiB leaves it room. The job
+	// gets a copy of its artifact directory, this test binary, in max_disk_bytes.
+	cfg := config.WorkerConfig{Enabled: true, AllowSameUser: true, Caps: config.WorkerCaps{MaxMemBytes: 8 << 30, MaxVMBytes: 1 << 46,
+		MaxDiskBytes: 256 << 20},
+		Functions: []config.FunctionConfig{{Name: "hello", Version: "1.0.0", Command: []string{exe, "-test.run=^TestWorkerHelperProcess$", "--", "job"},
+			Env: map[string]string{"GOMAXPROCS": "2"}}}}
+	if os.Geteuid() == 0 { // as root, jobs run as nobody: the test binary must then lie in a directory nobody can read
+		cfg.AllowSameUser, cfg.RunAs = false, &config.RunAs{UID: 65534, GID: 65534}
+	}
+	e, status := startWorkerNodeWith(t, cfg, true)
+	caps := cfg.Caps.WithDefaults()
+	want := map[string]any{"capabilities": []any{"worker:function"}, "runtime_classes": []any{protocol.ClassFunction}, "max_jobs": float64(caps.MaxJobs),
+		"max_ttl_ms": float64(caps.MaxTTLMS), "max_wall_ms": float64(caps.MaxWallMS),
+		"max_cpu_ms": float64(caps.MaxCPUMS), "max_mem_bytes": float64(caps.MaxMemBytes),
+		"max_output_bytes": float64(caps.MaxOutputBytes)}
+	got := status.Capabilities[protocol.CapWorker]
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("worker capability = %#v, want %#v", got, want)
+	}
+	return e
+}
+
+func startWorkerNodeWith(t *testing.T, workerCfg config.WorkerConfig, probeShouldPass bool) (*env, protocol.Status) {
+	t.Helper()
 	home, err := os.MkdirTemp("", "ovn")
 	if err != nil {
 		t.Fatal(err)
@@ -78,15 +102,7 @@ func startWorkerNode(t *testing.T) *env {
 	cfg := config.Default()
 	cfg.Plugins = nil
 	cfg.Video = config.VideoConfig{Source: "off"}
-	// A race-instrumented binary maps terabytes of shadow memory up front: RLIMIT_AS 64 TiB leaves it room. The job
-	// gets a copy of its artifact directory, this test binary, in max_disk_bytes.
-	cfg.Worker = config.WorkerConfig{Enabled: true, AllowSameUser: true, Caps: config.WorkerCaps{MaxMemBytes: 8 << 30, MaxVMBytes: 1 << 46,
-		MaxDiskBytes: 256 << 20},
-		Functions: []config.FunctionConfig{{Name: "hello", Version: "1.0.0", Command: []string{exe, "-test.run=^TestWorkerHelperProcess$", "--", "job"},
-			Env: map[string]string{"GOMAXPROCS": "2"}}}}
-	if os.Geteuid() == 0 { // as root, jobs run as nobody: the test binary must then lie in a directory nobody can read
-		cfg.Worker.AllowSameUser, cfg.Worker.RunAs = false, &config.RunAs{UID: 65534, GID: 65534}
-	}
+	cfg.Worker = workerCfg
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -95,11 +111,15 @@ func startWorkerNode(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(n.jobs.runtimeClasses(), protocol.ClassFunction) {
-		if os.Getenv("OPENVIBE_WORKER_TESTS") == "require" {
-			t.Fatal("job isolation unavailable: the worker probe failed")
+	if probeShouldPass {
+		if n.worker == nil {
+			if os.Getenv("OPENVIBE_WORKER_TESTS") == "require" {
+				t.Fatal("job isolation unavailable: the worker probe failed")
+			}
+			t.Skip("job isolation unavailable here (OPENVIBE_WORKER_TESTS=require fails instead)")
 		}
-		t.Skip("job isolation unavailable here (OPENVIBE_WORKER_TESTS=require fails instead)")
+	} else if n.worker != nil {
+		t.Fatal("worker probe passed without an identity policy")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -107,23 +127,38 @@ func startWorkerNode(t *testing.T) *env {
 	e := &env{t: t, srv: srv, node: n, paths: paths, cancel: cancel, done: done}
 	t.Cleanup(e.stop)
 	e.conn = e.nextConn()
-	f, err := e.conn.Expect(protocol.TypeStatus, 10*time.Second, func(m protocol.Message) bool {
-		_, ok := m.(protocol.Status).Capabilities[protocol.CapWorker]
-		return ok
-	})
+	f, err := e.conn.Expect(protocol.TypeStatus, 10*time.Second, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	caps := cfg.Worker.Caps.WithDefaults()
-	want := map[string]any{"capabilities": []any{"worker:function"}, "runtime_classes": []any{protocol.ClassFunction}, "max_jobs": float64(caps.MaxJobs),
-		"max_ttl_ms": float64(caps.MaxTTLMS), "max_wall_ms": float64(caps.MaxWallMS),
-		"max_cpu_ms": float64(caps.MaxCPUMS), "max_mem_bytes": float64(caps.MaxMemBytes),
-		"max_output_bytes": float64(caps.MaxOutputBytes)}
-	got := f.Msg.(protocol.Status).Capabilities[protocol.CapWorker]
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("worker capability = %#v, want %#v", got, want)
+	return e, f.Msg.(protocol.Status)
+}
+
+func TestWorkerWithNoFunctions(t *testing.T) {
+	e, status := startWorkerNodeWith(t, config.WorkerConfig{Enabled: true, AllowSameUser: true}, true)
+	if classes := e.node.jobs.runtimeClasses(); len(classes) != 0 {
+		t.Fatalf("runtime classes with no functions = %v, want none", classes)
 	}
-	return e
+	if _, ok := status.Capabilities[protocol.CapWorker]; ok {
+		t.Fatalf("worker capability advertised with no functions: %+v", status.Capabilities)
+	}
+	if nk := e.jobNack(testJob(jobID(1)), protocol.JobNotAvailable); nk.FaultCode != protocol.FaultUnsupported {
+		t.Fatalf("job with no functions: %+v", nk)
+	}
+}
+
+func TestWorkerFailedProbeDoesNotAdvertiseFunctions(t *testing.T) {
+	e, status := startWorkerNodeWith(t, config.WorkerConfig{Enabled: true,
+		Functions: []config.FunctionConfig{{Name: "hello", Version: "1.0.0", Command: []string{"/bin/true"}}}}, false)
+	if classes := e.node.jobs.runtimeClasses(); len(classes) != 0 {
+		t.Fatalf("runtime classes after failed probe = %v, want none", classes)
+	}
+	if _, ok := status.Capabilities[protocol.CapWorker]; ok {
+		t.Fatalf("worker capability advertised after failed probe: %+v", status.Capabilities)
+	}
+	if nk := e.jobNack(testJob(jobID(1)), protocol.JobNotAvailable); nk.FaultCode != protocol.FaultUnsupported {
+		t.Fatalf("job after failed probe: %+v", nk)
+	}
 }
 
 // TestJobRunsOverTheLink: a job sent by the fake Bot is acked, then job_started, job_stdout, job_usage (second 0)

@@ -87,7 +87,7 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
 
 The class `function` — advertised as the reserved Fabric capability `worker:function` in
 `status.capabilities.worker` (the `platform.resource-offer@1` namespace OpenVibe.Run routes on) — is offered only when `enabled` is true, the OS is Linux
-(amd64 or arm64: the architectures with a seccomp allowlist) and a **boot-time probe** passes: it starts `/bin/sh`
+(amd64 or arm64: the architectures with a seccomp allowlist), at least one `functions` entry is declared and a **boot-time probe** passes: it starts `/bin/sh`
 the way a job is started and checks every control from the host: the sandbox was set up; the process has user,
 mount, network, PID, IPC, UTS and cgroup namespaces of its own, `NoNewPrivs` and a seccomp filter; nothing in its
 root but `/tmp`, `/proc` and the device nodes is mounted writable; it is in its own cgroup with every controller
