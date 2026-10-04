@@ -63,14 +63,25 @@ type plan struct {
 	egress string // the job's network policy (egressFor); "" is none
 }
 
-// egressFor is the network policy a job runs under: the stricter of its net and the host's worker.egress. A job
-// naming net "deny" (the only value it may name) runs under none whatever the host allows; without net, the host's
-// policy applies.
-func egressFor(host, net string) string {
-	if net != "" || host == config.EgressNone {
-		return ""
+// egressFor is the network policy a job runs under: the stricter of the net the job names and the host's worker.egress.
+// A net of deny (or none, the same policy as the Node spells it), which is also what an absent net means in
+// platform.job@1, runs under no network whatever the host allows: the contract's default is deny and the Node never
+// widens it. A named public or openvibe-only still needs the host to allow that much, so a host under none refuses
+// the job at Admit rather than running it with less than was asked.
+func egressFor(host, net string) (string, bool) {
+	switch net {
+	case "", protocol.NetDeny, protocol.NetNone:
+		return "", true
+	case protocol.NetPublic, protocol.NetOpenVibeOnly:
+		if host == config.EgressNone {
+			return "", false
+		}
+		if host == net {
+			return host, true
+		}
+		return config.StrictestEgress(host, net), true
 	}
-	return host
+	return "", false
 }
 
 type job struct {
@@ -116,6 +127,14 @@ func (w *Worker) Admit(j protocol.Job) (fault, reason string) {
 	}
 	if j.Class != protocol.ClassFunction && j.Class != protocol.ClassCode {
 		return protocol.FaultUnsupported, protocol.JobNotAvailable
+	}
+	// inputs are refused until the Node can stage them and check their digests (platform.job@1): a job never runs
+	// with the files and the digest check silently dropped.
+	if len(j.Inputs) > 0 {
+		return protocol.FaultUnsupported, protocol.JobInputsRefused
+	}
+	if _, ok := egressFor(w.cfg.Egress, j.Net); !ok {
+		return protocol.FaultUnsupported, protocol.JobNetUnsupported
 	}
 	fn, ok := w.entry(j.Class, j.Artifact)
 	if !ok {
@@ -402,7 +421,8 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 	cmd.Dir, cmd.Env = work, jobEnv(jb.fn, work, id)
 	cmd.Stdin = bytes.NewReader(append(append([]byte(nil), jb.req.Args...), '\n'))
 	cmd.Stdout, cmd.ExtraFiles = outW, []*os.File{resW}
-	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits, egress: egressFor(w.cfg.Egress, jb.req.Net)})
+	egress, _ := egressFor(w.cfg.Egress, jb.req.Net) // Admit refused what the host cannot enforce
+	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits, egress: egress})
 	if err != nil {
 		outW.Close()
 		resW.Close()

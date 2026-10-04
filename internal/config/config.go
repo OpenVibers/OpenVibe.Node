@@ -127,8 +127,10 @@ type WorkerConfig struct {
 	// Egress is the most a job may reach on the network, all three enforced (docs/worker.md): none (the default; a
 	// network namespace with only a loopback that is down), public (IPv4 to public addresses, through a veth the Node
 	// NATs; private, shared, link-local and reserved ranges, EgressDeny and the host itself refused) or openvibe-only
-	// (public restricted to EgressAllow). A job runs under the stricter of its own net and this: net "deny" is none
-	// whatever Egress says. A policy the host cannot enforce fails the probe, so the worker stays off.
+	// (public restricted to EgressAllow). A job runs under the stricter of the net it names and this: a job naming no
+	// net (platform.job@1's declared default, deny), or deny or none, gets no network whatever this says; a job naming
+	// public or openvibe-only is refused when this is none, never run with less than was asked. A policy the host cannot
+	// enforce fails the probe, so the worker stays off.
 	Egress string `json:"egress,omitempty"`
 	// EgressAllow is the IPv4 CIDRs an openvibe-only job may reach (the OpenVibe network's own ranges, configured
 	// rather than guessed); required with openvibe-only and refused with any other policy.
@@ -147,6 +149,24 @@ const (
 	EgressPublic       = "public"
 	EgressOpenVibeOnly = "openvibe-only"
 )
+
+// StrictestEgress returns the stricter of two worker.egress policies: openvibe-only is stricter than public, public
+// than none. An unknown value ranks as none, the strictest that is still enforceable.
+func StrictestEgress(a, b string) string {
+	rank := func(p string) int {
+		switch p {
+		case EgressPublic:
+			return 1
+		case EgressOpenVibeOnly:
+			return 2
+		}
+		return 0
+	}
+	if rank(a) <= rank(b) {
+		return a
+	}
+	return b
+}
 
 // FunctionConfig is one artifact a job may run: Command is started with the job's args as JSON on stdin.
 type FunctionConfig struct {

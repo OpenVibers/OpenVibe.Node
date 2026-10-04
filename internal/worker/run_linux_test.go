@@ -1263,8 +1263,9 @@ func TestEgressUnenforceable(t *testing.T) {
 
 // TestEgress: under none a job has no route at all; under public it has one, but 10.0.0.1, 169.254.169.254 (cloud
 // metadata) and the host's end of its veth are refused by the Node's table (refused, not unreachable nor a timeout);
-// under openvibe-only an unlisted public host is refused too; a job naming net "deny" under public gets none. It needs
-// root, ip, nsenter, nft and IPv4 forwarding: it skips without the programs even where OPENVIBE_WORKER_TESTS=require.
+// under openvibe-only an unlisted public host is refused too; a job naming net "deny" or no net at all under public
+// gets none whatever the host allows, and one naming public under openvibe-only gets public. It needs root, ip,
+// nsenter, nft and IPv4 forwarding: it skips without the programs even where OPENVIBE_WORKER_TESTS=require.
 func TestEgress(t *testing.T) {
 	none := map[string]string{"10.0.0.1:80": "unreachable", "169.254.169.254:80": "unreachable",
 		"169.254.240.1:22": "unreachable", "1.1.1.1:53": "unreachable"}
@@ -1276,10 +1277,14 @@ func TestEgress(t *testing.T) {
 		want         map[string]string
 	}{
 		{"none", "", nil, "", none},
-		{"public", config.EgressPublic, nil, "", refused},
-		{"openvibe-only", config.EgressOpenVibeOnly, []string{"9.9.9.9/32"}, "",
+		{"public", config.EgressPublic, nil, protocol.NetPublic, refused},
+		{"openvibe-only", config.EgressOpenVibeOnly, []string{"9.9.9.9/32"}, protocol.NetOpenVibeOnly,
 			map[string]string{"10.0.0.1:80": "refused", "169.254.169.254:80": "refused", "1.1.1.1:53": "refused"}},
 		{"deny under public", config.EgressPublic, nil, protocol.NetDeny, none},
+		{"no net under public", config.EgressPublic, nil, "", none},
+		{"none under openvibe-only", config.EgressOpenVibeOnly, []string{"9.9.9.9/32"}, "", none},
+		// A job asking for less than the host allows runs under what it asked.
+		{"public under openvibe-only", config.EgressOpenVibeOnly, []string{"9.9.9.9/32"}, protocol.NetPublic, refused},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := helperConfig(t, config.WorkerCaps{}, "egress")

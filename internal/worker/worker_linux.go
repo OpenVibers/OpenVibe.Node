@@ -280,8 +280,14 @@ func probe(cfg config.WorkerConfig, isolate isolateFunc) error {
 	if err := policy(cfg); err != nil {
 		return err
 	}
-	egress := egressFor(cfg.Egress, "")
-	if egress != "" {
+	// The host's own policy, the ceiling every job may be offered: a job naming deny or none (or no net at all) runs
+	// under no network whatever it says, and one naming public or openvibe-only runs under this, which the probe must be
+	// able to enforce (Admit refuses what it cannot).
+	egress := cfg.Egress
+	if egress == "" {
+		egress = config.EgressNone
+	}
+	if egress != config.EgressNone {
 		if _, err := egressReady(); err != nil {
 			return fmt.Errorf("worker.egress %s: %w", egress, err)
 		}

@@ -237,7 +237,7 @@ Otherwise it advertises no class and refuses every well-formed job with `class n
 
 | direction        | type           | fields                                                                                    |
 |------------------|----------------|-------------------------------------------------------------------------------------------|
-| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function` and `code`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`: no network whatever the Node's `worker.egress`; absent: `worker.egress` applies, `none` by default)} |
+| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function` and `code`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`, `none`, `public`, `openvibe-only`; absent means `deny`, which the Node never widens to its own `worker.egress`; `public` and `openvibe-only` run under the stricter of what is asked and what `worker.egress` allows, and are refused when it is `none`), `inputs` (files pinned by Media id and sha256: **refused**, `job inputs not supported`, until the Node can stage and verify them)} |
 | server → device  | `job_cancel`   | `id`                                                                                      |
 | server → device  | `job_exit_ack` | `id`                                                                                      |
 | device → server  | `job_started`  | `id`, `started_ms`                                                                        |
@@ -254,7 +254,9 @@ checked in this order:
 | `malformed job`                              | `bad_frame`   | the `job` object does not decode (a field of the wrong type) |
 | `unknown class`                              | `unsupported` | `class` is not one of `function`, `code`, `browser`, `linux`, `desktop`, `gpu` |
 | `function or code job needs an artifact with an exact version` | `bad_value` | a `function` or `code` job without `artifact`, or a name or version outside the contract's pattern (a range) |
-| `net policy not supported`                   | `unsupported` | `net` is present and not `deny`                             |
+| `net policy not supported`                   | `unsupported` | `net` is present and not one of `deny`, `none`, `public`, `openvibe-only`, or is one the host cannot enforce |
+| `invalid inputs`                             | `bad_value`   | an entry of `inputs` outside the contract's patterns, a repeated name, or more than 32 |
+| `job inputs not supported`                   | `unsupported` | the job carries `inputs`: this Node cannot stage and check them yet, so it never runs it with them dropped |
 | `missing or invalid args, ttl_ms or limits`  | `bad_value`   | `args` is not an object, or `ttl_ms` or a limit is missing or below 1 |
 | `class not available`                        | `unsupported` | the class is valid but this Node does not run it (every class but `function`; every class while the worker is off) |
 | `the e-stop or local stop is latched`        | `estopped` or `local_stop` | the stop latch is set: no job starts until it clears |

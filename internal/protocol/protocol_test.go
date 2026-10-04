@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -264,6 +265,16 @@ func TestWorkerCapabilityNames(t *testing.T) {
 	}
 }
 
+// A well formed input, the Media object and digest the contract's example carries.
+const (
+	mediaID = "med_01JAB2C3D4E5F6G7H8J9K0MNPQ"
+	digest  = "9f86d081884c7d659a2feb15b0b4f8f1c0e6ad1d7e6fd2e1b0b6fd1c4f1d2a3b"
+)
+
+func goodInputs() []JobInput {
+	return []JobInput{{Name: "clip.mp4", MediaID: mediaID, SHA256: digest, SizeBytes: 1048576}}
+}
+
 func TestJobCheck(t *testing.T) {
 	const id = "job_01JAB2C3D4E5F6G7H8J9K0MNPQ"
 	valid := func() Job {
@@ -296,6 +307,24 @@ func TestJobCheck(t *testing.T) {
 		{"version span", func(j *Job) { j.Artifact.Version = "1.2 - 2" }, []string{ClassFunction}, JobNoArtifact},
 		{"bad artifact name", func(j *Job) { j.Artifact.Name = "Thumbnail" }, []string{ClassFunction}, JobNoArtifact},
 		{"net allow", func(j *Job) { j.Net = "allow" }, []string{ClassFunction}, JobNetUnsupported},
+		{"net none", func(j *Job) { j.Net = NetNone }, []string{ClassFunction}, ""},
+		{"net public", func(j *Job) { j.Net = NetPublic }, []string{ClassFunction}, ""},
+		{"net openvibe-only", func(j *Job) { j.Net = NetOpenVibeOnly }, []string{ClassFunction}, ""},
+		{"inputs taken", func(j *Job) { j.Inputs = goodInputs() }, []string{ClassFunction}, ""},
+		{"input without a digest", func(j *Job) { j.Inputs = []JobInput{{Name: "a.bin", MediaID: mediaID}} }, []string{ClassFunction}, JobBadInputs},
+		{"input with a path", func(j *Job) { j.Inputs = []JobInput{{Name: "a/b.bin", MediaID: mediaID, SHA256: digest}} }, []string{ClassFunction}, JobBadInputs},
+		{"input twice under one name", func(j *Job) {
+			j.Inputs = []JobInput{{Name: "a.bin", MediaID: mediaID, SHA256: digest}, {Name: "a.bin", MediaID: mediaID, SHA256: digest}}
+		}, []string{ClassFunction}, JobBadInputs},
+		{"input with a negative size", func(j *Job) {
+			j.Inputs = []JobInput{{Name: "a.bin", MediaID: mediaID, SHA256: digest, SizeBytes: -1}}
+		}, []string{ClassFunction}, JobBadInputs},
+		{"too many inputs", func(j *Job) {
+			j.Inputs = nil
+			for i := 0; i < 33; i++ {
+				j.Inputs = append(j.Inputs, JobInput{Name: fmt.Sprintf("f%02d.bin", i), MediaID: mediaID, SHA256: digest})
+			}
+		}, []string{ClassFunction}, JobBadInputs},
 		{"no args", func(j *Job) { j.Args = nil }, []string{ClassFunction}, JobBadLimits},
 		{"args not an object", func(j *Job) { j.Args = json.RawMessage(`[1]`) }, []string{ClassFunction}, JobBadLimits},
 		{"no ttl", func(j *Job) { j.TTLMS = 0 }, []string{ClassFunction}, JobBadLimits},
@@ -307,6 +336,33 @@ func TestJobCheck(t *testing.T) {
 		if _, reason := (JobRequest{Job: j}).Check(c.available); reason != c.reason {
 			t.Errorf("%s: reason %q, want %q", c.name, reason, c.reason)
 		}
+	}
+}
+
+// TestJobInputsDecode: the contract's second example (a code job with inputs and net public) decodes to the inputs it
+// names, which Check then takes; the same body without inputs keeps none.
+func TestJobInputsDecode(t *testing.T) {
+	const body = `{"v":1,"seq":3,"ts":1790935200000,"type":"job","job":{"id":"job_01JAB2C3D4E5F6G7H8J9K0MNPR","class":"code",
+		"artifact":{"name":"transcode","version":"0.4.1"},"args":{"format":"webm"},"ttl_ms":120000,
+		"limits":{"wall_ms":90000,"cpu_ms":90000,"mem_bytes":536870912},"net":"public",
+		"inputs":[{"name":"clip.mp4","media_id":"med_01JAB2C3D4E5F6G7H8J9K0MNPQ","sha256":"9f86d081884c7d659a2feb15b0b4f8f1c0e6ad1d7e6fd2e1b0b6fd1c4f1d2a3b","size_bytes":1048576}]}}`
+	f, err := Decode([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := f.Msg.(JobRequest)
+	if r.Err != nil || r.Job.Net != NetPublic || !reflect.DeepEqual(r.Job.Inputs, goodInputs()) {
+		t.Fatalf("%+v", r)
+	}
+	if fault, reason := r.Check([]string{ClassCode}); fault != "" {
+		t.Fatalf("the contract's example is refused: %s %s", fault, reason)
+	}
+	f, err = Decode([]byte(`{"v":1,"seq":3,"ts":1,"type":"job","job":{"id":"job_01JAB2C3D4E5F6G7H8J9K0MNPR","class":"code","artifact":{"name":"transcode","version":"0.4.1"},"args":{},"ttl_ms":1,"limits":{"wall_ms":1,"cpu_ms":1,"mem_bytes":1}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j := f.Msg.(JobRequest).Job; len(j.Inputs) != 0 || j.Net != "" {
+		t.Fatalf("%+v: inputs and net must stay absent when the body carries none", j)
 	}
 }
 

@@ -289,16 +289,49 @@ func TestUsageHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-// TestEgressFor: a job runs under the stricter of its net and the host's egress: net "deny" is none whatever the host
-// allows; without net, the host's policy.
+// TestEgressFor: an absent net (the contract's declared deny) is no network whatever the host allows; net deny and
+// none are that too; a named public or openvibe-only runs under the stricter of itself and the host's, and is refused
+// when the host is none; a net this Node does not know is refused, never run weaker.
 func TestEgressFor(t *testing.T) {
-	for _, c := range []struct{ host, net, want string }{
-		{"", "", ""}, {config.EgressNone, "", ""}, {config.EgressPublic, "", config.EgressPublic},
-		{config.EgressOpenVibeOnly, "", config.EgressOpenVibeOnly}, {config.EgressPublic, protocol.NetDeny, ""},
-		{config.EgressOpenVibeOnly, protocol.NetDeny, ""}, {config.EgressPublic, "allow", ""},
+	for _, c := range []struct {
+		host, net string
+		want      string
+		ok        bool
+	}{
+		{"", "", "", true}, {config.EgressNone, "", "", true}, {config.EgressPublic, "", "", true},
+		{config.EgressOpenVibeOnly, "", "", true},
+		{config.EgressPublic, protocol.NetDeny, "", true}, {config.EgressOpenVibeOnly, protocol.NetNone, "", true},
+		{config.EgressPublic, protocol.NetPublic, config.EgressPublic, true},
+		{config.EgressPublic, protocol.NetOpenVibeOnly, config.EgressPublic, true},
+		{config.EgressOpenVibeOnly, protocol.NetPublic, config.EgressPublic, true},
+		{config.EgressOpenVibeOnly, protocol.NetOpenVibeOnly, config.EgressOpenVibeOnly, true},
+		{config.EgressNone, protocol.NetPublic, "", false},
+		{config.EgressNone, protocol.NetOpenVibeOnly, "", false},
+		{config.EgressPublic, "allow", "", false}, {config.EgressPublic, "", "", true},
 	} {
-		if got := egressFor(c.host, c.net); got != c.want {
-			t.Errorf("egressFor(%q, %q) = %q, want %q", c.host, c.net, got, c.want)
+		got, ok := egressFor(c.host, c.net)
+		if got != c.want || ok != c.ok {
+			t.Errorf("egressFor(%q, %q) = %q, %v; want %q, %v", c.host, c.net, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+// TestAdmitRefusesInputs: a job carrying inputs is refused, never run with them silently dropped (platform.job@1).
+func TestAdmitRefusesInputs(t *testing.T) {
+	s := &sink{}
+	w := New(helperConfig(t, config.WorkerCaps{}, "sleep"), s.send, quiet())
+	j := testJob(1, "sleep")
+	j.Inputs = []protocol.JobInput{{Name: "clip.mp4", MediaID: "med_01JAB2C3D4E5F6G7H8J9K0MNPQ",
+		SHA256: "9f86d081884c7d659a2feb15b0b4f8f1c0e6ad1d7e6fd2e1b0b6fd1c4f1d2a3b"}}
+	if f, r := w.Admit(j); f != protocol.FaultUnsupported || r != protocol.JobInputsRefused {
+		t.Fatalf("a job with inputs: %q %q, want %q %q", f, r, protocol.FaultUnsupported, protocol.JobInputsRefused)
+	}
+	// A net the host cannot enforce is refused too, rather than run with no network.
+	n := testJob(2, "sleep")
+	n.Net = protocol.NetPublic
+	cfg := helperConfig(t, config.WorkerCaps{}, "sleep")
+	cfg.Egress = config.EgressNone
+	if f, r := New(cfg, s.send, quiet()).Admit(n); f != protocol.FaultUnsupported || r != protocol.JobNetUnsupported {
+		t.Fatalf("net public under egress none: %q %q", f, r)
 	}
 }
