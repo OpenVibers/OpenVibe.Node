@@ -113,7 +113,7 @@ pattern (dry-run), an H.264 byte stream from a child process (`rpicam-vid`, `ffm
 
 ## install.sh and CI
 
-`install/install.sh` (`curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_... --code ABCD-1234 --driver adeept`):
+`install/install.sh` (`curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code CODE [--driver adeept|adeept-mecanum|cozmo|none]`, e.g. `--code ABCD-1234 --driver adeept`):
 detect OS/arch, download the release binary and the plugin bundle, create a Python virtual environment for plugins,
 install the service, pair with the code.
 CI: `go vet`, `go test ./...` (race detector), cross-compile every target, Python plugin tests, and a release workflow on

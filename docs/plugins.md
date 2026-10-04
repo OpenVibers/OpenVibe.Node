@@ -107,6 +107,9 @@ the panel (ADR-043 decision 7: names are open strings checked against a registry
 | `camera`   | `{"h264_command": [argv]}` (the core runs it), `{"jpeg": true}` (frames by `video`), or `{"source": "test_pattern"}` | video |
 | `battery`, `sensors`, `lights`, `bridge` | informational                                              | —           |
 
+For the Adeept 4WD Smart Car's on-Pi pass — wiring, pairing, the panel checklist and camera troubleshooting — see
+[hardware-adeept.md](hardware-adeept.md).
+
 ## The bundled drivers
 
 ### `dryrun`
