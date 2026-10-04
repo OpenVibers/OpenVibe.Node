@@ -10,6 +10,10 @@
 // 4002 (credential refused) and 4003 (revoked) keep retrying, never sooner than CredentialRetryMin, and log what to
 // do: pair again, or import the owner's rotation. Bot's error frames are logged, never fatal.
 //
+// A Network-paired machine (Options.Tokens) presents a node token instead of the credential: a fresh one on every
+// upgrade after a refusal, and a `reauth` frame with a fresh one every ReauthInterval (Bot closes 4002 when none
+// arrives within 330 s). Network refusing the node credential (ErrNodeRevoked) is the one error that ends Run.
+//
 // Every server frame's ts also feeds an estimate of the server's clock (ServerNow), which the Node uses to read the
 // absolute deadline_ms of a command.
 package link
@@ -51,14 +55,23 @@ type Handler interface {
 type Options struct {
 	URL        string // wss://openvibe.bot/device
 	Credential credentials.Secret
-	UserAgent  string
-	Log        *slog.Logger
-	Dialer     *websocket.Dialer
+	// Tokens, when set, replaces Credential with node tokens (a Network-paired machine).
+	Tokens         Tokens
+	ReauthInterval time.Duration // default 240 s: node tokens live 300 s
+	UserAgent      string
+	Log            *slog.Logger
+	Dialer         *websocket.Dialer
 
 	HeartbeatInterval time.Duration // default 1 s
 	Deadman           time.Duration // default 2 × heartbeat
 	BackoffMin        time.Duration // default 500 ms
 	BackoffMax        time.Duration // default 30 s
+}
+
+// Tokens supplies node tokens; *TokenSource is the real one.
+type Tokens interface {
+	Token(ctx context.Context) (credentials.Secret, error)
+	Invalidate()
 }
 
 // CredentialRetryMin is the least a refused or revoked credential (close 4002 / 4003, HTTP 401 / 403) waits before
@@ -114,6 +127,9 @@ func New(opt Options, h Handler) *Link {
 	}
 	if opt.BackoffMax <= 0 {
 		opt.BackoffMax = 30 * time.Second
+	}
+	if opt.ReauthInterval <= 0 {
+		opt.ReauthInterval = 240 * time.Second
 	}
 	if opt.Log == nil {
 		opt.Log = slog.Default()
@@ -236,18 +252,27 @@ func (l *Link) Send(m protocol.Message) error {
 	}
 }
 
-// Run connects and reconnects until ctx ends. A refused or revoked credential does not end it: the owner may pair
-// the device again, and the Node retries every CredentialRetryMin or more, saying so in the log.
-func (l *Link) Run(ctx context.Context) {
+// Run connects and reconnects until ctx ends (it then returns nil). A refused or revoked credential does not end it:
+// the owner may pair the device again, and the Node retries every CredentialRetryMin or more, saying so in the log.
+// Only ErrNodeRevoked ends it early, returned: the node credential itself is dead and the machine must pair again.
+func (l *Link) Run(ctx context.Context) error {
 	attempt := 0
 	for ctx.Err() == nil {
 		start := time.Now()
 		err := l.session(ctx)
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 		msg := errMsg(err)
 		l.lastErr.Store(msg)
+		if errors.Is(err, ErrNodeRevoked) {
+			l.log.Error("link stopped: pair this machine again", "err", msg)
+			return err
+		}
+		if l.opt.Tokens != nil && credentialRefused(err) {
+			// Bot refused the token: the next upgrade presents a fresh one (bought with the node credential).
+			l.opt.Tokens.Invalidate()
+		}
 		if time.Since(start) > 30*time.Second {
 			attempt = 0
 		}
@@ -261,10 +286,11 @@ func (l *Link) Run(ctx context.Context) {
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-time.After(wait):
 		}
 	}
+	return nil
 }
 
 // backoff is the wait before reconnect attempt number attempt (0 first) after err: exponential with full jitter and
@@ -319,8 +345,16 @@ func errMsg(err error) string {
 }
 
 func (l *Link) session(ctx context.Context) error {
+	cred := l.opt.Credential
+	if l.opt.Tokens != nil {
+		tok, err := l.opt.Tokens.Token(ctx)
+		if err != nil {
+			return err
+		}
+		cred = tok
+	}
 	h := http.Header{}
-	h.Set("Authorization", "Bearer "+l.opt.Credential.Reveal())
+	h.Set("Authorization", "Bearer "+cred.Reveal())
 	if l.opt.UserAgent != "" {
 		h.Set("User-Agent", l.opt.UserAgent)
 	}
@@ -332,7 +366,7 @@ func (l *Link) session(ctx context.Context) error {
 		if resp != nil {
 			return fmt.Errorf("connect %s: HTTP %d", redactURL(l.opt.URL), resp.StatusCode)
 		}
-		return fmt.Errorf("connect %s: %s", redactURL(l.opt.URL), scrub(err.Error(), l.opt.Credential))
+		return fmt.Errorf("connect %s: %s", redactURL(l.opt.URL), scrub(err.Error(), cred))
 	}
 	defer conn.Close()
 	conn.SetReadLimit(1 << 20)
@@ -424,6 +458,10 @@ func (l *Link) session(ctx context.Context) error {
 		}
 	}()
 
+	if l.opt.Tokens != nil {
+		go l.reauth(sessCtx, &up, end)
+	}
+
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -431,7 +469,7 @@ func (l *Link) session(ctx context.Context) error {
 				if ce := closeErr(err); ce != nil {
 					end(ce)
 				} else {
-					end(fmt.Errorf("read: %s", scrub(err.Error(), l.opt.Credential)))
+					end(fmt.Errorf("read: %s", scrub(err.Error(), cred)))
 				}
 			}
 			return endErr
@@ -507,6 +545,41 @@ func (l *Link) session(ctx context.Context) error {
 			continue
 		}
 		l.handler.Frame(f)
+	}
+}
+
+// reauth sends a fresh node token every ReauthInterval once the connection is up, and retries a failed fetch every
+// 15 s (Bot's deadline is 330 s after the last token). Network refusing the credential ends the session.
+func (l *Link) reauth(ctx context.Context, up *atomic.Bool, end func(error)) {
+	timer := time.NewTimer(l.opt.ReauthInterval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		next := l.opt.ReauthInterval
+		if up.Load() {
+			l.opt.Tokens.Invalidate()
+			tok, err := l.opt.Tokens.Token(ctx)
+			switch {
+			case errors.Is(err, ErrNodeRevoked):
+				end(err)
+				return
+			case err != nil:
+				if ctx.Err() != nil {
+					return
+				}
+				l.log.Warn("reauth: no fresh node token yet", "err", err)
+				next = min(next, 15*time.Second)
+			default:
+				if err := l.Send(protocol.Reauth{Token: tok.Reveal()}); err != nil {
+					l.log.Warn("reauth not sent", "err", err)
+				}
+			}
+		}
+		timer.Reset(next)
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -46,12 +45,8 @@ var pairMessages = map[string]string{
 
 // Pair redeems a one-time code with POST <server>/api/v1/pair.
 func Pair(ctx context.Context, client *http.Client, server string, req protocol.PairRequest) (*credentials.Credentials, error) {
-	u, err := url.Parse(server)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return nil, fmt.Errorf("server %q is not an https:// origin", server)
-	}
-	if u.Scheme == "http" && !isLoopback(u.Hostname()) {
-		return nil, fmt.Errorf("refusing to pair over plain http with %s", u.Host)
+	if err := checkOrigin(server, "server"); err != nil {
+		return nil, err
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -64,10 +59,7 @@ func Pair(ctx context.Context, client *http.Client, server string, req protocol.
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("User-Agent", "openvibe-node/"+req.AgentVersion)
-	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second}
-	}
-	resp, err := client.Do(hreq)
+	resp, err := defaultClient(client).Do(hreq)
 	if err != nil {
 		return nil, fmt.Errorf("pairing request failed: %w", err)
 	}

@@ -21,6 +21,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 		Ack{ID: "c1"},
 		Nack{ID: "c1", FaultCode: FaultEstopped},
 		Heartbeat{Seq: 10},
+		Reauth{Token: "eyJ.node.token"},
 		EstopState{Latched: true},
 		Error{Code: ErrNotPaired},
 	}

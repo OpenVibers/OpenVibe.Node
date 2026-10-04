@@ -20,6 +20,22 @@ ports, works behind any home router), and a local kill switch stops everything i
    names the device on openvibe.bot (default: the hostname).
 3. Confirm the new device on openvibe.bot.
 
+**Two pairing paths.** Which one the command uses is up to openvibe.bot; the installer takes both.
+
+- **Bot pairing** (the form above): `--robot rob_… --code CODE`. The Node redeems the code at
+  `POST <bot>/api/v1/pair` and stores the Bot device credential it answers with.
+- **Network pairing**: `--network <URL> --pairing pair_… --code CODE`, e.g.
+
+  ```sh
+  curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.network --pairing pair_01J8Z4M2Q0R7T9YV3K6N8P1W2Y --code ABCD-1234 --driver adeept
+  ```
+
+  The Node redeems the code on OpenVibe.Network (`POST <network>/api/v1/node-pairing`) and stores the machine's node
+  principal (`nod_…`) and node credential. With it the Node buys short-lived node tokens (`POST <network>/oauth/token`,
+  audience `openvibe.bot`) and binds itself on Bot (`POST <bot>/api/v1/devices/bind`), which answers the device id, the
+  robot and the WHIP publish key. A bind that fails at pairing is retried when the Node starts. `--pairing CODE` with
+  no `--code` also works (the code is then the value of `--pairing`).
+
 The installer detects the OS and CPU (linux amd64/arm64/armv7, macOS amd64/arm64), downloads the binary and the plugin
 bundle and checks them against `SHA256SUMS`, creates a Python virtual environment for the plugins, writes
 `config.json`, disables the Adeept kit's stock server if it finds it, creates the `openvibe-node` service account
@@ -37,6 +53,8 @@ from plugins that send JPEG frames).
 ```sh
 sudo install -m 755 openvibe-node-linux-arm64 /usr/local/bin/openvibe-node
 sudo openvibe-node pair ABCD-1234 --robot rob_…   # stores /etc/openvibe-node/credential.json (mode 600)
+# or, for a Network pairing:
+sudo openvibe-node pair --network https://openvibe.network --pairing pair_… --code ABCD-1234
 sudo openvibe-node install               # systemd / launchd / Windows service, starts it
 openvibe-node status
 ```
@@ -57,7 +75,7 @@ need Python; set `"python"` in `config.json`.
 
 | command                                   | what it does                                                               |
 |-------------------------------------------|----------------------------------------------------------------------------|
-| `openvibe-node pair <CODE> [--force]`     | redeem a pairing code (or `--code CODE`); `--robot rob_…` the robot it is for, `--name` the device name (default: hostname); `--server`, `--kind onboard\|bridge` override config |
+| `openvibe-node pair <CODE> [--force]`     | redeem a pairing code (or `--code CODE`); `--robot rob_…` the robot it is for, `--name` the device name (default: hostname); `--server`, `--kind onboard\|bridge` override config. With `--network URL [--pairing pair_…]` the code is redeemed on OpenVibe.Network and the device bound on Bot |
 | `openvibe-node run [--dry-run]`           | run in the foreground (what the service runs)                              |
 | `openvibe-node install [--user NAME]`     | install and start the service                                              |
 | `openvibe-node uninstall`                 | stop and remove the service (config and credential are kept)               |
@@ -74,7 +92,7 @@ obeys within a quarter second and a starting Node obeys before anything moves. T
 | Linux                                 | macOS / Windows                                       | contents                          |
 |---------------------------------------|-------------------------------------------------------|-----------------------------------|
 | `/etc/openvibe-node/config.json`      | `…/OpenVibe Node/config.json`                         | configuration                     |
-| `/etc/openvibe-node/credential.json`  | `…/OpenVibe Node/credential.json`                     | device credential (mode 600)      |
+| `/etc/openvibe-node/credential.json`  | `…/OpenVibe Node/credential.json`                     | device or node credential (mode 600) |
 | `/var/lib/openvibe-node/latch.json`   | `…/OpenVibe Node/latch.json`                          | e-stop / kill switch latch        |
 | `/var/lib/openvibe-node/node.sock`    | `…/OpenVibe Node/node.sock`                           | local control socket (mode 600)   |
 | `/var/lib/openvibe-node/venv`         | `…/OpenVibe Node/venv`                                | plugin Python environment         |
@@ -140,6 +158,9 @@ internet (Ethernet, or a second Wi-Fi adapter). Install with `--driver cozmo`; t
 
 - `openvibe-node status` shows the last link error. "the server refused the device credential" means it was revoked:
   `sudo openvibe-node pair --force <NEW-CODE>`.
+- A Network-paired machine whose node credential OpenVibe.Network refuses (revoked or removed) stops with "OpenVibe.Network
+  refused this machine's node credential" and exit status 78, which the systemd unit does not restart. Get a new
+  installer command on openvibe.bot and pair again with `--force`.
 - Logs: `journalctl -u openvibe-node -f` (Linux), `/usr/local/var/log/openvibe-node.err.log` (macOS). On Windows the
   service's log is not kept yet; stop the service and run `openvibe-node run` in a terminal to watch it.
 - A plugin in `faulted` state says why in `status` (missing library, not a Raspberry Pi, robot not reachable, firmware).

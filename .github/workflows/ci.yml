@@ -97,5 +97,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck -s sh install/install.sh scripts/dist.sh scripts/test-install-stock-server.sh
+      - run: shellcheck -s sh install/install.sh scripts/dist.sh scripts/test-install-stock-server.sh scripts/test-install-pair-args.sh
       - run: sh scripts/test-install-stock-server.sh
+      - run: sh scripts/test-install-pair-args.sh

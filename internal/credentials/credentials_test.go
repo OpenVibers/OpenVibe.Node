@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 )
 
 const secret = "s3cr3t-credential-value"
@@ -81,5 +83,48 @@ func TestCorruptFileErrorHasNoContents(t *testing.T) {
 	_, err := Load(p, nil)
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("err %v", err)
+	}
+}
+
+// A Network pairing stores {principal, node_credential, network, paired_for} with mode 0600, before any device is
+// bound; neither secret prints.
+func TestSaveLoadNetworkPaired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential.json")
+	c := &Credentials{Principal: "nod_01J8Z4M2Q0R7T9YV3K6N8P1W2X", NodeCredential: NewSecret(secret), Network: "https://openvibe.network",
+		PairedFor: &protocol.PairedFor{Service: "bot", Ref: "rob_1"}, Server: "https://openvibe.bot"}
+	if s := fmt.Sprintf("%v %+v", c, *c); strings.Contains(s, secret) {
+		t.Fatalf("secret printed: %s", s)
+	}
+	if err := Save(path, c); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(path); runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %o", st.Mode().Perm())
+	}
+	b, _ := os.ReadFile(path)
+	var raw map[string]any
+	_ = json.Unmarshal(b, &raw)
+	if raw["principal"] != c.Principal || raw["node_credential"] != secret || raw["network"] != c.Network || raw["paired_for"] == nil {
+		t.Fatalf("file: %s", b)
+	}
+	if _, ok := raw["credential"]; ok {
+		t.Fatalf("a Network pairing has no Bot credential: %s", b)
+	}
+	got, err := Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.NetworkPaired() || got.Bound() || got.NodeCredential.Reveal() != secret || got.PairedFor.Ref != "rob_1" || got.Label() != c.Principal {
+		t.Fatalf("%+v", got)
+	}
+	got.DeviceID, got.PublishKey = "dev_1", NewSecret("pk")
+	if err := Save(path, got); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := Load(path, nil); !again.Bound() || again.PublishKey.Reveal() != "pk" || again.NodeCredential.Reveal() != secret {
+		t.Fatalf("%+v", again)
+	}
+	if err := Save(path, &Credentials{Principal: c.Principal, Network: c.Network}); err == nil {
+		t.Fatal("saved a principal without its credential")
 	}
 }

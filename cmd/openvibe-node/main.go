@@ -1,6 +1,7 @@
 // Command openvibe-node connects a computer, server, Raspberry Pi or robot to OpenVibe.
 //
 //	openvibe-node pair <CODE>     redeem a one-time pairing code and store the device credential
+//	                              (--network/--pairing: pair on OpenVibe.Network and bind the device on Bot)
 //	openvibe-node credential import  take a rotated credential: reads the rotate response JSON on stdin
 //	openvibe-node run             run in the foreground (this is also what the service runs)
 //	openvibe-node install         install and start the system service
@@ -45,6 +46,7 @@ const usage = `openvibe-node %s: connect this device to OpenVibe.
 
 Usage:
   openvibe-node pair <CODE> [--robot rob_…] [--name NAME] [--server URL] [--kind onboard|bridge] [--force]
+  openvibe-node pair --network URL --pairing pair_… --code CODE [--name NAME] [--server URL] [--force]
   openvibe-node credential import   store the credential from a rotate response, read as JSON on stdin
   openvibe-node run [--dry-run]
   openvibe-node install [--user NAME]
@@ -93,6 +95,8 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		robot   = fs.String("robot", "", "the rob_… id of the robot to pair with, from the installer command (pair)")
 		name    = fs.String("name", "", "a name for this device on openvibe.bot; default: the hostname (pair)")
 		codeArg = fs.String("code", "", "the pairing code, instead of the argument (pair)")
+		network = fs.String("network", "", "OpenVibe.Network origin: pair this machine there (pair)")
+		pairing = fs.String("pairing", "", "the pair_… id from the installer command (pair, with --network)")
 		force   = fs.Bool("force", false, "pair again even if already paired")
 		dryRun  = fs.Bool("dry-run", false, "run only the dry-run plugin and the test pattern (run)")
 		asJSON  = fs.Bool("json", false, "print JSON (status, plugins)")
@@ -119,11 +123,21 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		if *codeArg != "" {
 			positional = append(positional, *codeArg)
 		}
+		p := pairArgs{robot: *robot, name: *name, server: *server, kind: *kind, force: *force, network: *network, pairing: *pairing}
+		// --pairing with no code is the code itself (`--pairing ABCD-1234`); a pair_… id needs --code beside it.
+		if p.pairing != "" && len(positional) == 0 && !strings.HasPrefix(p.pairing, "pair_") {
+			positional, p.pairing = []string{p.pairing}, ""
+		}
 		if len(positional) != 1 {
-			fmt.Fprintln(stderr, "usage: openvibe-node pair <CODE> [--robot rob_…] [--name NAME]")
+			fmt.Fprintln(stderr, "usage: openvibe-node pair <CODE> [--robot rob_…] [--name NAME]\n       openvibe-node pair --network URL --pairing pair_… --code CODE [--name NAME]")
 			return 2
 		}
-		err = cmdPair(g, pairArgs{code: positional[0], robot: *robot, name: *name, server: *server, kind: *kind, force: *force}, stdout)
+		p.code = positional[0]
+		if p.network != "" || p.pairing != "" {
+			err = cmdPairNetwork(g, p, stdout)
+		} else {
+			err = cmdPair(g, p, stdout)
+		}
 	case "credential":
 		if len(positional) != 1 || positional[0] != "import" {
 			fmt.Fprintln(stderr, "usage: openvibe-node credential import  (reads the rotate response JSON on stdin)")
@@ -159,6 +173,9 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
+		if errors.Is(err, link.ErrNodeRevoked) {
+			return service.ExitPairAgain
+		}
 		return 1
 	}
 	return 0
@@ -212,46 +229,78 @@ func probeAll(cfg *config.Config, paths config.Paths, log *slog.Logger) (map[str
 // pairArgs are the flags of `openvibe-node pair`.
 type pairArgs struct {
 	code, robot, name, server, kind string
+	network, pairing                string
 	force                           bool
 }
 
 // maxNameLen is the longest device name OpenVibe.Bot stores.
 const maxNameLen = 80
 
-func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
-	code, err := link.NormalizeCode(a.code)
-	if err != nil {
-		return err
-	}
-	server, kind, force := a.server, a.kind, a.force
-	if a.robot != "" && !link.RobotRe.MatchString(a.robot) {
-		return fmt.Errorf("--robot must be a robot id like rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X (a driver kind such as %q goes in the config's plugins)", a.robot)
-	}
-	name := strings.TrimSpace(a.name)
+// deviceName is --name, else the hostname, cut to maxNameLen.
+func deviceName(name string) string {
+	name = strings.TrimSpace(name)
 	if name == "" {
 		name, _ = os.Hostname()
 	}
 	if r := []rune(name); len(r) > maxNameLen {
 		name = string(r[:maxNameLen])
 	}
+	return name
+}
+
+// preparePair checks that this Node may pair (not paired yet, or --force) and returns the config with --server and
+// --kind applied, and whether config.json was missing (then pairing writes it).
+func preparePair(g *globals, a pairArgs) (*config.Config, bool, error) {
 	if err := g.paths.Ensure(); err != nil {
-		return fmt.Errorf("cannot create %s (run with sudo, or use --home): %w", g.paths.ConfigDir, err)
+		return nil, false, fmt.Errorf("cannot create %s (run with sudo, or use --home): %w", g.paths.ConfigDir, err)
 	}
-	if old, err := credentials.Load(g.paths.CredentialFile(), nil); err == nil && !force {
-		return fmt.Errorf("already paired as %s; use --force to pair again (the old credential stops working once the owner removes it)", old.DeviceID)
+	if old, err := credentials.Load(g.paths.CredentialFile(), nil); err == nil && !a.force {
+		return nil, false, fmt.Errorf("already paired as %s; use --force to pair again (the old credential stops working once the owner removes it)", old.Label())
 	}
 	cfg, err := loadConfig(g)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	_, statErr := os.Stat(g.paths.ConfigFile())
-	if server != "" {
-		cfg.Server = server
+	if a.server != "" {
+		cfg.Server = a.server
 	}
-	if kind != "" {
-		cfg.DeviceKind = kind
+	if a.kind != "" {
+		cfg.DeviceKind = a.kind
 	}
 	if err := cfg.Validate(); err != nil {
+		return nil, false, err
+	}
+	return cfg, statErr != nil, nil
+}
+
+// finishPair writes config.json when it was missing or --server/--kind changed it, and restarts a running service
+// so it picks up the new credential.
+func finishPair(g *globals, a pairArgs, cfg *config.Config, noConfig bool, stdout io.Writer) error {
+	if noConfig || a.server != "" || a.kind != "" {
+		if err := config.Save(g.paths.ConfigFile(), cfg); err != nil {
+			return err
+		}
+		chownLikeDir(g.paths.ConfigFile(), g.paths.ConfigDir)
+	}
+	if service.Status(serviceOptions(g, "")) == "running" {
+		_ = service.Control(serviceOptions(g, ""), "restart")
+		fmt.Fprintln(stdout, "The service was running and has been restarted with the new credential.")
+	}
+	return nil
+}
+
+func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
+	code, err := link.NormalizeCode(a.code)
+	if err != nil {
+		return err
+	}
+	if a.robot != "" && !link.RobotRe.MatchString(a.robot) {
+		return fmt.Errorf("--robot must be a robot id like rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X (a driver kind such as %q goes in the config's plugins)", a.robot)
+	}
+	name := deviceName(a.name)
+	cfg, noConfig, err := preparePair(g, a)
+	if err != nil {
 		return err
 	}
 	descs, _ := probeAll(cfg, g.paths, g.log)
@@ -276,19 +325,90 @@ func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
 		return err
 	}
 	chownLikeDir(g.paths.CredentialFile(), g.paths.ConfigDir)
-	if statErr != nil || server != "" || kind != "" {
-		if err := config.Save(g.paths.ConfigFile(), cfg); err != nil {
-			return err
-		}
-		chownLikeDir(g.paths.ConfigFile(), g.paths.ConfigDir)
-	}
 	fmt.Fprintf(stdout, "Paired as %s (robot %s). Credential saved to %s (mode 600).\n", creds.DeviceID, creds.RobotID, g.paths.CredentialFile())
 	fmt.Fprintln(stdout, "Confirm the device on openvibe.bot, then start it: `openvibe-node run` or `sudo openvibe-node install`.")
-	if service.Status(serviceOptions(g, "")) == "running" {
-		_ = service.Control(serviceOptions(g, ""), "restart")
-		fmt.Fprintln(stdout, "The service was running and has been restarted with the new credential.")
+	return finishPair(g, a, cfg, noConfig, stdout)
+}
+
+// cmdPairNetwork pairs through OpenVibe.Network: it redeems the code at <network>/api/v1/node-pairing, stores the
+// node principal and credential, then binds the device on Bot (POST /api/v1/devices/bind with a node token). A
+// failed bind keeps the credential: `openvibe-node run` binds on start.
+func cmdPairNetwork(g *globals, a pairArgs, stdout io.Writer) error {
+	code, err := link.NormalizeCode(a.code)
+	if err != nil {
+		return err
 	}
+	if a.pairing != "" && !link.PairingIDRe.MatchString(a.pairing) {
+		return errors.New("--pairing must be the pair_… id from the installer command on openvibe.bot")
+	}
+	network := strings.TrimSuffix(strings.TrimSpace(a.network), "/")
+	if network == "" {
+		return errors.New("--pairing needs --network, the OpenVibe.Network URL from the installer command")
+	}
+	cfg, noConfig, err := preparePair(g, a)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ua := "openvibe-node/" + version
+	creds, err := link.PairNetwork(ctx, nil, network, protocol.NodePairingRequest{Code: code, Pairing: a.pairing, Name: deviceName(a.name)}, ua)
+	if err != nil {
+		return err
+	}
+	creds.Server = strings.TrimSuffix(cfg.Server, "/")
+	if err := saveCredentials(g, creds); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Paired on %s as %s. Credential saved to %s (mode 600).\n", network, creds.Principal, g.paths.CredentialFile())
+	if bound, err := link.Bind(ctx, nil, creds, link.NewTokenSource(creds, nil, ua), ua); err != nil {
+		if errors.Is(err, link.ErrNodeRevoked) {
+			return err
+		}
+		fmt.Fprintf(stdout, "Could not bind the device on %s yet (%v); the node binds it when it starts.\n", creds.Server, err)
+	} else {
+		if err := saveCredentials(g, bound); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Bound as %s (robot %s).\n", bound.DeviceID, bound.RobotID)
+	}
+	fmt.Fprintln(stdout, "Start it: `openvibe-node run` or `sudo openvibe-node install`.")
+	return finishPair(g, a, cfg, noConfig, stdout)
+}
+
+func saveCredentials(g *globals, c *credentials.Credentials) error {
+	if err := credentials.Save(g.paths.CredentialFile(), c); err != nil {
+		return err
+	}
+	chownLikeDir(g.paths.CredentialFile(), g.paths.ConfigDir)
 	return nil
+}
+
+// bindOnStart binds a Network-paired machine whose device record is missing (the bind at pairing failed) and saves
+// the answer. A refused node credential (ErrNodeRevoked) is returned; any other failure is logged and the Node
+// starts without a device record (no video); the next start binds again.
+func bindOnStart(g *globals, creds *credentials.Credentials, tokens *link.TokenSource, server string) (*credentials.Credentials, error) {
+	if !creds.NetworkPaired() || creds.Bound() {
+		return creds, nil
+	}
+	if creds.Server == "" {
+		creds.Server = server
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bound, err := link.Bind(ctx, nil, creds, tokens, "openvibe-node/"+version)
+	if errors.Is(err, link.ErrNodeRevoked) {
+		return nil, err
+	}
+	if err != nil {
+		g.log.Warn("could not bind the device on Bot; starting without video until the next start", "err", err)
+		return creds, nil
+	}
+	if err := saveCredentials(g, bound); err != nil {
+		return nil, err
+	}
+	g.log.Info("bound the device on Bot", "device", bound.DeviceID, "robot", bound.RobotID)
+	return bound, nil
 }
 
 // maxRotateJSON caps what `credential import` reads from stdin: Bot's rotate answer is a few hundred bytes.
@@ -329,6 +449,9 @@ func cmdCredentialImport(g *globals, stdin io.Reader, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if old.NetworkPaired() {
+		return errors.New("this Node is paired through OpenVibe.Network: it has no Bot credential to import")
+	}
 	if resp.Device.ID != old.DeviceID {
 		return fmt.Errorf("this rotation is for device %s, this Node is paired as %s", resp.Device.ID, old.DeviceID)
 	}
@@ -368,7 +491,15 @@ func cmdRun(g *globals, dryRun bool) error {
 	if err != nil && !errors.Is(err, credentials.ErrNotPaired) {
 		return err
 	}
-	n, err := node.New(node.Options{Config: cfg, Paths: g.paths, Creds: creds, Log: g.log, Version: version})
+	var tokens link.Tokens
+	if creds.NetworkPaired() {
+		ts := link.NewTokenSource(creds, nil, "openvibe-node/"+version)
+		if creds, err = bindOnStart(g, creds, ts, cfg.Server); err != nil {
+			return err
+		}
+		tokens = ts
+	}
+	n, err := node.New(node.Options{Config: cfg, Paths: g.paths, Creds: creds, Tokens: tokens, Log: g.log, Version: version})
 	if err != nil {
 		return err
 	}
@@ -454,7 +585,7 @@ func cmdStatus(g *globals, asJSON bool, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "OpenVibe Node %s, running for %s (service: %s)\n", s.Version, s.Uptime, service.Status(serviceOptions(g, "")))
 	if s.Paired {
-		fmt.Fprintf(stdout, "Device:   %s on %s\n", s.DeviceID, s.Server)
+		fmt.Fprintf(stdout, "Device:   %s\n", deviceLine(s.DeviceID, s.Principal, s.Server))
 	} else {
 		fmt.Fprintln(stdout, "Device:   not paired (openvibe-node pair <CODE>)")
 	}
@@ -498,6 +629,18 @@ func cmdStatus(g *globals, asJSON bool, stdout io.Writer) error {
 	return nil
 }
 
+// deviceLine is "dev_… on <server>", with the node principal of a Network-paired machine ("not bound yet" before
+// Bot has bound it).
+func deviceLine(device, principal, server string) string {
+	switch {
+	case principal == "":
+		return device + " on " + server
+	case device == "":
+		return principal + " (not bound yet) on " + server
+	}
+	return device + " (" + principal + ") on " + server
+}
+
 func latchText(l safety.LatchState) string {
 	switch {
 	case l.Local && l.Remote:
@@ -512,17 +655,18 @@ func latchText(l safety.LatchState) string {
 
 func offlineStatus(g *globals, asJSON bool, stdout io.Writer) error {
 	type offline struct {
-		Running  bool              `json:"running"`
-		Service  string            `json:"service"`
-		Paired   bool              `json:"paired"`
-		DeviceID string            `json:"device_id,omitempty"`
-		Server   string            `json:"server,omitempty"`
-		Latch    safety.LatchState `json:"latch"`
-		Config   string            `json:"config_dir"`
+		Running   bool              `json:"running"`
+		Service   string            `json:"service"`
+		Paired    bool              `json:"paired"`
+		DeviceID  string            `json:"device_id,omitempty"`
+		Principal string            `json:"principal,omitempty"`
+		Server    string            `json:"server,omitempty"`
+		Latch     safety.LatchState `json:"latch"`
+		Config    string            `json:"config_dir"`
 	}
 	o := offline{Service: service.Status(serviceOptions(g, "")), Config: g.paths.ConfigDir}
 	if c, err := credentials.Load(g.paths.CredentialFile(), nil); err == nil {
-		o.Paired, o.DeviceID, o.Server = true, c.DeviceID, c.Server
+		o.Paired, o.DeviceID, o.Principal, o.Server = true, c.DeviceID, c.Principal, c.Server
 	}
 	if l, _ := safety.OpenLatch(g.paths.LatchFile()); l != nil {
 		o.Latch = l.State()
@@ -532,7 +676,7 @@ func offlineStatus(g *globals, asJSON bool, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "OpenVibe Node %s is not running (service: %s).\n", version, o.Service)
 	if o.Paired {
-		fmt.Fprintf(stdout, "Device:   %s on %s\n", o.DeviceID, o.Server)
+		fmt.Fprintf(stdout, "Device:   %s\n", deviceLine(o.DeviceID, o.Principal, o.Server))
 	} else {
 		fmt.Fprintln(stdout, "Device:   not paired (openvibe-node pair <CODE>)")
 	}

@@ -51,7 +51,9 @@ type Server struct {
 	estop        map[string]bool   // robot id → the robot's e-stop latch, as Bot keeps it
 	pairRequests []protocol.PairRequest
 	pairRefusal  *refusal
+	bindRefusals []refusal
 	credInURL    bool
+	binds        atomic.Int64
 
 	conns chan *Conn
 	count atomic.Int64
@@ -76,6 +78,7 @@ func New() *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc(protocol.PairPath, s.pair)
 	mux.HandleFunc(protocol.DevicePath, s.device)
+	mux.HandleFunc(protocol.BindPath, s.bind)
 	mux.HandleFunc("/whip/", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		h := s.WHIP
@@ -234,6 +237,49 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_, _ = w.Write(body)
+}
+
+// RefuseBind makes the next POST /api/v1/devices/bind answer with this problem (queued: one refusal per call), as
+// Bot refuses a node token (401 bot.node_token_required) or a principal it will not bind (403 bot.node_not_bound).
+func (s *Server) RefuseBind(status int, code, detail string) {
+	s.mu.Lock()
+	s.bindRefusals = append(s.bindRefusals, refusal{status, code, detail})
+	s.mu.Unlock()
+}
+
+// Binds counts POST /api/v1/devices/bind requests.
+func (s *Server) Binds() int { return int(s.binds.Load()) }
+
+// bind is POST /api/v1/devices/bind: the bearer must be a registered credential (a node token the fake Network
+// registered); the answer is POST /pair's without the credential, with a new publish key every call.
+func (s *Server) bind(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		problem(w, http.StatusMethodNotAllowed, "bot.method_not_allowed", "POST only")
+		return
+	}
+	s.binds.Add(1)
+	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	s.mu.Lock()
+	if len(s.bindRefusals) > 0 {
+		rf := s.bindRefusals[0]
+		s.bindRefusals = s.bindRefusals[1:]
+		s.mu.Unlock()
+		problem(w, rf.status, rf.code, rf.detail)
+		return
+	}
+	dev, ok := s.creds[tok]
+	robot := s.robots[dev]
+	s.mu.Unlock()
+	if !ok {
+		problem(w, http.StatusUnauthorized, "bot.node_token_required", "a Network node token (audience openvibe.bot) is required")
+		return
+	}
+	pk := "pk_" + token()[:16]
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(protocol.PairResponse{DeviceID: dev, PublishKey: pk, WHIPURL: s.HTTP.URL + "/whip/" + pk, RobotID: robot,
+		Profile: json.RawMessage(`{"id":"sim.rover","limits":{"max_command_ms":300,"heartbeat_ms":1000}}`)})
 }
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
