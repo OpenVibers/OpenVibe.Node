@@ -66,6 +66,18 @@ func TestPluginCommand(t *testing.T) {
 	}
 }
 
+// TestWorkerVMLimitRequired: RLIMIT_AS is always set: max_vm_bytes has no "none" value and defaults when zero.
+func TestWorkerVMLimitRequired(t *testing.T) {
+	c := Default()
+	c.Worker.Caps.MaxVMBytes = -1
+	if err := c.Validate(); err == nil {
+		t.Fatal("max_vm_bytes -1 was accepted")
+	}
+	if v := (WorkerCaps{}).WithDefaults().MaxVMBytes; v != DefaultWorkerCaps.MaxVMBytes {
+		t.Fatalf("default max_vm_bytes %d", v)
+	}
+}
+
 // TestWorkerNameReserved: status.capabilities.worker holds the job runtime classes, so no plugin may be named worker.
 func TestWorkerNameReserved(t *testing.T) {
 	c := Default()

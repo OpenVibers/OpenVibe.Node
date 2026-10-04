@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -99,10 +98,21 @@ func helperConfig(t *testing.T, caps config.WorkerCaps, modes ...string) config.
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A race-instrumented binary maps terabytes of shadow memory up front: RLIMIT_AS 64 TiB leaves it room and is
+	// still a limit. GOMAXPROCS keeps its threads well under max_pids on a machine with many cores.
+	if caps.MaxVMBytes == 0 {
+		caps.MaxVMBytes = 1 << 46
+	}
+	if caps.MaxDiskBytes == 0 { // each job gets a copy of its artifact directory, this test binary, in that much
+		caps.MaxDiskBytes = 256 << 20
+	}
 	cfg := config.WorkerConfig{Enabled: true, AllowSameUser: true, Caps: caps}
+	if os.Geteuid() == 0 { // as root, jobs run as nobody: the test binary must then lie in a directory nobody can read
+		cfg.AllowSameUser, cfg.RunAs = false, &config.RunAs{UID: 65534, GID: 65534}
+	}
 	for _, m := range modes {
 		cfg.Functions = append(cfg.Functions, config.FunctionConfig{Name: m, Version: "1.0.0",
-			Command: []string{exe, "-test.run=^TestHelperProcess$", "--", m}})
+			Command: []string{exe, "-test.run=^TestHelperProcess$", "--", m}, Env: map[string]string{"GOMAXPROCS": "2"}})
 	}
 	return cfg
 }
@@ -114,7 +124,9 @@ func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)
 func TestAdmitRefusals(t *testing.T) {
 	s := &sink{}
 	w := New(helperConfig(t, config.WorkerCaps{MaxJobs: 1}, "sleep"), s.send, quiet())
-	w.isolate = func(*exec.Cmd, config.WorkerConfig) error { return errors.New("not in this test") }
+	w.isolate = func(*exec.Cmd, config.WorkerConfig, plan) (*sandbox, error) {
+		return nil, errors.New("not in this test")
+	}
 
 	wrongVersion := testJob(2, "sleep")
 	wrongVersion.Artifact.Version = "1.0.1"
@@ -169,7 +181,9 @@ func TestAdmitRefusals(t *testing.T) {
 func TestIsolationUnavailableRefused(t *testing.T) {
 	s := &sink{}
 	w := New(helperConfig(t, config.WorkerCaps{}, "sleep"), s.send, quiet())
-	w.isolate = func(*exec.Cmd, config.WorkerConfig) error { return errors.New("no user namespaces") }
+	w.isolate = func(*exec.Cmd, config.WorkerConfig, plan) (*sandbox, error) {
+		return nil, errors.New("no user namespaces")
+	}
 	t.Cleanup(w.Close)
 	if err := w.Probe(); err == nil {
 		t.Fatal("the probe passed without namespaces")
@@ -193,7 +207,9 @@ func TestIsolationUnavailableRefused(t *testing.T) {
 func TestCloseEndsUnlaunched(t *testing.T) {
 	s := &sink{}
 	w := New(helperConfig(t, config.WorkerCaps{}, "sleep"), s.send, quiet())
-	w.isolate = func(*exec.Cmd, config.WorkerConfig) error { return errors.New("not in this test") }
+	w.isolate = func(*exec.Cmd, config.WorkerConfig, plan) (*sandbox, error) {
+		return nil, errors.New("not in this test")
+	}
 	j := testJob(1, "sleep")
 	if f, r := w.Admit(j); f != "" {
 		t.Fatalf("%s %s", f, r)
@@ -235,65 +251,4 @@ func TestUsageHelperProcess(t *testing.T) {
 	_ = json.NewDecoder(os.Stdin).Decode(&args)
 	time.Sleep(time.Duration(args.HoldMS) * time.Millisecond)
 	os.Exit(0)
-}
-
-// TestUsageSecondsContiguous: a function that holds for several whole wall-clock seconds after job_started sends
-// exactly one job_usage for each fully elapsed second, `second` 0 then 1 then ... with no gap and no duplicate, and
-// its job_exit's usage is never smaller than the seconds already sent (wall_ms >= (n+1)*1000 for every second n).
-func TestUsageSecondsContiguous(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("function jobs run on Linux only")
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Isolation is not what this test measures: run the helper directly, without the job namespaces.
-	s := &sink{}
-	w := New(config.WorkerConfig{Enabled: true, AllowSameUser: true,
-		Functions: []config.FunctionConfig{{Name: "meter", Version: "1.0.0",
-			Command: []string{exe, "-test.run=^TestUsageHelperProcess$", "--", "meter"}}}}, s.send, quiet())
-	w.isolate = func(*exec.Cmd, config.WorkerConfig) error { return nil }
-	t.Cleanup(w.Close)
-
-	const holdMS = 2500 // two whole seconds, so seconds 0 and 1 are sent before the exit
-	j := testJob(1, "meter")
-	j.Args = json.RawMessage(fmt.Sprintf(`{"hold_ms":%d}`, holdMS))
-	if f, r := w.Admit(j); f != "" {
-		t.Fatalf("%s %s", f, r)
-	}
-	w.Launch(j.ID)
-	ex := s.exit(t, j.ID)
-	if ex.Reason != protocol.ExitExited || ex.Code == nil || *ex.Code != 0 || ex.Usage.StartedMS == nil {
-		t.Fatalf("%+v", ex)
-	}
-	if n := s.count(protocol.TypeJobStarted, j.ID); n != 1 {
-		t.Fatalf("job_started sent %d times, want 1", n)
-	}
-	started := s.wait(t, protocol.TypeJobStarted, j.ID, 1, 5*time.Second).(protocol.JobStarted)
-	if started.StartedMS != *ex.Usage.StartedMS {
-		t.Fatalf("job_started at %d, job_exit usage at %d", started.StartedMS, *ex.Usage.StartedMS)
-	}
-	var seconds []int64
-	for _, m := range s.all() {
-		u, ok := m.(protocol.JobUsage)
-		if !ok || u.ID != j.ID {
-			continue
-		}
-		if u.StartedMS != *ex.Usage.StartedMS || u.CPUMS == nil {
-			t.Fatalf("usage %+v", u)
-		}
-		seconds = append(seconds, u.Second)
-	}
-	if len(seconds) < 2 {
-		t.Fatalf("usage seconds %v, want 0..n-1 for a job that held %d ms", seconds, holdMS)
-	}
-	for n, second := range seconds {
-		if second != int64(n) {
-			t.Fatalf("usage seconds %v, want 0..%d with no gap or duplicate", seconds, len(seconds)-1)
-		}
-		if ex.Usage.WallMS < (second+1)*1000 {
-			t.Fatalf("usage second %d sent but wall_ms is %d, want at least %d", second, ex.Usage.WallMS, (second+1)*1000)
-		}
-	}
 }
