@@ -49,14 +49,16 @@ Drive from openvibe.bot; watch `openvibe-node status --json` for telemetry.
 | Camera (`rpicam-vid --codec h264 --inline -o -` → `internal/video/whip.go`) | panel shows live video (needs the Ops-WHIP row) | |
 | Safety | kill Wi-Fi / Ctrl-C / panel e-stop → wheels stop; e-stop stays latched through a restart | |
 
-Mecanum chassis: re-run with `--driver adeept-mecanum` (profile variant `adeept.adr036.mecanum`, `wheels: "mecanum"`).
+Mecanum chassis: re-run with `--driver adeept-mecanum` (same profile `adeept.adr036`, plugin config `wheels: "mecanum"`).
 
 OLED/display: **not supported** (deferred) — see `plugins/adeept_adr036/README.md`; the profile has no display
 widget and a `display` command is nacked.
 
 ## 4. If the camera will not start
 
-If `rpicam-vid` is missing, `video.source` `auto` falls back to the plugin's JPEG frames (the core encodes them with
-`ffmpeg`) and then to the test pattern — the panel can still show video. Check `openvibe-node status --json` →
-`video.state` and `video.last_error` and report the exact error. `--driver adeept` installs the plugin but the core
-still needs `rpicam-apps` for H.264 and `ffmpeg` for the JPEG path (both noted in `docs/install.md`).
+If `rpicam-vid` is missing, `video.source` `auto` has nothing to fall back to: the Adeept plugin offers only the
+H.264 camera command (no JPEG frames, no test pattern), so the core publishes **no video** — `journalctl -u openvibe-node` shows
+`camera program not found` and then `no camera to publish`, and `openvibe-node status --json` has no `video.source`.
+Install `rpicam-apps` (noted in `docs/install.md`) and `sudo systemctl restart openvibe-node`. To check the WHIP path without the camera,
+set `"video": {"source": "test"}` in `/etc/openvibe-node/config.json` and restart: the panel then shows the test
+pattern. Report `video.state`, `video.last_error` and the journal lines above.
