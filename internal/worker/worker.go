@@ -63,23 +63,25 @@ type plan struct {
 	egress string // the job's network policy (egressFor); "" is none
 }
 
-// egressFor is the network policy a job runs under: the stricter of the net the job names and the host's worker.egress.
-// A net of deny (or none, the same policy as the Node spells it), which is also what an absent net means in
-// platform.job@1, runs under no network whatever the host allows: the contract's default is deny and the Node never
-// widens it. A named public or openvibe-only still needs the host to allow that much, so a host under none refuses
-// the job at Admit rather than running it with less than was asked.
+// egressFor is the network policy a job runs under: the stricter of the net the job names and the host's worker.egress,
+// which must be the host's own, the only ruleset its veth is written with. A net of deny (or none, the same policy as
+// the Node spells it), which is also what an absent net means in platform.job@1, runs under no network whatever the
+// host allows: the contract's default is deny and the Node never widens it. A named public runs under a public or
+// openvibe-only host's policy; a named openvibe-only needs an openvibe-only host (a public one has no egress_allow to
+// restrict it to). Anything else, a host under none (or no worker.egress, the same) included, refuses the job at
+// Admit rather than running it with less, or more, than was asked.
 func egressFor(host, net string) (string, bool) {
 	switch net {
 	case "", protocol.NetDeny, protocol.NetNone:
 		return "", true
-	case protocol.NetPublic, protocol.NetOpenVibeOnly:
-		if host == config.EgressNone {
-			return "", false
-		}
-		if host == net {
+	case protocol.NetPublic:
+		if host == config.EgressPublic || host == config.EgressOpenVibeOnly {
 			return host, true
 		}
-		return config.StrictestEgress(host, net), true
+	case protocol.NetOpenVibeOnly:
+		if host == config.EgressOpenVibeOnly {
+			return host, true
+		}
 	}
 	return "", false
 }

@@ -93,9 +93,11 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   `openvibe-only`: `public`, further restricted to `egress_allow`. A job runs under the **stricter** of the `net` the
   contract's job names and this. `net` absent means `deny` (`platform.job@1`'s declared default), so **a job that names
   no `net` runs with no network at all** however open this is set: the Node never widens the contract's default. A job
-  naming `deny` or `none` gets the same; one naming `public` or `openvibe-only` runs under `egress` when that allows
-  that much (`public` under `openvibe-only`, say, runs as `public`) and is **refused** with `net policy not supported`
-  when `egress` is `none`: it is never run with less than was asked. A policy the host cannot enforce fails the
+  naming `deny` or `none` gets the same. One naming `public` runs under `egress` when that is `public` or
+  `openvibe-only` (so under `openvibe-only` it is restricted to `egress_allow`); one naming `openvibe-only` needs
+  `egress` `openvibe-only` (a `public` host has no `egress_allow` to hold it to). Otherwise, `egress` `none` (or unset)
+  included, the job is **refused** with `net policy not supported`: it is never run with no network, nor with a wider
+  one, in place of what it asked. A policy the host cannot enforce fails the
   probe and keeps the worker off: never a silent `none` nor an open network.
 - `egress_allow` (with `openvibe-only` only, and required by it): the IPv4 CIDRs a job may reach, the OpenVibe
   network's own ranges. They are configured, not guessed nor resolved from names: the Node trusts no DNS answer for

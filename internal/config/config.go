@@ -150,24 +150,6 @@ const (
 	EgressOpenVibeOnly = "openvibe-only"
 )
 
-// StrictestEgress returns the stricter of two worker.egress policies: openvibe-only is stricter than public, public
-// than none. An unknown value ranks as none, the strictest that is still enforceable.
-func StrictestEgress(a, b string) string {
-	rank := func(p string) int {
-		switch p {
-		case EgressPublic:
-			return 1
-		case EgressOpenVibeOnly:
-			return 2
-		}
-		return 0
-	}
-	if rank(a) <= rank(b) {
-		return a
-	}
-	return b
-}
-
 // FunctionConfig is one artifact a job may run: Command is started with the job's args as JSON on stdin.
 type FunctionConfig struct {
 	Name    string `json:"name"`

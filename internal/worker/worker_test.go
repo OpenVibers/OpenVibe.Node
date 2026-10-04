@@ -290,8 +290,9 @@ func TestUsageHelperProcess(t *testing.T) {
 }
 
 // TestEgressFor: an absent net (the contract's declared deny) is no network whatever the host allows; net deny and
-// none are that too; a named public or openvibe-only runs under the stricter of itself and the host's, and is refused
-// when the host is none; a net this Node does not know is refused, never run weaker.
+// none are that too; a named public or openvibe-only runs under the host's policy when that is at least as strict and
+// still a network, and is refused when the host is none (or unset) or wider than asked; a net this Node does not know
+// is refused, never run weaker.
 func TestEgressFor(t *testing.T) {
 	for _, c := range []struct {
 		host, net string
@@ -302,11 +303,12 @@ func TestEgressFor(t *testing.T) {
 		{config.EgressOpenVibeOnly, "", "", true},
 		{config.EgressPublic, protocol.NetDeny, "", true}, {config.EgressOpenVibeOnly, protocol.NetNone, "", true},
 		{config.EgressPublic, protocol.NetPublic, config.EgressPublic, true},
-		{config.EgressPublic, protocol.NetOpenVibeOnly, config.EgressPublic, true},
-		{config.EgressOpenVibeOnly, protocol.NetPublic, config.EgressPublic, true},
+		{config.EgressPublic, protocol.NetOpenVibeOnly, "", false},
+		{config.EgressOpenVibeOnly, protocol.NetPublic, config.EgressOpenVibeOnly, true},
 		{config.EgressOpenVibeOnly, protocol.NetOpenVibeOnly, config.EgressOpenVibeOnly, true},
 		{config.EgressNone, protocol.NetPublic, "", false},
 		{config.EgressNone, protocol.NetOpenVibeOnly, "", false},
+		{"", protocol.NetPublic, "", false}, {"", protocol.NetOpenVibeOnly, "", false},
 		{config.EgressPublic, "allow", "", false}, {config.EgressPublic, "", "", true},
 	} {
 		got, ok := egressFor(c.host, c.net)
