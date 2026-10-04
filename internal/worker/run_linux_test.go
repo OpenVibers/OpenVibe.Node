@@ -1235,8 +1235,8 @@ func TestForkBomb(t *testing.T) {
 }
 
 // TestEgressUnenforceable: an egress policy the host cannot enforce (here ip, nsenter and nft are not found, or the
-// Node is not root) fails the probe, so the class is not advertised, and a job fails without running: never a silent
-// none nor an open network.
+// Node is not root) fails the probe, so the class is not advertised, and a job asking for that network fails without
+// running: never a silent none nor an open network. (A job naming no net runs under none and needs no egress.)
 func TestEgressUnenforceable(t *testing.T) {
 	dirs := egressToolDirs
 	egressToolDirs = []string{t.TempDir()}
@@ -1254,6 +1254,7 @@ func TestEgressUnenforceable(t *testing.T) {
 			t.Fatalf("%s: probe %v, want refused", e, err)
 		}
 		j := testJob(1, "env")
+		j.Net = e
 		run(t, w, j)
 		if ex := s.exit(t, j.ID); ex.Reason != protocol.ExitFailed || ex.Usage.StartedMS != nil || s.count(protocol.TypeJobStarted, j.ID) != 0 {
 			t.Fatalf("%s: %+v", e, ex)
