@@ -9,7 +9,8 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1
 ```
 
 openvibe.bot shows this command with the robot's id and a fresh code. `--driver` is `adeept`, `adeept-mecanum`, `cozmo`
-or `none` (dry run; the old `--robot adeept` form still works but is deprecated). Details, manual
+or `none` (dry run; the old `--robot adeept` form still works but is deprecated). A robot paired through
+OpenVibe.Network gets `--network <URL> --pairing pair_… --code ABCD-1234` instead of `--robot`. Details, manual
 install, Windows and configuration: [docs/install.md](docs/install.md).
 
 ```sh

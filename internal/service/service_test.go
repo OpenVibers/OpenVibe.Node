@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -35,5 +36,9 @@ func TestConfig(t *testing.T) {
 	}
 	if u, _ := c.Option["SystemdScript"].(string); !strings.Contains(u, "\n[Service]\n") || !strings.Contains(u, "\nDelegate=yes\n") {
 		t.Fatalf("the systemd unit must delegate the Node's cgroup: %q", u)
+	}
+	// A revoked node credential exits with ExitPairAgain: systemd must not restart it into the same refusal.
+	if u, _ := c.Option["SystemdScript"].(string); !strings.Contains(u, fmt.Sprintf("\nRestartPreventExitStatus=%d\n", ExitPairAgain)) {
+		t.Fatalf("the systemd unit must not restart a Node that has to pair again: %q", u)
 	}
 }

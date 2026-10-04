@@ -65,6 +65,10 @@ func (p *program) Stop(ks.Service) error {
 	return nil
 }
 
+// ExitPairAgain is the exit status of a Node whose node credential OpenVibe.Network refused (EX_CONFIG): the
+// systemd unit does not restart it (RestartPreventExitStatus), since only pairing again can help.
+const ExitPairAgain = 78
+
 // Options for the service definition.
 type Options struct {
 	// Arguments passed to the executable by the service manager (["run"] plus --home when set).
@@ -116,6 +120,7 @@ StandardError=file:{{LogDirectory}}/{{Name}}.err
 {{end}}{{if Restart}}Restart={{Restart}}
 {{end}}{{if SuccessExitStatus}}SuccessExitStatus={{SuccessExitStatus}}
 {{end}}RestartSec=120
+RestartPreventExitStatus=78
 Delegate=yes
 EnvironmentFile=-/etc/sysconfig/{{Name}}
 

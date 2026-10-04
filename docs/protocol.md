@@ -46,6 +46,48 @@ The credential and publish key are stored in `credential.json` (mode 0600, with 
 appear in a URL, a log line, an error, `openvibe-node status` or telemetry (the Go type `credentials.Secret` prints as
 `[redacted]` in every format).
 
+### Pairing through OpenVibe.Network
+
+When the installer command carries `--network <URL> --pairing pair_… --code CODE` (Bot with
+`BOT_PAIRING_AUTHORITY=network`), the code is OpenVibe.Network's and the machine becomes a node principal there. Three
+calls, in order:
+
+```http
+POST <network>/api/v1/node-pairing
+Content-Type: application/json
+
+{"code": "ABCD1234", "pairing": "pair_…", "name": "rover"}
+```
+
+`201` → `{"principal": "nod_…", "node_id": "n-…", "home_cell": "…", "credential": "…", "token_endpoint": "…",
+"paired_for": {"service": "bot", "ref": "rob_…"}}`; refusals are problems with `registry.pairing_code_invalid`,
+`_locked`, `_used`, `_expired`, `registry.invalid_pairing_code`, `registry.invalid_pairing_request`, and a plain `429`.
+The Node stores `{principal, node_credential, network, paired_for}` in `credential.json` (mode 0600, temp file and
+rename) before anything else.
+
+```http
+POST <network>/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&client_id=nod_…&client_secret=<node credential>&audience=openvibe.bot
+```
+
+`200` → `{"access_token": "<node token>", "token_type": "Bearer", "expires_in": 300}`. The audience is
+`openvibe.<paired_for.service>`. The Node caches the token until 30 s before it expires. `401` (`invalid_client`)
+means the credential is revoked or the machine removed: the Node stops with "pair again" and exit status 78, which the
+systemd unit does not restart (`RestartPreventExitStatus=78`). It never retries in a loop.
+
+```http
+POST <bot>/api/v1/devices/bind
+Authorization: Bearer <node token>
+```
+
+`201` → `{"device_id": "dev_…", "publish_key": "…", "whip_url": "…", "robot_id": "rob_…", "profile": {…}}`: the
+`POST /api/v1/pair` answer without a `credential`. The Node stores these fields exactly as it stores a pairing's. A
+`401` refetches the token and retries once. `403 bot.node_not_bound` means Bot will not bind this principal. Every
+bind issues a new publish key, so the Node binds once at pairing, and again at start only while the device record is
+missing (a bind that failed at pairing).
+
 ## 2. The control link
 
 One WebSocket per device, opened by the device:
@@ -65,7 +107,13 @@ arrives (Bot answers any frame on a not-yet-authenticated socket with `error` `b
 | `4002`, or HTTP `401`/`403`  | the credential is wrong, rotated or revoked          | retries no sooner than 10 s (jitter only adds), logs "pair again, or import the owner's rotation" |
 | `4003`                       | the owner revoked the device (or rotated its credential) while it was connected | the same as `4002`             |
 
-The link never gives up on its own: the owner may pair the device again. Bot's `error` frames (`bot.not_paired`,
+A Network-paired machine presents a node token (`Authorization: Bearer <node token>`, audience `openvibe.bot`) instead
+of a credential. After a `4002` or `401` the next upgrade uses a freshly bought token. Once `hello` arrives the Node
+sends `reauth` with a fresh token every 240 s (Bot closes `4002` when none arrives within 330 s), and every 15 s while
+Network does not answer.
+
+The link never gives up on its own: the owner may pair the device again. The one exception is a Network-paired
+machine whose node credential Network refuses (`/oauth/token` `401`): the Node stops, as above. Bot's `error` frames (`bot.not_paired`,
 `bot.not_ready`, `bot.forbidden`, …) are logged and never end the connection.
 
 ### Rotating a credential
@@ -126,6 +174,7 @@ applied the Node runs nothing but `halt` (`nack not_ready`), so that latch is in
 | `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack)                                               |
 | `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
 | `heartbeat`   | `t` (send time, Unix ms), `rtt_ms` (the last measured round trip, once there is one; 0 is a real measurement) |
+| `reauth`      | `token`: a fresh node token for the same principal (a Network-paired machine only; refused → `error` `bot.reauth_refused`) |
 | `estop_state` | `latched` (the device is stopped: remote e-stop or local kill switch), `by` (`device`), `at`; Node extras: `robot_id` (when `hello` named exactly one robot), `local_stop` (local kill switch), `reason` |
 
 The first `status` and `estop_state` go out once the connection's `config` has been applied, never right after the

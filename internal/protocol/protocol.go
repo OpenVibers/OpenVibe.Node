@@ -21,6 +21,14 @@ const Version = 1
 const (
 	PairPath   = "/api/v1/pair"
 	DevicePath = "/device"
+	// BindPath binds a Network-paired machine (its node token, audience openvibe.bot) to its device on Bot.
+	BindPath = "/api/v1/devices/bind"
+)
+
+// OpenVibe.Network paths, relative to the Network origin (server/registry/node-principals.js).
+const (
+	NodePairingPath = "/api/v1/node-pairing" // redeems a Network pairing code for a node principal and its credential
+	TokenPath       = "/oauth/token"         // client_credentials: the node credential buys a node token
 )
 
 // Server → device message types.
@@ -53,6 +61,7 @@ const (
 	TypeAck        = "ack"
 	TypeNack       = "nack"
 	TypeHeartbeat  = "heartbeat"
+	TypeReauth     = "reauth" // a Network-paired machine's fresh node token, before the last one expires
 	TypeEstopState = "estop_state"
 )
 
@@ -482,6 +491,12 @@ type Heartbeat struct {
 	RTTMS *int64 `json:"rtt_ms,omitempty"`
 }
 
+// Reauth carries a fresh node token for the same principal; Bot closes the socket with 4002 when none arrives within
+// 330 s of the last one. Only a Network-paired machine sends it.
+type Reauth struct {
+	Token string `json:"token"`
+}
+
 type EstopState struct {
 	Latched   bool   `json:"latched"`
 	By        string `json:"by,omitempty"`
@@ -502,6 +517,7 @@ func (Telemetry) MessageType() string    { return TypeTelemetry }
 func (Ack) MessageType() string          { return TypeAck }
 func (Nack) MessageType() string         { return TypeNack }
 func (Heartbeat) MessageType() string    { return TypeHeartbeat }
+func (Reauth) MessageType() string       { return TypeReauth }
 func (EstopState) MessageType() string   { return TypeEstopState }
 func (JobRequest) MessageType() string   { return TypeJob }
 func (JobCancel) MessageType() string    { return TypeJobCancel }
@@ -523,6 +539,7 @@ var registry = map[string]func() Message{
 	TypeAck:          func() Message { return &Ack{} },
 	TypeNack:         func() Message { return &Nack{} },
 	TypeHeartbeat:    func() Message { return &Heartbeat{} },
+	TypeReauth:       func() Message { return &Reauth{} },
 	TypeEstopState:   func() Message { return &EstopState{} },
 	TypeJob:          func() Message { return &JobRequest{} },
 	TypeJobCancel:    func() Message { return &JobCancel{} },
@@ -607,6 +624,8 @@ func derefMessage(m Message) Message {
 		return *v
 	case *Heartbeat:
 		return *v
+	case *Reauth:
+		return *v
 	case *EstopState:
 		return *v
 	case *JobRequest:
@@ -676,7 +695,8 @@ type ICEServer struct {
 }
 
 // PairResponse is the 201 answer of POST /api/v1/pair. The credential, publish key and WHIP URL (which embeds the
-// publish key; null when Bot has no ingest configured) appear only here.
+// publish key; null when Bot has no ingest configured) appear only here. POST /api/v1/devices/bind answers the same
+// body without the credential.
 type PairResponse struct {
 	DeviceID   string          `json:"device_id"`
 	Credential string          `json:"credential"`
@@ -684,6 +704,43 @@ type PairResponse struct {
 	WHIPURL    string          `json:"whip_url,omitempty"`
 	RobotID    string          `json:"robot_id"`
 	Profile    json.RawMessage `json:"profile,omitempty"`
+}
+
+// NodePairingRequest is the body of POST <network>/api/v1/node-pairing: the code is the credential. Pairing is the
+// pair_… id from the installer command; with it a wrong try counts against that pairing's code.
+type NodePairingRequest struct {
+	Code    string `json:"code"`
+	Pairing string `json:"pairing,omitempty"`
+	Name    string `json:"name,omitempty"`
+}
+
+// PairedFor is the service and the reference there (Bot: the robot id) a node principal was paired for.
+type PairedFor struct {
+	Service string `json:"service"`
+	Ref     string `json:"ref,omitempty"`
+}
+
+// NodePairingResponse is the 201 answer of POST /api/v1/node-pairing. The credential appears only here.
+type NodePairingResponse struct {
+	Principal     string     `json:"principal"` // nod_…
+	NodeID        string     `json:"node_id"`
+	HomeCell      string     `json:"home_cell"`
+	Credential    string     `json:"credential"`
+	TokenEndpoint string     `json:"token_endpoint,omitempty"`
+	PairedFor     *PairedFor `json:"paired_for"`
+}
+
+// TokenResponse is the 200 answer of POST <network>/oauth/token.
+type TokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"` // seconds (300 for a node token)
+}
+
+// OAuthError is the OAuth-shaped refusal of /oauth/token (invalid_client for a wrong or revoked credential).
+type OAuthError struct {
+	Error       string `json:"error"`
+	Description string `json:"error_description,omitempty"`
 }
 
 // Problem is the RFC 9457 body of a non-2xx answer from Bot's REST API.

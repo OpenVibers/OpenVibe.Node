@@ -43,7 +43,11 @@ type Options struct {
 	Log     *slog.Logger
 	Version string
 
+	// Tokens are a Network-paired machine's node tokens; nil builds them from Creds.
+	Tokens link.Tokens
+
 	// For tests.
+	ReauthInterval    time.Duration
 	HeartbeatInterval time.Duration
 	LinkBackoffMin    time.Duration
 	VideoLoopback     bool
@@ -133,8 +137,18 @@ func New(opt Options) (*Node, error) {
 				return nil, err
 			}
 		}
-		n.link = link.New(link.Options{URL: u, Credential: opt.Creds.Credential, UserAgent: "openvibe-node/" + opt.Version,
-			Log: opt.Log, HeartbeatInterval: opt.HeartbeatInterval, BackoffMin: opt.LinkBackoffMin}, n)
+		lo := link.Options{URL: u, Credential: opt.Creds.Credential, UserAgent: "openvibe-node/" + opt.Version,
+			Log: opt.Log, HeartbeatInterval: opt.HeartbeatInterval, BackoffMin: opt.LinkBackoffMin, ReauthInterval: opt.ReauthInterval}
+		if opt.Creds.NetworkPaired() {
+			// A Network-paired machine authenticates with node tokens, never a Bot credential.
+			lo.Credential = credentials.Secret{}
+			if opt.Tokens != nil {
+				lo.Tokens = opt.Tokens
+			} else {
+				lo.Tokens = link.NewTokenSource(opt.Creds, nil, lo.UserAgent)
+			}
+		}
+		n.link = link.New(lo, n)
 		// The WHIP endpoint is the pairing's whip_url (built by Bot from the publish key) unless the config sets one.
 		whip := opt.Config.Video.WHIPURL
 		if whip == "" {
@@ -168,8 +182,12 @@ func New(opt Options) (*Node, error) {
 	return n, nil
 }
 
-// Run runs until ctx ends, then stops every actuator and waits for the plugins to exit.
-func (n *Node) Run(ctx context.Context) error {
+// Run runs until ctx ends, then stops every actuator and waits for the plugins to exit. It ends on its own, with
+// link.ErrNodeRevoked, when OpenVibe.Network refuses the machine's node credential.
+func (n *Node) Run(parent context.Context) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	var fatal error
 	n.ctx = ctx
 	n.started = time.Now()
 	ctlErr := make(chan error, 1)
@@ -196,7 +214,13 @@ func (n *Node) Run(ctx context.Context) error {
 	go func() { defer wg.Done(); n.startVideo(ctx) }()
 	if n.link != nil {
 		wg.Add(1)
-		go func() { defer wg.Done(); n.link.Run(ctx) }()
+		go func() {
+			defer wg.Done()
+			if err := n.link.Run(ctx); err != nil {
+				fatal = err
+				cancel()
+			}
+		}()
 	} else {
 		n.log.Warn("not paired: running local only (run `openvibe-node pair <CODE>`)")
 	}
@@ -209,7 +233,7 @@ func (n *Node) Run(ctx context.Context) error {
 	cancelPlugins()
 	n.mgr.Wait()
 	wg.Wait()
-	return nil
+	return fatal
 }
 
 // ---- link.Handler ----
@@ -718,6 +742,7 @@ func strSlice(v any) []string {
 type Status struct {
 	Version   string             `json:"version"`
 	DeviceID  string             `json:"device_id,omitempty"`
+	Principal string             `json:"principal,omitempty"` // nod_… of a Network-paired machine
 	Server    string             `json:"server,omitempty"`
 	Paired    bool               `json:"paired"`
 	Uptime    string             `json:"uptime"`
@@ -762,7 +787,7 @@ func (n *Node) Status() Status {
 	s := Status{Version: n.opt.Version, Latch: n.latch.State(), ConfigDir: n.opt.Paths.ConfigDir, StateDir: n.opt.Paths.StateDir,
 		Uptime: time.Since(n.started).Round(time.Second).String()}
 	if n.opt.Creds != nil {
-		s.Paired, s.DeviceID, s.Server = true, n.opt.Creds.DeviceID, n.opt.Creds.Server
+		s.Paired, s.DeviceID, s.Principal, s.Server = true, n.opt.Creds.DeviceID, n.opt.Creds.Principal, n.opt.Creds.Server
 	}
 	n.mu.Lock()
 	s.Limits = n.limits

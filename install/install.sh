@@ -2,16 +2,19 @@
 # OpenVibe Node installer.
 #
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|none]
+#   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> [--driver …]
 #
 # Detects the OS and CPU, downloads the openvibe-node binary and the plugin bundle (checking their SHA-256), creates
 # a Python virtual environment for the plugins, disables the Adeept kit's stock control server if it finds it,
 # installs the system service and pairs the device with <CODE>. Run it again to upgrade; the credential is kept.
-# openvibe.bot shows the first line with the robot id and a fresh code filled in.
+# openvibe.bot shows one of these lines with the robot id (or the Network pairing) and a fresh code filled in.
 #
 # Options:
 #   --robot ROBOT    the rob_… id of the robot to pair with (from openvibe.bot). A driver kind here (adeept, …) is the
 #                    old meaning of --robot: still accepted, but deprecated; use --driver.
 #   --code CODE      the one-time pairing code (or give it as the first argument).
+#   --network URL    pair through OpenVibe.Network at URL (the machine gets a node credential, then Bot binds it).
+#   --pairing ID     the pair_… id of that Network pairing; a code given here instead (with no --code) is the code.
 #   --name NAME      the device's name on openvibe.bot (default: the hostname).
 #   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), none (dry run). Default: none.
 #   --no-service     install and pair, but do not install the service.
@@ -27,6 +30,7 @@
 #   OPENVIBE_CRONTAB_ROOT=FILE      edit FILE as root's crontab instead of the real one.
 #   OPENVIBE_CRONTAB_USER=FILE      edit FILE as the invoking user's crontab instead of the real one.
 #   OPENVIBE_RC_LOCAL=FILE          edit FILE as rc.local instead of /etc/rc.local.
+# OPENVIBE_INSTALL_PAIR_ARGS_ONLY=1 prints the `openvibe-node pair` arguments the flags make, one per line, and exits.
 set -eu
 
 REPO_URL="https://github.com/OpenVibers/OpenVibe.Node"
@@ -34,14 +38,17 @@ CODE=""
 DRIVER="none"
 ROBOT_ID=""
 NAME=""
+NETWORK=""
+PAIRING=""
 SERVICE=1
 LOCAL=""
 TAG="latest"
 
 usage() {
-	echo "usage: install.sh [--robot rob_…] [--code CODE | CODE] [--name NAME] [--driver adeept|adeept-mecanum|cozmo|none]"
-	echo "                  [--no-service] [--local DIR] [--version TAG]"
+	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
+	echo "                  [--driver adeept|adeept-mecanum|cozmo|none] [--no-service] [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
+	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.network --pairing pair_… --code ABCD-1234"
 }
 say() { printf '%s\n' "openvibe-node: $*"; }
 die() { printf '%s\n' "openvibe-node: error: $*" >&2; exit 1; }
@@ -63,6 +70,10 @@ while [ $# -gt 0 ]; do
 	--code=*) CODE="${1#*=}"; shift ;;
 	--name) NAME="${2:-}"; shift 2 ;;
 	--name=*) NAME="${1#*=}"; shift ;;
+	--network) NETWORK="${2:-}"; shift 2 ;;
+	--network=*) NETWORK="${1#*=}"; shift ;;
+	--pairing) PAIRING="${2:-}"; shift 2 ;;
+	--pairing=*) PAIRING="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
 	--local) LOCAL="${2:-}"; shift 2 ;;
 	--version) TAG="${2:-}"; shift 2 ;;
@@ -74,6 +85,29 @@ done
 
 case "$DRIVER" in adeept|adeept-mecanum|cozmo|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo or none" ;; esac
 case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
+# --pairing takes the pair_… id; with no --code, anything else there is the code itself.
+case "$PAIRING" in ""|pair_*) ;; *) [ -z "$CODE" ] || die "--pairing must be a pair_… id"; CODE="$PAIRING"; PAIRING="" ;; esac
+if [ -n "$PAIRING" ] && [ -z "$NETWORK" ]; then die "--pairing needs --network, the OpenVibe.Network URL"; fi
+if [ -n "$NETWORK" ] && [ -z "$CODE" ]; then die "--network needs the pairing code (--code)"; fi
+case "$NETWORK" in ""|https://*|http://localhost*|http://127.0.0.1*) ;; *) die "--network must be an https:// URL" ;; esac
+
+# Run "$@" pair … with the pairing the flags gave: through Network with --network, else Bot's legacy code.
+pair_with() {
+	set -- "$@" pair "$CODE"
+	if [ -n "$NETWORK" ]; then
+		set -- "$@" --network "$NETWORK"
+		[ -z "$PAIRING" ] || set -- "$@" --pairing "$PAIRING"
+	else
+		[ -z "$ROBOT_ID" ] || set -- "$@" --robot "$ROBOT_ID"
+	fi
+	[ -z "$NAME" ] || set -- "$@" --name "$NAME"
+	"$@"
+}
+
+if [ "${OPENVIBE_INSTALL_PAIR_ARGS_ONLY:-0}" = 1 ]; then
+	pair_with printf '%s\n'
+	exit 0
+fi
 
 # Root for the service, /usr/local/bin and /etc.
 SUDO=""
@@ -315,12 +349,9 @@ fi
 # ---- pair ----
 if [ -n "$CODE" ]; then
 	if $SUDO "$BIN_DIR/openvibe-node" status --json 2>/dev/null | grep -q '"paired":true'; then
-		say "already paired; keeping the credential (to pair again: sudo openvibe-node pair --force <CODE>)"
+		say "already paired; keeping the credential (to pair again: sudo openvibe-node pair --force <CODE>, adding --network <URL> --pairing <pair_…> for a Network pairing)"
 	else
-		set -- pair "$CODE"
-		[ -z "$ROBOT_ID" ] || set -- "$@" --robot "$ROBOT_ID"
-		[ -z "$NAME" ] || set -- "$@" --name "$NAME"
-		$SUDO "$BIN_DIR/openvibe-node" "$@"
+		pair_with $SUDO "$BIN_DIR/openvibe-node"
 	fi
 else
 	say "not paired yet: get a code on openvibe.bot and run: sudo openvibe-node pair <CODE>"
