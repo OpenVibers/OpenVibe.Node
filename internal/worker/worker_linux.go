@@ -280,7 +280,7 @@ func probe(cfg config.WorkerConfig, isolate isolateFunc) error {
 			err = scanArtifact(f.Artifact())
 		}
 		if err != nil {
-			return fmt.Errorf("function %s@%s: %w", f.Name, f.Version, err)
+			return fmt.Errorf("%s %s@%s: %w", f.EffectiveClass(), f.Name, f.Version, err)
 		}
 	}
 	root, err := os.MkdirTemp("", "openvibe-probe-")

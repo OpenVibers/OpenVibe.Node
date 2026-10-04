@@ -103,10 +103,10 @@ func (w *Worker) Admit(j protocol.Job) (fault, reason string) {
 	if w.closed {
 		return protocol.FaultShuttingDown, protocol.JobNotAvailable
 	}
-	if j.Class != protocol.ClassFunction {
+	if j.Class != protocol.ClassFunction && j.Class != protocol.ClassCode {
 		return protocol.FaultUnsupported, protocol.JobNotAvailable
 	}
-	fn, ok := w.function(j.Artifact)
+	fn, ok := w.entry(j.Class, j.Artifact)
 	if !ok {
 		return protocol.FaultUnsupported, protocol.JobUnknownArtifact
 	}
@@ -125,16 +125,32 @@ func (w *Worker) Admit(j protocol.Job) (fault, reason string) {
 	return "", ""
 }
 
-func (w *Worker) function(a *protocol.Artifact) (config.FunctionConfig, bool) {
+// entry finds the declared artifact that implements class: a code job never runs a function entry, nor the reverse.
+func (w *Worker) entry(class string, a *protocol.Artifact) (config.FunctionConfig, bool) {
 	if a == nil {
 		return config.FunctionConfig{}, false
 	}
 	for _, f := range w.cfg.Functions {
-		if f.Name == a.Name && f.Version == a.Version {
+		if f.Name == a.Name && f.Version == a.Version && f.EffectiveClass() == class {
 			return f, true
 		}
 	}
 	return config.FunctionConfig{}, false
+}
+
+// Classes is the runtime classes the declared entries implement, in the order of protocol.RuntimeClasses: none
+// when no entry is declared.
+func (w *Worker) Classes() []string {
+	var out []string
+	for _, c := range protocol.RuntimeClasses {
+		for _, f := range w.cfg.Functions {
+			if f.EffectiveClass() == c {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // Launch runs an admitted job on its own goroutine. A job already launched, or unknown, is left alone.

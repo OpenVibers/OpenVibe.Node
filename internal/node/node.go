@@ -159,10 +159,8 @@ func New(opt Options) (*Node, error) {
 			n.worker = w
 			w.SetStopped(stopFault(n.latch.State()))
 			n.jobs.admit = w.Admit
-			// Advertise function jobs only when the worker has a function to run.
-			if len(opt.Config.Worker.Functions) > 0 {
-				n.jobs.classes = []string{protocol.ClassFunction}
-			}
+			// Advertise a class only when an entry implements it, and only here, after the sandbox probe passed.
+			n.jobs.classes = w.Classes()
 			opt.Log.Info("worker on", "functions", len(opt.Config.Worker.Functions))
 		}
 	}

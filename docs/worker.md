@@ -1,8 +1,8 @@
-# The job worker (`function` jobs)
+# The job worker (`function` and `code` jobs)
 
-The Node can run **function jobs** (OpenVibe.Contracts `platform.job@1`, class `function`) sent over the control link
-([protocol.md](protocol.md#jobs)). A job is untrusted input: it names a function, and the Node runs it only if the
-owner declared that function, at that exact version, in the local config. Nothing is downloaded and no path comes from
+The Node can run **function and code jobs** (OpenVibe.Contracts `platform.job@1`, class `function` or `code`) sent over
+the control link ([protocol.md](protocol.md#jobs)). A job is untrusted input: it names an artifact, and the Node runs it
+only if the owner declared that artifact, at that exact version and for that class, in the local config. Nothing is downloaded and no path comes from
 the server. The worker is **off by default**; off, the Node refuses every job `class not available`, as before.
 
 ## Config
@@ -14,7 +14,8 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   "enabled": false,
   "functions": [
     {"name": "thumbnail", "version": "1.2.0", "command": ["/opt/fn/thumbnail/bin/run"], "env": {"MODE": "fast"},
-     "artifact_dir": "/opt/fn/thumbnail"}
+     "artifact_dir": "/opt/fn/thumbnail"},
+    {"name": "py-script", "version": "3.12.0", "class": "code", "command": ["/opt/code/py/bin/run"]}
   ],
   "run_as": {"uid": 2001, "gid": 2001},
   "allow_same_user": false,
@@ -36,10 +37,12 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
 }
 ```
 
-- `functions`: `name` and `version` match a job's `artifact` exactly (the contract's patterns; listed once each);
-  `command[0]` is an absolute path. `env` is added to the job's environment. A per-entry `class` (`function`, the
-  default, or `code`) is planned and not accepted yet: the config loader refuses unknown keys, so leave it out
-  until the `code` class ships; only `function` is advertised in `status.capabilities.worker` today. `artifact_dir` (default: the directory
+- `functions`: `name` and `version` match a job's `artifact` exactly (the contract's patterns; listed once per class);
+  `command[0]` is an absolute path. `env` is added to the job's environment. `class` is the runtime class the entry
+  implements: `function` (the default) or `code`; `browser`, `linux`, `desktop` and `gpu` are refused at load. A job
+  runs only an entry of its own class: a `code` job naming a `function` entry is an `unknown artifact`, and the
+  reverse. A `code` entry is a local declared runtime like a function (nothing is fetched); its job gets exactly the
+  same sandbox, limits and checks as a function job, never weaker. `artifact_dir` (default: the directory
   of `command[0]`) is the one host directory a job gets besides the system paths, as a **copy** made as the job
   starts, read-only, at the same path: nothing the host adds to it or changes in it later reaches the job (a Unix
   socket or a FIFO that appears there, say, through which a job could reach a host process). The Node opens the
@@ -87,9 +90,9 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   not built yet (follow-up): with either, the probe fails and the worker stays off, never a silent `none` nor an
   open network.
 
-The class `function` — advertised as the reserved Fabric capability `worker:function` in
-`status.capabilities.worker` (the `platform.resource-offer@1` namespace OpenVibe.Run routes on) — is offered only when `enabled` is true, the OS is Linux
-(amd64 or arm64: the architectures with a seccomp allowlist), at least one `functions` entry is declared and a **boot-time probe** passes: it starts `/bin/sh`
+The classes `function` and `code` — advertised as the reserved Fabric capabilities `worker:function` and `worker:code` in
+`status.capabilities.worker` (the `platform.resource-offer@1` namespace OpenVibe.Run routes on) — are each offered only when `enabled` is true, the OS is Linux
+(amd64 or arm64: the architectures with a seccomp allowlist), at least one `functions` entry of that class is declared and a **boot-time probe** passes: it starts `/bin/sh`
 the way a job is started and checks every control from the host: the sandbox was set up; the process has user,
 mount, network, PID, IPC, UTS and cgroup namespaces of its own, `NoNewPrivs` and a seccomp filter; nothing in its
 root but `/tmp`, `/proc` and the device nodes is mounted writable; it is in its own cgroup with every controller
@@ -214,10 +217,10 @@ Refused with `nack` (keyed by the job id; the first matching row wins, after the
 
 | `message`                             | `fault_code`               | when                                                    |
 |---------------------------------------|----------------------------|---------------------------------------------------------|
-| `class not available`                 | `unsupported`              | the worker is off (disabled, not Linux, probe failed), or the class is not `function` |
+| `class not available`                 | `unsupported`              | the worker is off (disabled, not Linux, probe failed), or no declared entry has the job's class (`function` or `code`) |
 | `the e-stop or local stop is latched` | `estopped` or `local_stop` | the stop latch is set                                   |
 | `class not available`                 | `shutting_down`            | the Node is stopping                                    |
-| `unknown artifact`                    | `unsupported`              | no declared function has that name and exact version    |
+| `unknown artifact`                    | `unsupported`              | no declared entry of the job's class has that name and exact version |
 | `worker busy`                         | `not_ready`                | `max_jobs` jobs are running                             |
 
 Accepted jobs end with `job_exit.reason`:

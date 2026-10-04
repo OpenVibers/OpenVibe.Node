@@ -86,3 +86,38 @@ func TestWorkerNameReserved(t *testing.T) {
 		t.Fatal("a plugin named worker was accepted")
 	}
 }
+
+// TestWorkerEntryClass: an entry is a function unless it says code; the other runtime classes are refused at load,
+// and one name@version may be declared once per class.
+func TestWorkerEntryClass(t *testing.T) {
+	run := filepath.Join(t.TempDir(), "run") // absolute on every platform: Validate wants an absolute command
+	entry := func(class string) FunctionConfig {
+		return FunctionConfig{Name: "thumbnail", Version: "1.2.0", Class: class, Command: []string{run}}
+	}
+	if c := entry("").EffectiveClass(); c != ClassFunction {
+		t.Fatalf("no class is %q", c)
+	}
+	for _, class := range []string{"", "function", "code"} {
+		c := Default()
+		c.Worker.Functions = []FunctionConfig{entry(class)}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("class %q: %v", class, err)
+		}
+	}
+	for _, class := range []string{"browser", "linux", "desktop", "gpu", "wasm", "Code"} {
+		c := Default()
+		c.Worker.Functions = []FunctionConfig{entry(class)}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("class %q was accepted", class)
+		}
+	}
+	c := Default()
+	c.Worker.Functions = []FunctionConfig{entry(""), entry("code")}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("one artifact as function and code: %v", err)
+	}
+	c.Worker.Functions = append(c.Worker.Functions, entry("function"))
+	if err := c.Validate(); err == nil {
+		t.Fatal("a function entry with no class and one with class function were both accepted")
+	}
+}

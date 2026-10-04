@@ -181,13 +181,14 @@ Commands are never queued while offline and never replayed after a reconnect.
 ### Jobs
 
 The job frames of OpenVibe.Contracts `platform.job-frame@1` (plan T14 Run) ride the same link and envelope. The Node
-runs class `function` only, and only when the owner turned the worker on in the local config, the OS is Linux and a
-boot-time probe could start a process in its own user, network and PID namespaces ([worker.md](worker.md)).
+runs classes `function` and `code` only: each only when the owner declared an entry of that class, turned the worker on
+in the local config, the OS is Linux and a boot-time probe could start a process in its own user, network and PID
+namespaces ([worker.md](worker.md)); both run in the same sandbox.
 Otherwise it advertises no class and refuses every well-formed job with `class not available`, and nothing executes.
 
 | direction        | type           | fields                                                                                    |
 |------------------|----------------|-------------------------------------------------------------------------------------------|
-| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`, the default)} |
+| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function` and `code`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`, the default)} |
 | server → device  | `job_cancel`   | `id`                                                                                      |
 | server → device  | `job_exit_ack` | `id`                                                                                      |
 | device → server  | `job_started`  | `id`, `started_ms`                                                                        |
@@ -203,7 +204,7 @@ checked in this order:
 | `missing or malformed job id`                | `bad_value`   | `id` is not `job_` + 26 ULID characters (the nack echoes it) |
 | `malformed job`                              | `bad_frame`   | the `job` object does not decode (a field of the wrong type) |
 | `unknown class`                              | `unsupported` | `class` is not one of `function`, `code`, `browser`, `linux`, `desktop`, `gpu` |
-| `function job needs an artifact with an exact version` | `bad_value` | a `function` job without `artifact`, or a name or version outside the contract's pattern (a range) |
+| `function or code job needs an artifact with an exact version` | `bad_value` | a `function` or `code` job without `artifact`, or a name or version outside the contract's pattern (a range) |
 | `net policy not supported`                   | `unsupported` | `net` is present and not `deny`                             |
 | `missing or invalid args, ttl_ms or limits`  | `bad_value`   | `args` is not an object, or `ttl_ms` or a limit is missing or below 1 |
 | `class not available`                        | `unsupported` | the class is valid but this Node does not run it (every class but `function`; every class while the worker is off) |
@@ -250,9 +251,9 @@ worker caps in `status.capabilities.worker`:
 `{"capabilities":["worker:function"],"runtime_classes":["function"],"max_jobs":1,"max_ttl_ms":600000,"max_wall_ms":300000,"max_cpu_ms":300000,"max_mem_bytes":536870912,"max_output_bytes":1048576}`.
 `capabilities` holds one `worker:<class>` name per entry in `runtime_classes` (the `platform.resource-offer@1`
 capabilities namespace OpenVibe.Run routes on; the names are reserved in OpenVibe.Contracts and no schema change
-was needed), so only classes this Node actually runs are advertised: `worker:function` today, `worker:code` once the
-`code` class ships. The limits are `worker.caps` with defaults applied; the key is absent while the worker is off or
-declares no `functions` (a probe that passes with none advertises nothing, so Fabric places no job this Node would
+was needed), so only classes this Node actually runs are advertised: `worker:function` when a `function` entry is declared,
+`worker:code` when a `code` entry is (`"runtime_classes":["function","code"]`, in that order, with both). The limits are `worker.caps` with defaults applied; the key is absent while the worker is off or
+declares no `functions` entry (a probe that passes with none advertises nothing, so Fabric places no job this Node would
 refuse), and `worker` is reserved as a plugin name.
 
 ### Node descriptor → Fabric offers

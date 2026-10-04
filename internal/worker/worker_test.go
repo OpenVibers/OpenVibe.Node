@@ -138,7 +138,7 @@ func TestAdmitRefusals(t *testing.T) {
 	}{
 		{testJob(1, "nope"), protocol.FaultUnsupported, protocol.JobUnknownArtifact},
 		{wrongVersion, protocol.FaultUnsupported, protocol.JobUnknownArtifact},
-		{code, protocol.FaultUnsupported, protocol.JobNotAvailable},
+		{code, protocol.FaultUnsupported, protocol.JobUnknownArtifact},
 	} {
 		if f, r := w.Admit(c.j); f != c.fault || r != c.reason {
 			t.Errorf("%s %+v: %q %q, want %q %q", c.j.Class, c.j.Artifact, f, r, c.fault, c.reason)
@@ -174,6 +174,42 @@ func TestAdmitRefusals(t *testing.T) {
 			t.Fatalf("a refused job started: %+v", m)
 		}
 	}
+}
+
+// TestAdmitByClass: a job runs only an entry of its own class (a declared function is no code artifact, nor the
+// reverse), a class no entry implements is never available, and Classes lists the declared classes in protocol order.
+func TestAdmitByClass(t *testing.T) {
+	if c := New(helperConfig(t, config.WorkerCaps{}), (&sink{}).send, quiet()).Classes(); len(c) != 0 {
+		t.Fatalf("no entry declared, classes %v", c)
+	}
+	cfg := helperConfig(t, config.WorkerCaps{MaxJobs: 8}, "sleep")
+	script := cfg.Functions[0]
+	script.Name, script.Class = "script", config.ClassCode
+	cfg.Functions = append([]config.FunctionConfig{script}, cfg.Functions...)
+	w := New(cfg, (&sink{}).send, quiet())
+	if c := w.Classes(); len(c) != 2 || c[0] != protocol.ClassFunction || c[1] != protocol.ClassCode {
+		t.Fatalf("classes %v", c)
+	}
+	job := func(n int, class, name string) protocol.Job {
+		j := testJob(n, name)
+		j.Class = class
+		return j
+	}
+	for _, c := range []struct {
+		j             protocol.Job
+		fault, reason string
+	}{
+		{job(1, protocol.ClassCode, "script"), "", ""},
+		{job(2, protocol.ClassFunction, "sleep"), "", ""},
+		{job(3, protocol.ClassFunction, "script"), protocol.FaultUnsupported, protocol.JobUnknownArtifact},
+		{job(4, protocol.ClassCode, "sleep"), protocol.FaultUnsupported, protocol.JobUnknownArtifact},
+		{job(5, protocol.ClassBrowser, "script"), protocol.FaultUnsupported, protocol.JobNotAvailable},
+	} {
+		if f, r := w.Admit(c.j); f != c.fault || r != c.reason {
+			t.Errorf("%s %+v: %q %q, want %q %q", c.j.Class, c.j.Artifact, f, r, c.fault, c.reason)
+		}
+	}
+	w.Close()
 }
 
 // TestIsolationUnavailableRefused: when the namespaces cannot be created the probe fails (the class is not
