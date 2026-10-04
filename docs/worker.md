@@ -90,9 +90,15 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   WireGuard meshes), loopback, link-local (`169.254/16`, cloud metadata included), multicast, documentation and
   reserved ranges, `egress_deny`, the host itself (every address it holds) and anything not routed through the
   host's default route (a WireGuard peer, a container bridge) are refused; there is no IPv6 (`fe80::/10` included).
-  `openvibe-only`: `public`, further restricted to `egress_allow`. A job runs under the **stricter** of its own `net`
-  and this: a job naming `net: "deny"` gets `none` whatever `egress` says; a job without `net` gets `egress`. A policy
-  the host cannot enforce fails the probe and keeps the worker off: never a silent `none` nor an open network.
+  `openvibe-only`: `public`, further restricted to `egress_allow`. A job runs under the **stricter** of the `net` the
+  contract's job names and this. `net` absent means `deny` (`platform.job@1`'s declared default), so **a job that names
+  no `net` runs with no network at all** however open this is set: the Node never widens the contract's default. A job
+  naming `deny` or `none` gets the same. One naming `public` runs under `egress` when that is `public` or
+  `openvibe-only` (so under `openvibe-only` it is restricted to `egress_allow`); one naming `openvibe-only` needs
+  `egress` `openvibe-only` (a `public` host has no `egress_allow` to hold it to). Otherwise, `egress` `none` (or unset)
+  included, the job is **refused** with `net policy not supported`: it is never run with no network, nor with a wider
+  one, in place of what it asked. A policy the host cannot enforce fails the
+  probe and keeps the worker off: never a silent `none` nor an open network.
 - `egress_allow` (with `openvibe-only` only, and required by it): the IPv4 CIDRs a job may reach, the OpenVibe
   network's own ranges. They are configured, not guessed nor resolved from names: the Node trusts no DNS answer for
   them. The refused ranges above still win over an entry that overlaps them.
@@ -126,7 +132,9 @@ AppArmor; a Node running as root with `run_as` is not affected.
 
 1. **Admit** (before the `ack`): refused unless the stop latch is clear, the artifact is declared and fewer than
    `max_jobs` jobs run. An id the worker already holds is answered from it (`ack` while it runs, its `job_exit` once
-   it ended) and never starts a second process.
+   it ended) and never starts a second process. A job carrying `inputs` is refused (`job inputs not supported`) until
+   the Node can place them in its working directory and check their size and sha256: it never runs one with the
+   requested files and the digest check silently dropped. So is a job naming a `net` this host cannot enforce.
 2. **Start**: the Node makes the job's cgroup and starts itself again (`/proc/self/exe`) as the **sandbox init**,
    with its name as its only argument and its spec (the function's command and environment included) in a memfd, so
    that no host user reads the environment in its `/proc/<pid>/cmdline` (the Node checks that it shows the name
@@ -171,8 +179,8 @@ In six lines:
    `artifact_dir` made as it starts and a size-capped `/tmp` of its own: none of the Node's files, its credential or
    its control socket, nor the host's private keys.
 4. The network namespace has only a loopback that is down: no IP network, not even to the Node or `localhost`
-   (`egress` `none`, or a job naming `net: "deny"`). Under `public` or `openvibe-only` it also holds one veth to the
-   host, through which only what that policy allows leaves (see "Egress"); the loopback stays down.
+   (`net` absent, `deny` or `none`, whatever `egress` says). Under `public` or `openvibe-only` it also holds one veth to
+   the host, through which only what that policy allows leaves (see "Egress"); the loopback stays down.
 5. Nothing of the Node's environment reaches it.
 6. CPU, memory, processes and disk I/O are enforced by its cgroup v2 and rlimits; ttl, wall, CPU and output also by a
    per-job watchdog that SIGKILLs the whole group; `RLIMIT_CPU` backs the CPU cap per process.
@@ -255,6 +263,8 @@ Refused with `nack` (keyed by the job id; the first matching row wins, after the
 | `message`                             | `fault_code`               | when                                                    |
 |---------------------------------------|----------------------------|---------------------------------------------------------|
 | `class not available`                 | `unsupported`              | the worker is off (disabled, not Linux, probe failed), or no declared entry has the job's class (`function` or `code`) |
+| `job inputs not supported`            | `unsupported`              | the job carries `inputs`: this Node cannot stage them and check their digests yet, and never runs a job with them silently dropped |
+| `net policy not supported`            | `unsupported`              | the job names a `net` this host cannot enforce (`public` or `openvibe-only` while `egress` is `none`) |
 | `the e-stop or local stop is latched` | `estopped` or `local_stop` | the stop latch is set                                   |
 | `class not available`                 | `shutting_down`            | the Node is stopping                                    |
 | `unknown artifact`                    | `unsupported`              | no declared entry of the job's class has that name and exact version |

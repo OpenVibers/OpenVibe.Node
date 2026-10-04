@@ -231,6 +231,19 @@ func TestCodeJobRefusedByFunctionWorker(t *testing.T) {
 	}
 }
 
+// TestJobWithInputsRefusedOverTheLink: a well formed job carrying inputs reaches the worker and is nacked job inputs
+// not supported: the Node cannot stage them yet, and it never acks a job whose files it would silently drop.
+func TestJobWithInputsRefusedOverTheLink(t *testing.T) {
+	e := startWorkerNode(t)
+	j := testJob(jobID(1))
+	j.Artifact = &protocol.Artifact{Name: "hello", Version: "1.0.0"}
+	j.Inputs = []protocol.JobInput{{Name: "clip.mp4", MediaID: "med_01JAB2C3D4E5F6G7H8J9K0MNPQ",
+		SHA256: "9f86d081884c7d659a2feb15b0b4f8f1c0e6ad1d7e6fd2e1b0b6fd1c4f1d2a3b"}}
+	if nk := e.jobNack(j, protocol.JobInputsRefused); nk.FaultCode != protocol.FaultUnsupported {
+		t.Fatalf("a job with inputs: %+v", nk)
+	}
+}
+
 // TestJobRunsOverTheLink: a job sent by the fake Bot is acked, then job_started, job_stdout, job_usage (second 0)
 // and job_exit arrive in that order; a job frame resent while it runs is acked again and starts no second process;
 // after the end a resent job is answered with the same job_exit, before and after job_exit_ack.

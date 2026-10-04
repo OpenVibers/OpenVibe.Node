@@ -90,8 +90,14 @@ const (
 // RuntimeClasses lists every class the contract names; a worker runs only those it advertises.
 var RuntimeClasses = []string{ClassFunction, ClassCode, ClassBrowser, ClassLinux, ClassDesktop, ClassGPU}
 
-// NetDeny is the only job network policy (and the default when net is absent).
-const NetDeny = "deny"
+// Job network policies (platform.job@1 net). A job that names none runs under NetDeny: the contract's declared
+// default, which is never widened by the Node's own worker.egress.
+const (
+	NetDeny         = "deny"          // no network at all; also what an absent net means
+	NetNone         = "none"          // NetDeny under the name the Node's worker.egress uses
+	NetPublic       = "public"        // public IPv4, filtered by the host
+	NetOpenVibeOnly = "openvibe-only" // public, restricted to the host's egress_allow
+)
 
 // CapWorker is the status.capabilities key a worker advertises its runtime classes under (WorkerCapabilities). It is
 // present only when the Node runs at least one class.
@@ -118,6 +124,8 @@ const (
 	JobUnknownClass   = "unknown class"
 	JobNoArtifact     = "function or code job needs an artifact with an exact version"
 	JobNetUnsupported = "net policy not supported"
+	JobBadInputs      = "invalid inputs"
+	JobInputsRefused  = "job inputs not supported"
 	JobBadLimits      = "missing or invalid args, ttl_ms or limits"
 	JobNotAvailable   = "class not available"
 
@@ -280,6 +288,16 @@ type Artifact struct {
 	Version string `json:"version"`
 }
 
+// JobInput is one file the job's working directory must hold before the process starts: an OpenVibe.Media object
+// pinned by digest. The worker fetches it with its own token and never a caller-chosen URL, and a size or digest
+// mismatch ends the job failed before the process ever runs.
+type JobInput struct {
+	Name      string `json:"name"`
+	MediaID   string `json:"media_id"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+}
+
 // Job is platform.job@1.
 type Job struct {
 	ID       string          `json:"id"` // job_<ULID>, minted by the dispatcher: the idempotency and ack key
@@ -289,6 +307,7 @@ type Job struct {
 	TTLMS    int64           `json:"ttl_ms"`
 	Limits   JobLimits       `json:"limits"`
 	Net      string          `json:"net,omitempty"` // absent means deny
+	Inputs   []JobInput      `json:"inputs,omitempty"`
 }
 
 // JobRequest is the `job` frame: run Job. A body that does not decode still yields the frame, with Err set and the
@@ -324,10 +343,35 @@ var (
 	jobIDRe       = regexp.MustCompile(`^job_[0-9A-HJKMNP-TV-Z]{26}$`)
 	artifactRe    = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 	artifactVerRe = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$`)
+	mediaIDRe     = regexp.MustCompile(`^med_[0-9A-HJKMNP-TV-Z]{26}$`)
+	sha256Re      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	inputNameRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
 
 // ValidJobID reports whether id is a job_<ULID>.
 func ValidJobID(id string) bool { return jobIDRe.MatchString(id) }
+
+// ValidJobInputs reports whether the job's inputs are well formed: at most maxJobInputs, each a Media object named by
+// its contract's patterns, with names unique and carrying no path separator. An empty list is valid; nil is, too.
+func ValidJobInputs(in []JobInput) bool {
+	if len(in) > maxJobInputs {
+		return false
+	}
+	seen := make(map[string]bool, len(in))
+	for _, i := range in {
+		if !inputNameRe.MatchString(i.Name) || !mediaIDRe.MatchString(i.MediaID) || !sha256Re.MatchString(i.SHA256) || i.SizeBytes < 0 {
+			return false
+		}
+		if seen[i.Name] {
+			return false
+		}
+		seen[i.Name] = true
+	}
+	return true
+}
+
+// maxJobInputs is the contract's cap on a job's inputs array.
+const maxJobInputs = 32
 
 // Check returns the fault code and reason to nack this job with, or two empty strings when a worker running the
 // classes in available takes it. The checks run in this order, so the reason names the first problem.
@@ -342,8 +386,10 @@ func (r JobRequest) Check(available []string) (fault, reason string) {
 		return FaultUnsupported, JobUnknownClass
 	case (j.Class == ClassFunction || j.Class == ClassCode) && (j.Artifact == nil || !artifactRe.MatchString(j.Artifact.Name) || !artifactVerRe.MatchString(j.Artifact.Version)):
 		return FaultBadValue, JobNoArtifact
-	case j.Net != "" && j.Net != NetDeny:
+	case j.Net != "" && j.Net != NetDeny && j.Net != NetNone && j.Net != NetPublic && j.Net != NetOpenVibeOnly:
 		return FaultUnsupported, JobNetUnsupported
+	case !ValidJobInputs(j.Inputs):
+		return FaultBadValue, JobBadInputs
 	case !isObject(j.Args) || j.TTLMS < 1 || j.Limits.WallMS < 1 || j.Limits.CPUMS < 1 || j.Limits.MemBytes < 1:
 		return FaultBadValue, JobBadLimits
 	case !contains(available, j.Class):

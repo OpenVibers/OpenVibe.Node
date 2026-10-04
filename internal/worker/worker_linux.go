@@ -272,7 +272,7 @@ func (s *sandbox) close() {
 // filter; nothing but its /tmp, /proc and device nodes is mounted writable; it is in its job cgroup; its rlimits
 // (RLIMIT_AS included: max_vm_bytes must be set) are set; every block device has its io.max; its root holds none of
 // the Node's directories nor hiddenPaths (/var, the host's private keys); its CPU limit can be set and its usage read.
-// It does so for every policy a job may run under: none (a job naming net "deny") and worker.egress, whose veth must
+// It does so for every policy a job may run under: none (a job whose net is absent, deny or none) and worker.egress, whose veth must
 // then stand as the only interface up with the default route through it, the Node's nftables table written. It also
 // checks that no declared function's artifact directory is refused. Any failure keeps the class off: there is no
 // weaker mode, never none in place of public nor an open network.
@@ -280,8 +280,14 @@ func probe(cfg config.WorkerConfig, isolate isolateFunc) error {
 	if err := policy(cfg); err != nil {
 		return err
 	}
-	egress := egressFor(cfg.Egress, "")
-	if egress != "" {
+	// The host's own policy, the ceiling every job may be offered: a job naming deny or none (or no net at all) runs
+	// under no network whatever it says, and one naming public or openvibe-only runs under this, which the probe must be
+	// able to enforce (Admit refuses what it cannot).
+	egress := cfg.Egress
+	if egress == "" {
+		egress = config.EgressNone
+	}
+	if egress != config.EgressNone {
 		if _, err := egressReady(); err != nil {
 			return fmt.Errorf("worker.egress %s: %w", egress, err)
 		}
@@ -305,7 +311,7 @@ func probe(cfg config.WorkerConfig, isolate isolateFunc) error {
 	if err := probeSandbox(cfg, isolate, ""); err != nil {
 		return err
 	}
-	if egress != "" {
+	if egress != config.EgressNone {
 		return probeSandbox(cfg, isolate, egress)
 	}
 	return nil

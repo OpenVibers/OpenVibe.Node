@@ -68,6 +68,12 @@ func TestJobsRefused(t *testing.T) {
 	j.Net = "allow"
 	e.jobNack(j, protocol.JobNetUnsupported)
 
+	// A malformed input is nacked by Check, before the class is even looked at.
+	j = testJob(jobID(8))
+	j.Inputs = []protocol.JobInput{{Name: "../escape", MediaID: "med_01JAB2C3D4E5F6G7H8J9K0MNPQ",
+		SHA256: "9f86d081884c7d659a2feb15b0b4f8f1c0e6ad1d7e6fd2e1b0b6fd1c4f1d2a3b"}}
+	e.jobNack(j, protocol.JobBadInputs)
+
 	e.jobNack(testJob("job_123"), protocol.JobBadID)
 
 	j = testJob(jobID(4))
