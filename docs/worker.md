@@ -84,11 +84,20 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   (`RLIMIT_AS`, always set: there is no "none"; a runtime that reserves a large address space up front, such as
   Node.js, the JVM or race-instrumented Go, needs a large value, e.g. 64 TiB for the last). `mem_bytes` is the job cgroup's `memory.max` (swap off: `memory.swap.max` is set to 0 and read back; without swap accounting, which makes that
   control, the probe and each job are refused unless the host has no swap at all; an OOM kills the whole job).
-- `egress`: what a job may reach on the network. `none` (the default) is the only policy enforced: a network
-  namespace with nothing but a loopback that is down. `public` (internet but no private, link-local or Node
-  addresses) and `openvibe-only` (the platform's endpoints only) need an egress proxy in the job's namespace that is
-  not built yet (follow-up): with either, the probe fails and the worker stays off, never a silent `none` nor an
-  open network.
+- `egress`: the most a job may reach on the network; all three policies are enforced (see "Egress" below). `none`
+  (the default): a network namespace with nothing but a loopback that is down. `public`: IPv4 to public addresses
+  only, through a veth the Node NATs; private (`10/8`, `172.16/12`, `192.168/16`), shared (`100.64/10`, most
+  WireGuard meshes), loopback, link-local (`169.254/16`, cloud metadata included), multicast, documentation and
+  reserved ranges, `egress_deny`, the host itself (every address it holds) and anything not routed through the
+  host's default route (a WireGuard peer, a container bridge) are refused; there is no IPv6 (`fe80::/10` included).
+  `openvibe-only`: `public`, further restricted to `egress_allow`. A job runs under the **stricter** of its own `net`
+  and this: a job naming `net: "deny"` gets `none` whatever `egress` says; a job without `net` gets `egress`. A policy
+  the host cannot enforce fails the probe and keeps the worker off: never a silent `none` nor an open network.
+- `egress_allow` (with `openvibe-only` only, and required by it): the IPv4 CIDRs a job may reach, the OpenVibe
+  network's own ranges. They are configured, not guessed nor resolved from names: the Node trusts no DNS answer for
+  them. The refused ranges above still win over an entry that overlaps them.
+- `egress_deny` (with `public` or `openvibe-only`): more IPv4 CIDRs to refuse, on top of those always refused: the
+  Node's own cell or WireGuard peers when they hold public addresses.
 
 The classes `function` and `code` — advertised as the reserved Fabric capabilities `worker:function` and `worker:code` in
 `status.capabilities.worker` (the `platform.resource-offer@1` namespace OpenVibe.Run routes on) — are each offered only when `enabled` is true, the OS is Linux
@@ -97,8 +106,11 @@ the way a job is started and checks every control from the host: the sandbox was
 mount, network, PID, IPC, UTS and cgroup namespaces of its own, `NoNewPrivs` and a seccomp filter; nothing in its
 root but `/tmp`, `/proc` and the device nodes is mounted writable; it is in its own cgroup with every controller
 (cpu, memory, pids, io) and every block device holds its `io.max`; its rlimits (`RLIMIT_AS` included) are set; its
-root holds none of `/var`, `/etc/shadow`, `/etc/ssl/private`, `/etc/pki/tls/private` and the Node's directories; its CPU limit can be set and its usage read; `egress` is `none`; no function's `artifact_dir`
-is refused (above). If any check fails the Node logs why (`worker off: …`) and refuses every job,
+root holds none of `/var`, `/etc/shadow`, `/etc/ssl/private`, `/etc/pki/tls/private` and the Node's directories; its CPU limit can be set and its usage read; no function's `artifact_dir`
+is refused (above). It does so under `none` and, when `egress` is `public` or `openvibe-only`, again under that
+policy, whose veth must then stand as the process's only interface up, with the default route through it and the
+Node's nftables table written (and first: the Node runs as root, `ip`, `nsenter` and `nft` are installed, IPv4
+forwarding is on). If any check fails the Node logs why (`worker off: …`) and refuses every job,
 exactly as with the worker off: there is no weaker mode. A job whose sandbox fails at run time ends `failed` without
 its function having run.
 
@@ -159,7 +171,8 @@ In six lines:
    `artifact_dir` made as it starts and a size-capped `/tmp` of its own: none of the Node's files, its credential or
    its control socket, nor the host's private keys.
 4. The network namespace has only a loopback that is down: no IP network, not even to the Node or `localhost`
-   (`egress` `none`; the other policies are not enforced yet, so they keep the worker off).
+   (`egress` `none`, or a job naming `net: "deny"`). Under `public` or `openvibe-only` it also holds one veth to the
+   host, through which only what that policy allows leaves (see "Egress"); the loopback stays down.
 5. Nothing of the Node's environment reaches it.
 6. CPU, memory, processes and disk I/O are enforced by its cgroup v2 and rlimits; ttl, wall, CPU and output also by a
    per-job watchdog that SIGKILLs the whole group; `RLIMIT_CPU` backs the CPU cap per process.
@@ -207,8 +220,32 @@ What it does **not** protect against:
 - **The `args` and the result are trusted to the function**: the worker passes the server's JSON unchanged; validating
   it is the function's job.
 
-Not built yet (follow-ups): the `public` and `openvibe-only` egress policies (an egress proxy reached through a veth
-or a socket bound into the job's namespace, filtering by destination).
+### Egress
+
+How `public` and `openvibe-only` are enforced (`internal/worker/egress_linux.go`):
+
+- **A veth per job.** Before the job starts, the Node makes a veth pair `ovw<n>`/`ovw<n>j` and gives the two ends a
+  `/30` of `169.254.240.0/20` (link-local: an address no job may reach, so no job reaches another's). Once the
+  sandbox stands, and before the function executes, it moves `ovw<n>j` into the job's network namespace, addresses it
+  with a default route through `ovw<n>` and reads the namespace back: that interface alone up (the loopback stays
+  down), that route and its `/30` alone. The job cannot change any of it: it holds no capability. Deleted when the
+  job ends.
+- **NAT and filtering in the host's namespace**, in the Node's own nftables table `inet openvibe_worker`, written whole
+  in one transaction each time a job's veth is made (a firewall reload that dropped it is undone by the next job;
+  other tables are left alone, and a firewall that drops forwarded traffic still does). What a job sends is
+  masqueraded out of the host's default route. Refused, with a TCP reset (otherwise ICMP administratively prohibited),
+  so a job sees "connection refused" at once: anything addressed to the host itself; IPv6; anything not leaving by an
+  interface of the host's IPv4 default route; the refused ranges listed under `egress`; `egress_deny`; and, under
+  `openvibe-only`, anything outside `egress_allow`. Nothing new reaches a job; only replies do.
+- **Needs**: the Node running as root (`run_as`), `ip` and `nsenter` (iproute2, util-linux) and `nft` (nftables) in
+  `/usr/sbin`, `/sbin`, `/usr/bin` or `/bin`, IPv4 forwarding on (`sysctl net.ipv4.ip_forward=1`: the Node does not
+  turn it on, which would make the host a router for every interface; the owner does) and an IPv4 default route.
+  Without one of them the probe fails and so does every job.
+- **No DNS.** The Node runs no resolver for jobs, and the host's (`127.0.0.53` on most systems) is out of a job's
+  reach. A job resolves names only through a resolver its policy lets it reach by address (any public one under
+  `public`; one listed in `egress_allow` under `openvibe-only`), or connects by address.
+- **`openvibe-only` is configured, not guessed.** No authoritative list of the OpenVibe network's ranges exists in
+  this repository or OpenVibe.Contracts, so `egress_allow` must name them; without it the config does not load.
 
 ## Refusals and exit reasons
 

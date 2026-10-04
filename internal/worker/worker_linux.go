@@ -29,8 +29,8 @@ var pageSize = int64(os.Getpagesize())
 const capSysAdmin = 21
 
 // isolate turns cmd into the start of a sandboxed job (see sandbox_linux.go): the Node's own executable re-run as the
-// sandbox init, in its own process group, in new user, mount, network (a loopback that is down), PID, IPC, UTS and
-// cgroup namespaces, inside the job's cgroup v2 (made here), with PR_SET_PDEATHSIG SIGKILL. It runs as worker.run_as
+// sandbox init, in its own process group, in new user, mount, network (a loopback that is down, and under egress public
+// or openvibe-only a veth, egress_linux.go), PID, IPC, UTS and cgroup namespaces, inside the job's cgroup v2 (made here), with PR_SET_PDEATHSIG SIGKILL. It runs as worker.run_as
 // (no supplementary groups; the Node must be root) or, with allow_same_user, as the Node's own non-root user. cmd's
 // path, args, env and dir become the function's, run once the sandbox stands; cmd.ExtraFiles holds at most fd 3. The
 // function's artifact directory is opened here and copied by the init (stageArtifact).
@@ -97,6 +97,11 @@ func isolate(cmd *exec.Cmd, cfg config.WorkerConfig, p plan) (*sandbox, error) {
 	if art != nil {
 		files = append(files, art) // artifactFD
 	}
+	if p.egress != "" {
+		if sb.egress, err = newEgress(cfg); err != nil {
+			return fail(fmt.Errorf("worker.egress %s: %w", p.egress, err))
+		}
+	}
 	if sb.cg, err = newJobCgroup(caps, p.limits); err != nil {
 		return fail(err)
 	}
@@ -131,12 +136,9 @@ func specFile(spec sandboxSpec) (*os.File, error) {
 	return f, nil
 }
 
-// policy refuses what the sandbox cannot enforce: an egress other than none, an architecture without a seccomp
-// allowlist.
+// policy refuses what the sandbox cannot enforce: an architecture without a seccomp allowlist. (An egress policy the
+// host cannot enforce fails in newEgress.)
 func policy(cfg config.WorkerConfig) error {
-	if e := cfg.Egress; e != "" && e != config.EgressNone {
-		return fmt.Errorf("worker.egress %s is not enforced yet (only none is)", e)
-	}
 	_, err := seccompFilter()
 	return err
 }
@@ -170,9 +172,10 @@ func jobAttr(cfg config.WorkerConfig) (*syscall.SysProcAttr, error) {
 }
 
 // sandbox is a job's sandbox as the Node holds it: the status pipe of its init, the pipe that lets it execute the
-// function, the descriptors the child inherits (closed once it started) and its cgroup.
+// function, the descriptors the child inherits (closed once it started), its cgroup and its veth (nil under none).
 type sandbox struct {
 	cg     *jobCgroup
+	egress *egressNet
 	status *os.File
 	goW    *os.File
 	child  []*os.File
@@ -186,8 +189,8 @@ func (s *sandbox) started() {
 	s.child = nil
 }
 
-// ready waits until the sandbox init stands confined, about to execute the function, and checks from the host that
-// it runs with no_new_privs and the seccomp filter, that nothing but its /tmp, /proc and device nodes is mounted
+// ready waits until the sandbox init stands confined, about to execute the function, moves the job's veth into its
+// network namespace (under egress public or openvibe-only) and checks from the host that it runs with no_new_privs and the seccomp filter, that nothing but its /tmp, /proc and device nodes is mounted
 // writable and that every block device has the job's io.max. The init waits for run meanwhile, so it cannot have
 // exited. An error means the function must not run.
 func (s *sandbox) ready(pid int) error {
@@ -199,6 +202,11 @@ func (s *sandbox) ready(pid int) error {
 	if b[0] != 0 {
 		msg, _ := io.ReadAll(s.status)
 		return fmt.Errorf("the sandbox could not be set up: %s%s", b[:], msg)
+	}
+	if s.egress != nil {
+		if err := s.egress.attach(pid); err != nil {
+			return fmt.Errorf("worker.egress: the job's network: %w", err)
+		}
 	}
 	// The spec, the function's environment included, must not show to every host user in the init's argv.
 	if c, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); err != nil || string(c) != sandboxArg0+"\x00" {
@@ -254,6 +262,9 @@ func (s *sandbox) close() {
 	if s.cg != nil {
 		s.cg.remove()
 	}
+	if s.egress != nil {
+		s.egress.close()
+	}
 }
 
 // probe starts /bin/sh the way a job is started and checks every control from the host: the sandbox was set up;
@@ -261,11 +272,19 @@ func (s *sandbox) close() {
 // filter; nothing but its /tmp, /proc and device nodes is mounted writable; it is in its job cgroup; its rlimits
 // (RLIMIT_AS included: max_vm_bytes must be set) are set; every block device has its io.max; its root holds none of
 // the Node's directories nor hiddenPaths (/var, the host's private keys); its CPU limit can be set and its usage read.
-// It also checks that no declared function's artifact directory is refused. Any failure keeps the class off: there is
-// no weaker mode.
+// It does so for every policy a job may run under: none (a job naming net "deny") and worker.egress, whose veth must
+// then stand as the only interface up with the default route through it, the Node's nftables table written. It also
+// checks that no declared function's artifact directory is refused. Any failure keeps the class off: there is no
+// weaker mode, never none in place of public nor an open network.
 func probe(cfg config.WorkerConfig, isolate isolateFunc) error {
 	if err := policy(cfg); err != nil {
 		return err
+	}
+	egress := egressFor(cfg.Egress, "")
+	if egress != "" {
+		if _, err := egressReady(); err != nil {
+			return fmt.Errorf("worker.egress %s: %w", egress, err)
+		}
 	}
 	binds, links, err := rootPlan(cfg.NodeDirs)
 	if err != nil {
@@ -283,6 +302,17 @@ func probe(cfg config.WorkerConfig, isolate isolateFunc) error {
 			return fmt.Errorf("%s %s@%s: %w", f.EffectiveClass(), f.Name, f.Version, err)
 		}
 	}
+	if err := probeSandbox(cfg, isolate, ""); err != nil {
+		return err
+	}
+	if egress != "" {
+		return probeSandbox(cfg, isolate, egress)
+	}
+	return nil
+}
+
+// probeSandbox is probe's check of one sandbox, under egress.
+func probeSandbox(cfg config.WorkerConfig, isolate isolateFunc, egress string) error {
 	root, err := os.MkdirTemp("", "openvibe-probe-")
 	if err != nil {
 		return err
@@ -296,7 +326,7 @@ func probe(cfg config.WorkerConfig, isolate isolateFunc) error {
 	caps := cfg.Caps.WithDefaults()
 	cmd := exec.Command("/bin/sh", "-c", "read x")
 	cmd.Env, cmd.Dir = []string{"PATH=/usr/bin:/bin"}, "/tmp"
-	sb, err := isolate(cmd, cfg, plan{root: root, limits: protocol.JobLimits{CPUMS: 1000, MemBytes: caps.MaxMemBytes}})
+	sb, err := isolate(cmd, cfg, plan{root: root, limits: protocol.JobLimits{CPUMS: 1000, MemBytes: caps.MaxMemBytes}, egress: egress})
 	if err != nil {
 		return err
 	}

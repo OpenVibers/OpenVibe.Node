@@ -121,3 +121,30 @@ func TestWorkerEntryClass(t *testing.T) {
 		t.Fatal("a function entry with no class and one with class function were both accepted")
 	}
 }
+
+// TestWorkerEgress: the three policies load; openvibe-only needs its allowlist, which no other policy takes; both
+// lists hold IPv4 CIDRs only.
+func TestWorkerEgress(t *testing.T) {
+	ok := []WorkerConfig{{}, {Egress: EgressNone}, {Egress: EgressPublic, EgressDeny: []string{"203.0.113.0/24"}},
+		{Egress: EgressOpenVibeOnly, EgressAllow: []string{"198.51.100.7/32"}, EgressDeny: []string{"198.51.100.0/24"}}}
+	for _, w := range ok {
+		c := Default()
+		c.Worker = w
+		if err := c.Validate(); err != nil {
+			t.Fatalf("%+v: %v", w, err)
+		}
+	}
+	bad := []WorkerConfig{{Egress: "open"}, {Egress: EgressOpenVibeOnly},
+		{Egress: EgressPublic, EgressAllow: []string{"198.51.100.0/24"}}, {EgressAllow: []string{"198.51.100.0/24"}},
+		{Egress: EgressOpenVibeOnly, EgressAllow: []string{"openvibe.network"}},
+		{Egress: EgressOpenVibeOnly, EgressAllow: []string{"2001:db8::/32"}},
+		{Egress: EgressOpenVibeOnly, EgressAllow: []string{"198.51.100.7/24"}},
+		{Egress: EgressPublic, EgressDeny: []string{"10.0.0.1"}}}
+	for _, w := range bad {
+		c := Default()
+		c.Worker = w
+		if err := c.Validate(); err == nil {
+			t.Fatalf("%+v was accepted", w)
+		}
+	}
+}

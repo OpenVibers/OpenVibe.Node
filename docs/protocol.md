@@ -188,7 +188,7 @@ Otherwise it advertises no class and refuses every well-formed job with `class n
 
 | direction        | type           | fields                                                                                    |
 |------------------|----------------|-------------------------------------------------------------------------------------------|
-| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function` and `code`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`, the default)} |
+| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function` and `code`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`: no network whatever the Node's `worker.egress`; absent: `worker.egress` applies, `none` by default)} |
 | server → device  | `job_cancel`   | `id`                                                                                      |
 | server → device  | `job_exit_ack` | `id`                                                                                      |
 | device → server  | `job_started`  | `id`, `started_ms`                                                                        |
