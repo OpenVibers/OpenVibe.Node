@@ -44,6 +44,10 @@ again upgrades and keeps the credential. Options: `--no-service`, `--version vX.
 directory holding the release files). `OPENVIBE_NODE_BASE` overrides the download location, `OPENVIBE_SERVER` the
 server.
 
+The installer downloads the binary, the plugin bundle and `SHA256SUMS` from `releases/latest/download`, which GitHub
+resolves only to the latest full release, so a host whose release is still a pre-release needs `OPENVIBE_NODE_BASE` or
+`--version TAG`.
+
 Requirements: `python3` with `venv` (`sudo apt install python3 python3-venv`), `curl` or `wget`. For the Adeept camera,
 `rpicam-apps` (preinstalled on Raspberry Pi OS). For Cozmo's voice, `espeak-ng`. `ffmpeg` is optional (better video
 from plugins that send JPEG frames).
