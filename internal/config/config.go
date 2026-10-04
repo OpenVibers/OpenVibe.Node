@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -138,9 +139,63 @@ type WorkerConfig struct {
 	// EgressDeny is more IPv4 CIDRs a public or openvibe-only job is refused (the Node's cell, WireGuard peers with
 	// public addresses), on top of the ranges always refused.
 	EgressDeny []string `json:"egress_deny,omitempty"`
+	// Media is where a job's inputs come from and a result over 256 KiB is uploaded to. Off (the default), a job
+	// naming inputs is refused and a result over 256 KiB ends the job limit.
+	Media MediaConfig `json:"media,omitzero"`
 	// NodeDirs are the Node's own directories (config, credential, state, control socket), which no job may see; the
 	// Node sets them, the config file does not.
 	NodeDirs []string `json:"-"`
+}
+
+// MediaConfig is the OpenVibe.Media objects client the worker fetches inputs and uploads large results with. The
+// token is read from the environment variable TokenEnv names when a job needs it: it never lies in the config file
+// and appears in no job's environment, log line or error. Which app and token a Node uses is the operator's choice
+// (Run's own app, never Node's), made when they enable it.
+type MediaConfig struct {
+	Enabled  bool   `json:"enabled,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`  // https only, e.g. https://media.openvibe.network
+	App      string `json:"app,omitempty"`       // the :app of /api/v2/:app/objects
+	TokenEnv string `json:"token_env,omitempty"` // default DefaultMediaTokenEnv
+	MaxBytes int64  `json:"max_bytes,omitempty"` // the most bytes one input or uploaded result may take; default 64 MiB
+}
+
+// DefaultMediaTokenEnv is the variable worker.media's token is read from when token_env is not set.
+const DefaultMediaTokenEnv = "OPENVIBE_MEDIA_TOKEN"
+
+// WithDefaults fills token_env and max_bytes.
+func (m MediaConfig) WithDefaults() MediaConfig {
+	if m.TokenEnv == "" {
+		m.TokenEnv = DefaultMediaTokenEnv
+	}
+	if m.MaxBytes == 0 {
+		m.MaxBytes = 64 << 20
+	}
+	return m
+}
+
+var (
+	mediaAppRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+	envNameRe  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+)
+
+func (m MediaConfig) validate() error {
+	if m.Endpoint != "" {
+		u, err := url.Parse(m.Endpoint)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return errors.New("config: worker.media.endpoint must be an https:// URL with no credentials, query or fragment")
+		}
+	}
+	switch {
+	case m.App != "" && !mediaAppRe.MatchString(m.App):
+		return fmt.Errorf("config: worker.media.app %q is not an app id", m.App)
+	case m.TokenEnv != "" && !envNameRe.MatchString(m.TokenEnv):
+		return fmt.Errorf("config: worker.media.token_env %q is not an environment variable name", m.TokenEnv)
+	case m.MaxBytes < 0:
+		return errors.New("config: worker.media.max_bytes must not be negative")
+	case m.Enabled && (m.Endpoint == "" || m.App == ""):
+		return errors.New("config: worker.media.enabled needs worker.media.endpoint and worker.media.app")
+	}
+	return nil
 }
 
 // The worker.egress policies.
@@ -425,7 +480,7 @@ func (w WorkerConfig) validate() error {
 		c.MaxCPUMillis < 0 || c.MaxPids < 0 || c.MaxDiskBytes < 0 || c.MaxIOBps < 0 || c.MaxIOPS < 0 || c.MaxVMBytes < 0 {
 		return errors.New("config: worker.caps must not be negative")
 	}
-	return nil
+	return w.Media.validate()
 }
 
 // PluginCommand resolves a plugin's argv.

@@ -351,6 +351,9 @@ var (
 // ValidJobID reports whether id is a job_<ULID>.
 func ValidJobID(id string) bool { return jobIDRe.MatchString(id) }
 
+// ValidMediaID reports whether id is a Media object id, med_<ULID>.
+func ValidMediaID(id string) bool { return mediaIDRe.MatchString(id) }
+
 // ValidJobInputs reports whether the job's inputs are well formed: at most maxJobInputs, each a Media object named by
 // its contract's patterns, with names unique and carrying no path separator. An empty list is valid; nil is, too.
 func ValidJobInputs(in []JobInput) bool {

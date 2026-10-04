@@ -148,3 +148,47 @@ func TestWorkerEgress(t *testing.T) {
 		}
 	}
 }
+
+// TestWorkerMedia: worker.media is off unless enabled; enabled it needs an https endpoint (no credentials in it) and an
+// app, and its token is named, never written: a key the block does not know fails the load.
+func TestWorkerMedia(t *testing.T) {
+	ok := []MediaConfig{{}, {Endpoint: "https://media.openvibe.network"},
+		{Enabled: true, Endpoint: "https://media.openvibe.network", App: "prj_01JAB2C3D4E5F6G7H8J9K0MNPQ", TokenEnv: "RUN_MEDIA_TOKEN", MaxBytes: 1 << 20}}
+	for _, m := range ok {
+		c := Default()
+		c.Worker.Media = m
+		if err := c.Validate(); err != nil {
+			t.Fatalf("%+v: %v", m, err)
+		}
+	}
+	bad := []MediaConfig{{Enabled: true}, {Enabled: true, Endpoint: "https://media.openvibe.network"},
+		{Enabled: true, Endpoint: "http://media.openvibe.network", App: "run"},
+		{Enabled: true, Endpoint: "https://user:pw@media.openvibe.network", App: "run"},
+		{Enabled: true, Endpoint: "https://media.openvibe.network?token=x", App: "run"},
+		{Enabled: true, Endpoint: "https://media.openvibe.network", App: "../admin"},
+		{Enabled: true, Endpoint: "https://media.openvibe.network", App: "run", TokenEnv: "A=B"},
+		{Enabled: true, Endpoint: "https://media.openvibe.network", App: "run", MaxBytes: -1}}
+	for _, m := range bad {
+		c := Default()
+		c.Worker.Media = m
+		if err := c.Validate(); err == nil {
+			t.Fatalf("%+v validated", m)
+		}
+	}
+	if d := (MediaConfig{}).WithDefaults(); d.TokenEnv != "OPENVIBE_MEDIA_TOKEN" || d.MaxBytes != 64<<20 {
+		t.Fatalf("defaults %+v", d)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"worker":{"media":{"enabled":true,"endpoint":"https://media.openvibe.network","app":"run"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := Load(path); err != nil || !c.Worker.Media.Enabled || c.Worker.Media.App != "run" {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if err := os.WriteFile(path, []byte(`{"worker":{"media":{"enabled":true,"endpoint":"https://media.openvibe.network","app":"run","token":"x"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("a token written in the config file loaded")
+	}
+}

@@ -20,6 +20,13 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   "run_as": {"uid": 2001, "gid": 2001},
   "allow_same_user": false,
   "egress": "none",
+  "media": {
+    "enabled": false,
+    "endpoint": "",
+    "app": "",
+    "token_env": "OPENVIBE_MEDIA_TOKEN",
+    "max_bytes": 67108864
+  },
   "caps": {
     "max_ttl_ms": 600000,
     "max_wall_ms": 300000,
@@ -104,6 +111,14 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   them. The refused ranges above still win over an entry that overlaps them.
 - `egress_deny` (with `public` or `openvibe-only`): more IPv4 CIDRs to refuse, on top of those always refused: the
   Node's own cell or WireGuard peers when they hold public addresses.
+- `media` (off by default): the OpenVibe.Media objects API (`/api/v2/<app>/objects`) a job's `inputs` are fetched
+  from and a result over 256 KiB is uploaded to. `enabled` needs `endpoint` (https only, no credentials, query or
+  fragment) and `app`. Which app and token a Node uses is deployment configuration, chosen by the operator who enables
+  it: OpenVibe.Run's own app (a token holding `media.object.read` and `media.object.upload`), never Node's. The token
+  is read from the environment variable `token_env` names (default `OPENVIBE_MEDIA_TOKEN`) when a job needs it: it is
+  never written in `config.json` (a `token` key fails the load), and it appears in no job's environment, no log line
+  and no error; it is sent only to `endpoint`'s own host. `max_bytes` caps each input and each uploaded result.
+  Off, a job naming `inputs` is refused and a result over 256 KiB ends the job `limit`, as before.
 
 The classes `function` and `code` — advertised as the reserved Fabric capabilities `worker:function` and `worker:code` in
 `status.capabilities.worker` (the `platform.resource-offer@1` namespace OpenVibe.Run routes on) — are each offered only when `enabled` is true, the OS is Linux
@@ -132,10 +147,20 @@ AppArmor; a Node running as root with `run_as` is not affected.
 
 1. **Admit** (before the `ack`): refused unless the stop latch is clear, the artifact is declared and fewer than
    `max_jobs` jobs run. An id the worker already holds is answered from it (`ack` while it runs, its `job_exit` once
-   it ended) and never starts a second process. A job carrying `inputs` is refused (`job inputs not supported`) until
-   the Node can place them in its working directory and check their size and sha256: it never runs one with the
-   requested files and the digest check silently dropped. So is a job naming a `net` this host cannot enforce.
-2. **Start**: the Node makes the job's cgroup and starts itself again (`/proc/self/exe`) as the **sandbox init**,
+   it ended) and never starts a second process. A job carrying `inputs` is refused (`job inputs not supported`) unless
+   `media` is enabled: it never runs one with the requested files and the digest check silently dropped. So is a job
+   naming a `net` this host cannot enforce.
+2. **Inputs** (with `media` on, before anything of the job runs): each input is fetched by the Node from
+   `GET <endpoint>/api/v2/<app>/objects/<media_id>/download?redirect=1` into the job's directory under its `name`
+   (the contract's file-name pattern, unique, checked before the `ack`, so it cannot leave that directory). Every
+   redirect hop must stay https (at most 3; the token is dropped on a hop to another host), the body is cut off at
+   `max_bytes` (and at what is left of `max_disk_bytes` for all inputs together) while it streams, and the bytes that
+   arrive, from whatever host served them, must match the pinned `sha256` (and `size_bytes` when given). The requests
+   are bounded by the job's `ttl_ms` from receipt and cancelled when it is killed. Any failure (Media unreachable, a
+   status other than 2xx, a redirect off https, too many bytes, another digest, `token_env` unset) ends the job
+   `failed`, with no `job_started`: no sandbox is made and nothing runs. Under `egress` `openvibe-only` an unreachable
+   Media therefore fails closed. The Node fetches, not the job: inputs give a job no network of its own.
+3. **Start**: the Node makes the job's cgroup and starts itself again (`/proc/self/exe`) as the **sandbox init**,
    with its name as its only argument and its spec (the function's command and environment included) in a memfd, so
    that no host user reads the environment in its `/proc/<pid>/cmdline` (the Node checks that it shows the name
    alone), straight into that cgroup (`clone3` `CLONE_INTO_CGROUP`), in its own process group and in new user, mount,
@@ -144,18 +169,23 @@ AppArmor; a Node running as root with `run_as` is not affected.
    `RLIMIT_CORE` 0, `RLIMIT_NOFILE` 1024, `RLIMIT_NPROC`, `RLIMIT_FSIZE` and `RLIMIT_AS`; drops every capability; sets
    `no_new_privs` and the seccomp filter; reports that it is ready and waits for the Node's go; and only then
    executes the function, with only fds 0-3 open. The function
-   works in a fresh directory `/tmp/openvibe-job-*` of its own `/tmp`; its environment is built from scratch
+   works in a fresh directory `/tmp/openvibe-job-*` of its own `/tmp`, where the init copied its inputs (regular files
+   only, opened without following a symlink) before the private root covered the Node's copies: they count towards
+   `max_disk_bytes` and its memory, and are removed with the job's directory when it ends; its environment is built from scratch
    (`PATH=/usr/local/bin:/usr/bin:/bin`, `HOME` and `TMPDIR` that directory, `LANG=C.UTF-8`, `OPENVIBE_JOB_ID`, and
    the function's `env`; nothing inherited from the Node); `args` come as one line of JSON on stdin; stderr is
    discarded. While the init waits (so it is sure to be alive), the Node checks `NoNewPrivs`, the seccomp filter and
    that nothing but `/tmp`, `/proc` and the device nodes is mounted writable, and sets `RLIMIT_CPU` again from
    outside; only then does it let the init execute the function. `job_started` follows once that `execve`
    succeeded: otherwise the process is killed and the job ends `failed` with no `job_started`.
-3. **Run**: stdout streams as `job_stdout` chunks of at most 16 KiB each as sent (invalid UTF-8 becomes U+FFFD before
+4. **Run**: stdout streams as `job_stdout` chunks of at most 16 KiB each as sent (invalid UTF-8 becomes U+FFFD before
    it is cut, and a UTF-8 sequence is never split); a watchdog samples CPU time and resident memory of every process in the
    job's PID namespace every 200 ms and sends `job_usage` for every second once it fully elapsed.
-4. **End**: the function's result is what it writes to **fd 3** (JSON, at most 256 KiB), reported only when it exits
-   0. `job_exit` carries the reason, the exit code (null when it was killed) and the usage, and is resent until
+5. **End**: the function's result is what it writes to **fd 3** (JSON, at most 256 KiB), reported only when it exits
+   0. With `media` on a result may be up to `max_bytes`: one over 256 KiB is uploaded as a private Media object
+   (`POST …/objects`, `PUT …/objects/<id>/content`, `POST …/objects/<id>/complete`, each to `endpoint`, never
+   redirected, the stored sha256 checked) and `job_exit.result` is `{"media_id": "med_…"}`; the bytes never ride the
+   control link. An upload that fails ends the job `failed` (its `code` kept). `job_exit` carries the reason, the exit code (null when it was killed) and the usage, and is resent until
    `job_exit_ack`. The job's cgroup is then killed (`cgroup.kill`) and removed.
 
 Every kill is SIGKILL to the whole process group and to the leader, which is PID 1 of the job's PID namespace, so its
@@ -263,7 +293,7 @@ Refused with `nack` (keyed by the job id; the first matching row wins, after the
 | `message`                             | `fault_code`               | when                                                    |
 |---------------------------------------|----------------------------|---------------------------------------------------------|
 | `class not available`                 | `unsupported`              | the worker is off (disabled, not Linux, probe failed), or no declared entry has the job's class (`function` or `code`) |
-| `job inputs not supported`            | `unsupported`              | the job carries `inputs`: this Node cannot stage them and check their digests yet, and never runs a job with them silently dropped |
+| `job inputs not supported`            | `unsupported`              | the job carries `inputs` and `media` is off: this Node never runs a job with them silently dropped |
 | `net policy not supported`            | `unsupported`              | the job names a `net` this host cannot enforce (`public` or `openvibe-only` while `egress` is `none`) |
 | `the e-stop or local stop is latched` | `estopped` or `local_stop` | the stop latch is set                                   |
 | `class not available`                 | `shutting_down`            | the Node is stopping                                    |
@@ -277,6 +307,6 @@ Accepted jobs end with `job_exit.reason`:
 | `exited`    | the process ended by itself; `code` is its status (null if a signal the worker did not send ended it)      |
 | `cancelled` | `job_cancel`; a job cancelled before it started never starts                                               |
 | `ttl`       | `ttl_ms` (clamped) ran out, before or while it ran                                                         |
-| `limit`     | `wall_ms`, `cpu_ms` (sampled, or `RLIMIT_CPU`'s SIGXCPU) or `mem_bytes` (sampled, or the cgroup's OOM kill) exceeded, stdout past `max_output_bytes`, or a result over 256 KiB |
+| `limit`     | `wall_ms`, `cpu_ms` (sampled, or `RLIMIT_CPU`'s SIGXCPU) or `mem_bytes` (sampled, or the cgroup's OOM kill) exceeded, stdout past `max_output_bytes`, or a result over 256 KiB (over `media.max_bytes` with `media` on) |
 | `stopped`   | the e-stop or local stop latched, or the Node shut down                                                    |
-| `failed`    | the job could not run isolated: sandbox, cgroup or namespaces not set up, spawn error, working directory not made, CPU limit not set; never run with less isolation |
+| `failed`    | the job could not run isolated: sandbox, cgroup or namespaces not set up, spawn error, working directory not made, CPU limit not set; never run with less isolation. Also: an input not fetched or not matching its digest (nothing ran), or a large result not uploaded |
