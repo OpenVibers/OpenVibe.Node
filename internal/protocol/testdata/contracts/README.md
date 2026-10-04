@@ -1,6 +1,6 @@
 # OpenVibe.Contracts job-frame fixtures
 
-Pinned to **OpenVibe.Contracts `4029434`** (PR #7, plan T14 Run): each `.json` file is a verbatim copy of
+Pinned to **OpenVibe.Contracts `93e9bb2`** (v0.92.0, unchanged since `4029434`, PR #7, plan T14 Run): each `.json` file is a verbatim copy of
 `fixtures/platform.job-frame/valid/<name>.json`, one frame of `contracts/platform/job-frame.v1.json`
 (`platform.job-frame@1`, whose `job` field is `platform.job@1`).
 

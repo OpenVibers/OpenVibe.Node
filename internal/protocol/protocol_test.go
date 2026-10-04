@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -313,6 +314,12 @@ func TestJobCheck(t *testing.T) {
 		{"inputs taken", func(j *Job) { j.Inputs = goodInputs() }, []string{ClassFunction}, ""},
 		{"input without a digest", func(j *Job) { j.Inputs = []JobInput{{Name: "a.bin", MediaID: mediaID}} }, []string{ClassFunction}, JobBadInputs},
 		{"input with a path", func(j *Job) { j.Inputs = []JobInput{{Name: "a/b.bin", MediaID: mediaID, SHA256: digest}} }, []string{ClassFunction}, JobBadInputs},
+		{"input escaping the job dir", func(j *Job) { j.Inputs = []JobInput{{Name: "..", MediaID: mediaID, SHA256: digest}} }, []string{ClassFunction}, JobBadInputs},
+		{"input hidden name", func(j *Job) { j.Inputs = []JobInput{{Name: ".bashrc", MediaID: mediaID, SHA256: digest}} }, []string{ClassFunction}, JobBadInputs},
+		{"input with a 63-char digest", func(j *Job) { j.Inputs = []JobInput{{Name: "a.bin", MediaID: mediaID, SHA256: digest[:63]}} }, []string{ClassFunction}, JobBadInputs},
+		{"input with an upper-case digest", func(j *Job) {
+			j.Inputs = []JobInput{{Name: "a.bin", MediaID: mediaID, SHA256: strings.ToUpper(digest)}}
+		}, []string{ClassFunction}, JobBadInputs},
 		{"input twice under one name", func(j *Job) {
 			j.Inputs = []JobInput{{Name: "a.bin", MediaID: mediaID, SHA256: digest}, {Name: "a.bin", MediaID: mediaID, SHA256: digest}}
 		}, []string{ClassFunction}, JobBadInputs},

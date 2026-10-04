@@ -10,10 +10,13 @@ package worker
 
 import (
 	"bytes"
+	"cmp"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +46,8 @@ type Worker struct {
 
 	// isolate puts a job's command in its sandbox; tests replace it to stand for a kernel that cannot.
 	isolate isolateFunc
+	// mediaRT carries the worker.media requests; nil is http.DefaultTransport (tests trust their own server with it).
+	mediaRT http.RoundTripper
 
 	mu      sync.Mutex
 	stopped string          // the fault code while the stop latch is set; "" when clear
@@ -61,6 +66,9 @@ type plan struct {
 	fn     config.FunctionConfig // zero for the probe
 	limits protocol.JobLimits
 	egress string // the job's network policy (egressFor); "" is none
+	// inputs are the names of the files fetched into root, which the sandbox copies into the job's working directory
+	// before covering root with the private root.
+	inputs []string
 }
 
 // egressFor is the network policy a job runs under: the stricter of the net the job names and the host's worker.egress,
@@ -97,6 +105,7 @@ type job struct {
 	launched  bool        // Launch was called
 	started   bool        // job_started was sent (its CPU limit is set)
 	proc      *os.Process // set while the process runs
+	abort     func()      // cancels its worker.media requests; set while it fetches its inputs or uploads its result
 	startedMS int64
 	exit      *protocol.JobExit // set once it ended
 }
@@ -130,10 +139,13 @@ func (w *Worker) Admit(j protocol.Job) (fault, reason string) {
 	if j.Class != protocol.ClassFunction && j.Class != protocol.ClassCode {
 		return protocol.FaultUnsupported, protocol.JobNotAvailable
 	}
-	// inputs are refused until the Node can stage them and check their digests (platform.job@1): a job never runs
-	// with the files and the digest check silently dropped.
-	if len(j.Inputs) > 0 {
+	// inputs are fetched from worker.media and checked against their digests before the job starts (platform.job@1):
+	// without it a job naming inputs is refused, never run with the files and the digest check silently dropped.
+	if len(j.Inputs) > 0 && !w.cfg.Media.Enabled {
 		return protocol.FaultUnsupported, protocol.JobInputsRefused
+	}
+	if !protocol.ValidJobInputs(j.Inputs) {
+		return protocol.FaultBadValue, protocol.JobBadInputs
 	}
 	if _, ok := egressFor(w.cfg.Egress, j.Net); !ok {
 		return protocol.FaultUnsupported, protocol.JobNetUnsupported
@@ -353,6 +365,9 @@ func (w *Worker) killLocked(jb *job, reason string) {
 	if jb.proc != nil {
 		killGroup(jb.proc)
 	}
+	if jb.abort != nil {
+		jb.abort()
+	}
 }
 
 func (w *Worker) run(jb *job) {
@@ -400,9 +415,22 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 		return never(protocol.ExitFailed, err)
 	}
 	defer os.RemoveAll(dir)
+	// Every input is fetched and checked before anything of the job runs: one that fails ends it failed, never started.
+	inputs, err := w.fetchInputs(jb, dir)
+	if err != nil {
+		w.mu.Lock()
+		reason := jb.reason
+		w.mu.Unlock()
+		if reason != "" {
+			return never(reason, nil)
+		}
+		return never(protocol.ExitFailed, err)
+	}
 	if r := w.cfg.RunAs; r != nil {
-		if err := os.Chown(dir, int(r.UID), int(r.GID)); err != nil {
-			return never(protocol.ExitFailed, err)
+		for _, p := range append([]string{"."}, inputs...) { // the job's user reads its inputs to copy them
+			if err := os.Chown(filepath.Join(dir, p), int(r.UID), int(r.GID)); err != nil {
+				return never(protocol.ExitFailed, err)
+			}
 		}
 	}
 	outR, outW, err := os.Pipe()
@@ -424,7 +452,7 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 	cmd.Stdin = bytes.NewReader(append(append([]byte(nil), jb.req.Args...), '\n'))
 	cmd.Stdout, cmd.ExtraFiles = outW, []*os.File{resW}
 	egress, _ := egressFor(w.cfg.Egress, jb.req.Net) // Admit refused what the host cannot enforce
-	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits, egress: egress})
+	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits, egress: egress, inputs: inputs})
 	if err != nil {
 		outW.Close()
 		resW.Close()
@@ -509,7 +537,12 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 	}
 	ex := protocol.JobExit{ID: id, Reason: reason, Code: code, Result: json.RawMessage("null")}
 	if r := bytes.TrimSpace(result); reason == protocol.ExitExited && code != nil && *code == 0 && len(r) > 0 && json.Valid(r) {
-		ex.Result = json.RawMessage(r)
+		if ex.Result, err = w.storeResult(jb, r); err != nil {
+			w.log.Error("job result not stored", "id", id, "err", err)
+			w.mu.Lock()
+			ex.Reason, ex.Result = cmp.Or(jb.reason, protocol.ExitFailed), json.RawMessage("null") // killed meanwhile, or failed
+			w.mu.Unlock()
+		}
 	}
 	// wall_ms is at least (n+1) s for every usage second n already sent, as platform.job-frame@1 requires.
 	wallMS := max(wall.Milliseconds(), acc.seconds*1000)
@@ -636,15 +669,86 @@ func completeRunes(b []byte) int {
 	return len(b)
 }
 
-// readResult reads what the function writes to fd 3, its result; more than resultBytes kills the job (limit).
+// readResult reads what the function writes to fd 3, its result; more than resultBytes kills the job (limit), or with
+// worker.media on, more than its max_bytes (storeResult uploads a result over resultBytes).
 func (w *Worker) readResult(jb *job, r io.Reader) []byte {
-	b, _ := io.ReadAll(io.LimitReader(r, resultBytes+1))
-	if len(b) > resultBytes {
+	limit := int64(resultBytes)
+	if w.cfg.Media.Enabled {
+		limit = max(limit, w.cfg.Media.WithDefaults().MaxBytes)
+	}
+	b, _ := io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(b)) > limit {
 		w.kill(jb, protocol.ExitLimit)
 		_, _ = io.Copy(io.Discard, r)
 		return nil
 	}
 	return b
+}
+
+// mediaClient returns jb's worker.media client, bounded by its ttl from receipt, and the context its requests run
+// in, which killing jb cancels; done releases it.
+func (w *Worker) mediaClient(jb *job) (c *mediaClient, ctx context.Context, done func(), err error) {
+	deadline := jb.received.Add(jb.ttl)
+	if c, err = newMediaClient(w.cfg.Media, w.mediaRT, deadline); err != nil {
+		return nil, nil, nil, err
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if jb.reason != "" {
+		cancel()
+		return nil, nil, nil, fmt.Errorf("killed (%s)", jb.reason)
+	}
+	jb.abort = cancel
+	return c, ctx, func() {
+		w.mu.Lock()
+		jb.abort = nil
+		w.mu.Unlock()
+		cancel()
+	}, nil
+}
+
+// fetchInputs fetches jb's inputs into dir and returns their names: each at most worker.media.max_bytes, all of them
+// together at most worker.caps.max_disk_bytes (the size of the job's /tmp they are copied to), each matching its
+// pinned sha256.
+func (w *Worker) fetchInputs(jb *job, dir string) ([]string, error) {
+	if len(jb.req.Inputs) == 0 {
+		return nil, nil
+	}
+	c, ctx, done, err := w.mediaClient(jb)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	left := w.caps.MaxDiskBytes
+	names := make([]string, 0, len(jb.req.Inputs))
+	for _, in := range jb.req.Inputs {
+		n, err := c.fetchInput(ctx, in, dir, min(c.cfg.MaxBytes, left))
+		if err != nil {
+			return nil, err
+		}
+		left -= n
+		names = append(names, in.Name)
+	}
+	return names, nil
+}
+
+// storeResult is the job_exit result for r, a function's valid JSON result: r itself up to resultBytes, beyond that
+// {"media_id": …} of the Media object it is uploaded as (only read past resultBytes with worker.media on).
+func (w *Worker) storeResult(jb *job, r []byte) (json.RawMessage, error) {
+	if len(r) <= resultBytes {
+		return json.RawMessage(r), nil
+	}
+	c, ctx, done, err := w.mediaClient(jb)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	id, err := c.uploadResult(ctx, jb.req.ID, r)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]string{"media_id": id})
 }
 
 // jobEnv is the whole environment of a job: nothing is inherited from the Node (no credential, no secrets), only a

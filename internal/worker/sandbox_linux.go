@@ -39,10 +39,12 @@ const (
 
 // sandboxSpec is everything the sandbox init needs, from the Node.
 type sandboxSpec struct {
-	Root  string     `json:"root"` // the host directory the private root is mounted on
-	Work  string     `json:"work"` // the working directory, inside the private root
-	Disk  int64      `json:"disk"` // the size of the job's /tmp, and the most its artifact's copy may take
-	Binds []bindSpec `json:"binds"`
+	Root string `json:"root"` // the host directory the private root is mounted on
+	Work string `json:"work"` // the working directory, inside the private root
+	Disk int64  `json:"disk"` // the size of the job's /tmp, and the most its artifact's copy may take
+	// Inputs are the files the Node fetched into Root, copied into Work before the private root covers them.
+	Inputs []string   `json:"inputs,omitempty"`
+	Binds  []bindSpec `json:"binds"`
 	// Artifact is where the copy of the artifact directory open on artifactFD goes (its host path); "" for none.
 	Artifact string     `json:"artifact,omitempty"`
 	Links    []linkSpec `json:"links"`
@@ -120,6 +122,14 @@ func enterSandbox() error {
 		return nil
 	}
 	r := s.Root
+	// Root itself, before the private root is mounted on it: the job's inputs lie there.
+	var inputs *os.File
+	if len(s.Inputs) > 0 {
+		if inputs, err = os.Open(r); err != nil {
+			return step("opening the job's inputs", err)
+		}
+		defer inputs.Close()
+	}
 	if err := step("making mounts private", syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, "")); err != nil {
 		return err
 	}
@@ -135,6 +145,9 @@ func enterSandbox() error {
 		return err
 	}
 	if err := os.MkdirAll(r+s.Work, 0o700); err != nil {
+		return err
+	}
+	if err := step("copying the job's inputs", copyInputs(inputs, r+s.Work, s.Inputs)); err != nil {
 		return err
 	}
 	for _, b := range s.Binds {
@@ -277,6 +290,40 @@ func bind(r string, b bindSpec) error {
 		return nil
 	}
 	return readOnlyTree(dst)
+}
+
+// copyInputs copies the regular files names in the directory from (opened before the private root covered it) into
+// work, the job's working directory in its /tmp: they count towards its size (max_disk_bytes) and its memory.
+func copyInputs(from *os.File, work string, names []string) error {
+	for _, name := range names {
+		if filepath.Base(name) != name || name == "." || name == ".." {
+			return fmt.Errorf("input name %q", name)
+		}
+		fd, err := syscall.Openat(int(from.Fd()), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		src := os.NewFile(uintptr(fd), name)
+		err = func() error {
+			defer src.Close()
+			if st, err := src.Stat(); err != nil || !st.Mode().IsRegular() {
+				return fmt.Errorf("%s is not a regular file (%v)", name, err)
+			}
+			dst, err := os.OpenFile(filepath.Join(work, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(dst, src)
+			if cerr := dst.Close(); err == nil {
+				err = cerr
+			}
+			return err
+		}()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // stageArtifact copies the artifact directory open on artifactFD, the host's src, into a tmpfs of at most size bytes

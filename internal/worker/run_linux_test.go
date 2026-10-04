@@ -144,6 +144,16 @@ func TestHelperProcess(t *testing.T) {
 		_ = json.NewEncoder(result).Encode(out)
 	case "quick":
 		fmt.Fprint(result, `{"ok":true}`)
+	case "inputs": // every file of its working directory, and its environment
+		out := map[string]string{"env": strings.Join(os.Environ(), "\n")}
+		ents, _ := os.ReadDir(".")
+		for _, e := range ents {
+			b, err := os.ReadFile(e.Name())
+			out[e.Name()] = string(b) + errString(err)
+		}
+		_ = json.NewEncoder(result).Encode(out)
+	case "bigresult": // a result over resultBytes
+		fmt.Fprintf(result, `{"x":"%s"}`, strings.Repeat("y", 300<<10))
 	case "snapshot": // looks for what TestArtifactSnapshot adds to its artifact directory on the host once it started
 		dir := filepath.Dir(os.Args[0])
 		for end := time.Now().Add(2 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {

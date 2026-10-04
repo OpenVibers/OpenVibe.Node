@@ -237,13 +237,13 @@ Otherwise it advertises no class and refuses every well-formed job with `class n
 
 | direction        | type           | fields                                                                                    |
 |------------------|----------------|-------------------------------------------------------------------------------------------|
-| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function` and `code`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`, `none`, `public`, `openvibe-only`; absent means `deny`, which the Node never widens to its own `worker.egress`; `public` and `openvibe-only` run under the stricter of what is asked and what `worker.egress` allows, and are refused when it is `none`), `inputs` (files pinned by Media id and sha256: **refused**, `job inputs not supported`, until the Node can stage and verify them)} |
+| server → device  | `job`          | `job` {`id` (`job_<ULID>`: the idempotency and ack key), `class`, `artifact` {`name`, `version`} (required for `function` and `code`, one exact version), `args` {}, `ttl_ms`, `limits` {`wall_ms`, `cpu_ms`, `mem_bytes`}, `net` (`deny`, `none`, `public`, `openvibe-only`; absent means `deny`, which the Node never widens to its own `worker.egress`; `public` and `openvibe-only` run under the stricter of what is asked and what `worker.egress` allows, and are refused when it is `none`), `inputs` (at most 32 files, each `name`, `media_id`, `sha256`, optional `size_bytes`: fetched and checked against the digest before the job starts when `worker.media` is on, the job ending `failed` with nothing run otherwise; **refused**, `job inputs not supported`, when it is off)} |
 | server → device  | `job_cancel`   | `id`                                                                                      |
 | server → device  | `job_exit_ack` | `id`                                                                                      |
 | device → server  | `job_started`  | `id`, `started_ms`                                                                        |
 | device → server  | `job_stdout`   | `id`, `chunk_seq` (the job's own counter from 1; the envelope owns `seq`), `chunk`        |
 | device → server  | `job_usage`    | `id`, `started_ms`, `second`, `cpu_ms`                                                    |
-| device → server  | `job_exit`     | `id`, `reason` (`exited`, `cancelled`, `ttl`, `limit`, `stopped`, `failed`), `code`, `result`, `usage` {`started_ms`, `wall_ms`, `cpu_ms`, `mem_peak_bytes`} |
+| device → server  | `job_exit`     | `id`, `reason` (`exited`, `cancelled`, `ttl`, `limit`, `stopped`, `failed`), `code`, `result` (a result over 256 KiB uploaded to Media is `{"media_id": …}`), `usage` {`started_ms`, `wall_ms`, `cpu_ms`, `mem_peak_bytes`} |
 
 A `job` is answered `ack` (accepted) or `nack` keyed by the job id. A nack's `message` names the first problem found,
 checked in this order:

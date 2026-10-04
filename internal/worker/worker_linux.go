@@ -72,7 +72,7 @@ func isolate(cmd *exec.Cmd, cfg config.WorkerConfig, p plan) (*sandbox, error) {
 	}
 	sb.goW, sb.child = gw, append(sb.child, gr)
 	files = append(files, sw, gr) // statusFD, goFD
-	spec := sandboxSpec{Root: p.root, Work: cmd.Dir, Disk: caps.MaxDiskBytes, Links: links,
+	spec := sandboxSpec{Root: p.root, Work: cmd.Dir, Disk: caps.MaxDiskBytes, Links: links, Inputs: p.inputs,
 		Argv: append([]string{cmd.Path}, cmd.Args[1:]...), Env: cmd.Env}
 	if art != nil {
 		spec.Artifact = p.fn.Artifact()
