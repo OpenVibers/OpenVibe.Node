@@ -98,7 +98,9 @@ Cozmo runs closed firmware and makes its own Wi-Fi access point with no internet
 PCM), `display_image` (text/faces rendered with Pillow to 128×32/64), backpack and cube lights, camera frames
 (`enable_camera`, 320×240, grey or colour) handed to the core as JPEG, battery voltage, **cliff and pick-up events that
 stop the wheels at once**. Check the robot's firmware at connect and report `nack` with a clear fault if PyCozmo does not
-support it. Map commands so Cozmo's head and lift appear as ptz-like actuators. Tests with a fake PyCozmo client.
+support it. Map commands so Cozmo's head and lift appear as ptz-like actuators. Tests with a fake PyCozmo client. The
+on-robot bridge pass — the two interfaces, pairing, firmware and the panel checklist — is in
+[hardware-cozmo.md](hardware-cozmo.md).
 
 ## Plugin 0: `dryrun`
 

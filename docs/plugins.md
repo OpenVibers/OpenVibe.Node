@@ -108,7 +108,8 @@ the panel (ADR-043 decision 7: names are open strings checked against a registry
 | `battery`, `sensors`, `lights`, `bridge` | informational                                              | —           |
 
 For the Adeept 4WD Smart Car's on-Pi pass — wiring, pairing, the panel checklist and camera troubleshooting — see
-[hardware-adeept.md](hardware-adeept.md).
+[hardware-adeept.md](hardware-adeept.md). For Cozmo's bridge pass — the two interfaces, pairing, firmware and the panel
+checklist — see [hardware-cozmo.md](hardware-cozmo.md).
 
 ## The bundled drivers
 
