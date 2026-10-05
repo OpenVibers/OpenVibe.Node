@@ -6,9 +6,10 @@
 // it includes only ArduinoJson (v7) and the standard library, so the same file runs on an ESP32 and in the desktop
 // conformance harness (esp32/test).
 //
-// Time is injected as a `now_ms` function returning Unix milliseconds, and every side effect is a callback
-// (send/heartbeat frames, drive, actuator, stop, log, latch change). The Arduino transport lives in OpenVibeNode.h;
-// nothing here touches WiFi, TLS, NVS or a board.
+// Time is injected as two clocks: a monotonic one for every timer (heartbeat, deadman, motion deadline) and a Unix
+// one for the protocol's timestamps only. Every side effect is a callback (send/heartbeat frames, drive, actuator,
+// stop, log, latch change). The Arduino transport lives in OpenVibeNode.h; nothing here touches WiFi, TLS, NVS or a
+// board.
 //
 // Source of truth: docs/protocol.md and internal/protocol in OpenVibe.Node. Where this file diverges from the Go Node
 // it is because the ESP32 has no plugin supervisor, no worker and no WHIP publisher, and says so in the protocol's own
@@ -17,6 +18,7 @@
 
 #include <ArduinoJson.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -33,10 +35,21 @@ inline constexpr int kVersion = 1;
 inline constexpr int kDefaultDeadlineMS = 300;
 inline constexpr int kDefaultMaxCommandMS = 1000;
 inline constexpr int kDefaultHeartbeatMS = 1000;
+inline constexpr int kMaxHeartbeatMS = 5000; // the server cannot widen the deadman beyond 2 x this
 inline constexpr int64_t kHelloAllowanceMS = 10000;
 inline constexpr int kCredentialRetryMinMS = 10000; // 4002/4003/401/403: never sooner
 inline constexpr int kBackoffMinMS = 500;
 inline constexpr int kBackoffMaxMS = 30000;
+inline constexpr int64_t kStableLinkMS = 30000;  // a session this long resets the reconnect backoff (as the Go Node does)
+inline constexpr int64_t kDedupTTLMS = 600000;   // a repeated id is answered for 10 minutes and across reconnects
+
+// Resource limits for one inbound frame. The protocol allows frames up to 1 MiB; a device with a few hundred KiB of
+// heap bounds them far lower. Anything over these limits (or a frame the JSON parser cannot allocate) is treated as a
+// frame that might have been an e-stop: motion stops and the link is dropped to re-read config.estop_latched.
+inline constexpr size_t kMaxFrameBytes = 16384;
+inline constexpr size_t kMaxJsonDepth = 10; // ArduinoJson's own default nesting limit, passed explicitly
+inline constexpr size_t kMaxIdBytes = 64;   // command ids (and kinds) longer than this are rejected unread
+inline constexpr size_t kMaxKindBytes = 64;
 
 // Close codes the server ends the socket with (protocol §2).
 inline constexpr int kCloseReplaced = 4000;
@@ -51,6 +64,7 @@ inline constexpr const char* kFaultNotAllowed = "not_allowed";
 inline constexpr const char* kFaultEstopped = "estopped";
 inline constexpr const char* kFaultLocalStop = "local_stop";
 inline constexpr const char* kFaultNotReady = "not_ready";
+inline constexpr const char* kFaultNotConnected = "not_connected";
 inline constexpr const char* kFaultExpired = "expired";
 inline constexpr const char* kFaultShuttingDown = "shutting_down";
 
@@ -101,16 +115,22 @@ struct Paired {
   std::string robot_id;
 };
 
-// One remembered command result: a repeated `id` is answered with it and never executed again (step 1).
+// One remembered command result: a repeated `id` is answered with it and never executed again for ten minutes
+// (protocol §Commands step 1), including across reconnects.
 struct DedupResult {
   bool ok = false;
   std::string fault;
   std::string message;
+  int64_t at_ms = 0; // the monotonic instant it was cached; recall() expires it after kDedupTTLMS
 };
 
 class Core {
  public:
-  using NowFn = std::function<int64_t()>;                 // Unix milliseconds
+  // now is the monotonic clock (never steps back; int64, so the ESP32's 32-bit millis() wrap cannot reach it) and
+  // drives every timer: the heartbeat cadence, the deadman and the motion deadline. wall is the Unix clock and is used
+  // only for the envelope's `ts`, estop_state.at and heartbeat.t, which the protocol defines in Unix milliseconds.
+  using NowFn = std::function<int64_t()>;                 // monotonic milliseconds
+  using WallFn = std::function<int64_t()>;                // Unix milliseconds
   using SendFn = std::function<void(const std::string&)>; // one text frame, already encoded
   using DriveFn = std::function<void(const std::string& value, int deadline_ms)>;
   using ActuatorFn = std::function<void(const std::string& name, const std::string& value, int deadline_ms)>;
@@ -118,7 +138,7 @@ class Core {
   using LogFn = std::function<void(const char* level, const std::string& message)>;
   using LatchFn = std::function<void(bool remote, bool local)>;
 
-  Core(NowFn now, SendFn send);
+  Core(NowFn now, WallFn wall, SendFn send);
 
   // --- configuration, set once by the transport/sketch ---
   void set_callbacks(DriveFn drive, ActuatorFn actuator, StopFn stop, LogFn log);
@@ -129,15 +149,24 @@ class Core {
   // object. Nothing here ever adds a `worker` capability (this device runs no jobs).
   void set_descriptor(const std::string& firmware, const std::string& driver, const std::string& capabilities_json);
 
+  // The JSON allocator seam: null (the default) leaves ArduinoJson's default allocator in place; the desktop harness
+  // passes a failing allocator so the NoMemory path can be exercised on a machine that cannot run out of heap. The
+  // allocator must outlive the Core.
+  void set_json_allocator(ArduinoJson::Allocator* allocator) { json_allocator_ = allocator; }
+
   const std::string& firmware() const { return firmware_; }
   const std::string& driver() const { return driver_; }
   const std::string& capabilities_json() const { return capabilities_json_; }
 
   // --- connection lifecycle, called by the transport ---
-  void connect();                     // the WebSocket upgrade succeeded; wait for hello
-  void feed(const std::string& text); // one server text frame
+  void connect(); // the WebSocket upgrade succeeded; wait for hello
+  // One server text frame. The explicit length lets an oversize frame be rejected before it is copied into a string.
+  void feed(const char* data, size_t length);
+  void feed(const std::string& text) { feed(text.data(), text.size()); }
   void tick();                        // call often: heartbeat cadence, deadman, motion deadline
-  void on_close(int code);            // the socket ended; 0 when the transport cannot know the code
+  // The socket ended. 0 means the transport cannot know the code: before hello that is treated as the refused case
+  // (the >= 10 s floor, logged as uncertain); after hello it is the normal backoff. 4002/4003 are always the floor.
+  void on_close(int code);
 
   // After on_close: jittered delay before the next connect (>= 10 s for 4002/4003/401/403).
   int next_reconnect_delay_ms() const { return next_delay_ms_; }
@@ -176,6 +205,7 @@ class Core {
  private:
   void emit(const char* type, const std::function<void(JsonObject)>& fill);
   void log(const char* level, const std::string& message) const;
+  int64_t wall_ms() const;
   void notify_latch() const;
 
   void handle_hello(JsonDocument& doc, int64_t now);
@@ -191,9 +221,9 @@ class Core {
                      std::string& message) const;
   void send_ack(const std::string& id, int64_t latency_ms);
   void send_nack(const std::string& id, const char* fault, const std::string& message);
-  void remember(const std::string& id, const DedupResult& result);
+  void remember(const std::string& id, DedupResult result);
   void remember_job(const std::string& id, const char* fault, const std::string& message);
-  bool recall(const std::string& id, DedupResult& result) const;
+  bool recall(const std::string& id, DedupResult& result, int64_t now);
   int normal_backoff_ms();
   uint32_t next_random();
   void stop_motion();
@@ -201,7 +231,9 @@ class Core {
   void set_remote_stop(bool on, const std::string& reason, bool notify);
 
   NowFn now_;
+  WallFn wall_;
   SendFn send_;
+  ArduinoJson::Allocator* json_allocator_ = nullptr;
   DriveFn drive_;
   ActuatorFn actuator_;
   StopFn stop_;
@@ -232,8 +264,9 @@ class Core {
   uint64_t seq_ = 0;
   int64_t last_rx_ms_ = 0;
   int64_t next_hb_ms_ = 0;
+  int64_t connected_at_ms_ = 0;
   int hb_ms_ = kDefaultHeartbeatMS;
-  int deadman_ms_ = 2 * kDefaultHeartbeatMS;
+  int64_t deadman_ms_ = 2 * kDefaultHeartbeatMS;
 
   int64_t motion_deadline_ms_ = 0;
 

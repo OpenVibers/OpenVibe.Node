@@ -4,12 +4,18 @@
 // header in esp32/test/.deps (run.sh fetches and checks it). It replays every fixture in
 // internal/protocol/testdata/bot — each server-to-device frame is decoded and handled, and each device-to-server frame
 // the core emits is checked for the fixture's keys and value types — and runs the protocol's scenarios (deadman,
-// e-stop, clamping, nack codes, a job refusal, close codes, heartbeat cadence, hello/config ordering).
+// e-stop, clamping, nack codes, a job refusal, close codes, heartbeat cadence, hello/config ordering) plus the safety
+// hardening scenarios (a wall clock that steps backwards, 64-bit monotonic time across the millis() wrap, wrong-typed
+// latch frames, oversize/too-deep/allocation-failing frames, over-long ids and kinds, the dedup cache's ten-minute
+// limit, the heartbeat cap, guarded commands while the link is lost, the backoff reset and the refused-reconnect
+// floor).
 //
 // Exit status is non-zero if any scenario fails; every scenario prints one PASS/FAIL line.
 #include <ArduinoJson.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -84,8 +90,30 @@ bool lastOfType(const std::vector<std::string>& frames, const char* type, JsonDo
   return false;
 }
 
+const int64_t kT = 1738065600000LL;
+
+std::size_t countType(const std::vector<std::string>& frames, const char* type) {
+  std::size_t n = 0;
+  for (const auto& s : frames) {
+    JsonDocument d;
+    if (parse(s, d) && std::strcmp(d["type"] | "", type) == 0) n++;
+  }
+  return n;
+}
+
+// Exercises the "the parser could not allocate" path on a desktop with gigabytes of free heap: flip fail and the next
+// JsonDocument built by the core (in feed() or emit()) fails its allocations exactly as a full ESP32 heap would.
+struct FailingAllocator : ArduinoJson::Allocator {
+  bool fail = false;
+  void* allocate(size_t size) override { return fail ? nullptr : std::malloc(size); }
+  void deallocate(void* ptr) override { std::free(ptr); }
+  void* reallocate(void* ptr, size_t new_size) override { return fail ? nullptr : std::realloc(ptr, new_size); }
+};
+
 struct H {
-  int64_t now = 0;
+  int64_t now = kT;       // monotonic milliseconds: every core timer runs on this clock
+  int64_t wall_shift = 0; // Unix milliseconds = now + wall_shift; only the envelope ts/at/heartbeat t read it
+  FailingAllocator alloc;
   std::vector<std::string> sent;
   std::vector<std::string> drives;
   std::vector<std::string> stops;
@@ -97,7 +125,9 @@ struct H {
   ov::Core core;
 
   H()
-      : core([this]() { return now; }, [this](const std::string& s) { sent.push_back(s); }) {
+      : core([this]() { return now; }, [this]() { return now + wall_shift; },
+             [this](const std::string& s) { sent.push_back(s); }) {
+    core.set_json_allocator(&alloc);
     core.set_descriptor("openvibe-esp32-0.1.0", "esp32", "{\"esp32\":{\"drive\":{\"type\":\"differential\"}}}");
     core.set_local_limits(1.0, 1.0, 1000);
     core.set_callbacks(
@@ -138,14 +168,17 @@ std::string commandFrame(const std::string& id, const std::string& kind, const s
          "\",\"kind\":\"" + kind + "\",\"value\":" + value_json + ",\"deadline_ms\":" + std::to_string(deadline) + "}";
 }
 
-std::string configFrame(double max_speed, double max_turn, int max_command_ms, int heartbeat_ms) {
+std::string configFrameRaw(double max_speed, double max_turn, int max_command_ms, int heartbeat_ms,
+                           const std::string& estop_json) {
   return "{\"v\":1,\"seq\":1,\"ts\":1,\"type\":\"config\",\"heartbeat_ms\":" + std::to_string(heartbeat_ms) +
          ",\"limits\":{\"max_speed\":" + std::to_string(max_speed) + ",\"max_turn\":" + std::to_string(max_turn) +
          ",\"max_command_ms\":" + std::to_string(max_command_ms) +
-         "},\"allowed_commands\":[\"drive\",\"actuator\",\"halt\"],\"estop_latched\":false}";
+         "},\"allowed_commands\":[\"drive\",\"actuator\",\"halt\"],\"estop_latched\":" + estop_json + "}";
 }
 
-const int64_t kT = 1738065600000LL;
+std::string configFrame(double max_speed, double max_turn, int max_command_ms, int heartbeat_ms) {
+  return configFrameRaw(max_speed, max_turn, max_command_ms, heartbeat_ms, "false");
+}
 
 #define REQUIRE(cond, msg)          \
   do {                              \
@@ -407,6 +440,333 @@ std::string scenarioClose(const std::string& hello, const std::string& config) {
   return "";
 }
 
+std::string scenarioClock(const std::string& hello, const std::string& config) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  const int64_t t0 = h.now;
+  h.core.feed(commandFrame("cmd_clock1", "drive", "{\"throttle\":0.5}", t0, t0 + 300));
+  REQUIRE(h.drives.size() == 1, "the drive before the clock step did not run");
+
+  // The wall clock steps back an hour. The envelope ts follows it; no safety timer may.
+  h.wall_shift = -3600000;
+  ov::Telemetry telemetry;
+  telemetry.has_battery = true;
+  telemetry.battery = 0.5;
+  h.sent.clear();
+  h.core.send_telemetry(telemetry);
+  JsonDocument d;
+  REQUIRE(lastOfType(h.sent, "telemetry", d), "no telemetry after the wall clock stepped back");
+  REQUIRE(d["ts"].as<int64_t>() == h.now - 3600000, "the envelope ts did not follow the wall clock backwards");
+
+  h.now = t0 + 299;
+  h.core.tick();
+  REQUIRE(h.stops.empty(), "the motion deadline moved with the wall clock");
+  h.now = t0 + 300;
+  h.core.tick();
+  REQUIRE(h.stops.size() == 1, "the motion deadline did not fire on the monotonic clock");
+
+  // A command after the step is still timed against the monotonic clock and the skew estimate, not the wall clock.
+  h.core.feed(commandFrame("cmd_clock2", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 2, "a drive after the wall clock step did not run");
+  h.now += 300;
+  h.core.tick();
+  REQUIRE(h.stops.size() == 2, "the second deadline did not fire after the wall clock step");
+
+  // The heartbeat cadence and the deadman still run on the monotonic clock after the step.
+  h.sent.clear();
+  h.now += 2001;
+  h.core.tick();
+  JsonDocument hb;
+  REQUIRE(lastOfType(h.sent, "heartbeat", hb), "no heartbeat after the wall clock step");
+  REQUIRE(hb["t"].as<int64_t>() == h.now - 3600000, "heartbeat.t did not follow the wall clock");
+  REQUIRE(h.core.link_lost(), "the deadman moved with the wall clock");
+  return "";
+}
+
+std::string scenarioMonotonic64(const std::string& hello, const std::string& config) {
+  H h;
+  h.now = 4294967000LL; // just below the 32-bit millis() wrap at 49.7 days
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  const int64_t t0 = h.now;
+  // The server's clock is Unix (the hello ts); the device's monotonic clock is the wrap point. Deadlines ride the
+  // server's clock, the timers the device's.
+  const auto server_ms = [&]() { return kT + (h.now - t0); };
+  h.core.feed(commandFrame("cmd_wrap", "drive", "{\"throttle\":0.4}", server_ms(), server_ms() + 300));
+  REQUIRE(h.drives.size() == 1, "the drive before the 32-bit wrap did not run");
+  h.sent.clear();
+  h.now = t0 + 296; // exactly 2^32
+  h.core.tick();
+  REQUIRE(h.stops.empty(), "motion stopped early across the 32-bit wrap");
+  h.now = t0 + 300;
+  h.core.tick();
+  REQUIRE(h.stops.size() == 1, "the motion deadline did not fire across the 32-bit wrap");
+  JsonDocument hb;
+  REQUIRE(lastOfType(h.sent, "heartbeat", hb), "no heartbeat across the 32-bit wrap");
+  REQUIRE(hb["t"].as<int64_t>() >= 4294967000LL, "the heartbeat lost the 64-bit monotonic time");
+  return "";
+}
+
+std::string scenarioWrongTypedLatch(const std::string& hello, const std::string& config) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  const std::string estop_true = "{\"v\":1,\"seq\":5,\"ts\":" + std::to_string(h.now) +
+                                 ",\"type\":\"estop\",\"latched\":true,\"by\":\"usr_1\"}";
+  h.core.feed(estop_true);
+  REQUIRE(h.core.estopped(), "the e-stop did not latch");
+  for (const std::string& raw : {std::string("\"false\""), std::string("0"), std::string("1"), std::string("{}")}) {
+    h.core.feed("{\"v\":1,\"seq\":6,\"ts\":" + std::to_string(h.now) + ",\"type\":\"estop\",\"latched\":" + raw + "}");
+    REQUIRE(h.core.estopped(), "estop latched:" + raw + " released the latch");
+  }
+  h.core.feed(commandFrame("cmd_wrongtype", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  std::string fault;
+  std::string message;
+  REQUIRE(h.lastNack("cmd_wrongtype", fault, message) && fault == "estopped",
+          "a drive while latched was not nacked estopped");
+  REQUIRE(h.drives.empty(), "a drive reached the motors while latched");
+  h.core.feed("{\"v\":1,\"seq\":9,\"ts\":" + std::to_string(h.now) + ",\"type\":\"estop\",\"latched\":false}");
+  REQUIRE(!h.core.estopped(), "a proper clear did not release the latch");
+
+  // The same for config.estop_latched: a wrong-typed frame must apply nothing, including its heartbeat_ms.
+  h.core.feed(estop_true);
+  REQUIRE(h.core.estopped(), "the second latch did not take");
+  h.core.tick();
+  for (const std::string& raw : {std::string("\"false\""), std::string("0"), std::string("1"), std::string("{}")}) {
+    h.core.feed(configFrameRaw(1.0, 1.0, 1000, 4000, raw));
+    REQUIRE(h.core.estopped(), "config estop_latched:" + raw + " released the latch");
+  }
+  h.now += 1000;
+  h.core.tick();
+  h.sent.clear();
+  h.now += 1000;
+  h.core.tick();
+  REQUIRE(countType(h.sent, "heartbeat") == 1,
+          "a wrong-typed config was still applied (its heartbeat_ms took effect)");
+  h.core.feed(configFrame(1.0, 1.0, 1000, 1000));
+  REQUIRE(!h.core.estopped(), "a proper config did not clear the latch");
+  return "";
+}
+
+std::string scenarioFrameLimits(const std::string& hello, const std::string& config) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+
+  // A frame past the device's size limit: too big to be any frame this device handles (an estop could be inside).
+  h.core.feed(commandFrame("cmd_limits1", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 1, "the drive before the oversize frame did not run");
+  h.stops.clear();
+  h.core.feed(std::string(ov::kMaxFrameBytes + 1, 'x'));
+  REQUIRE(h.stops.size() == 1, "an oversize frame did not stop motion");
+  REQUIRE(h.core.link_lost(), "an oversize frame did not drop the link");
+
+  // A frame nested past the JSON depth limit.
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  h.core.feed(commandFrame("cmd_limits2", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 2, "the drive before the too-deep frame did not run");
+  h.stops.clear();
+  std::string deep;
+  for (int i = 0; i < 14; ++i) deep += "[";
+  deep += "1";
+  for (int i = 0; i < 14; ++i) deep += "]";
+  h.core.feed(deep);
+  REQUIRE(h.stops.size() == 1, "a too-deep frame did not stop motion");
+  REQUIRE(h.core.link_lost(), "a too-deep frame did not drop the link");
+
+  // A frame the parser cannot allocate room for.
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  h.core.feed(commandFrame("cmd_limits3", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 3, "the drive before the allocation-failing frame did not run");
+  h.stops.clear();
+  h.alloc.fail = true;
+  h.core.feed("{\"v\":1,\"seq\":9,\"ts\":" + std::to_string(h.now) +
+              ",\"type\":\"estop\",\"latched\":true,\"by\":\"usr_1\"}");
+  h.alloc.fail = false;
+  REQUIRE(h.stops.size() == 1, "a frame that failed to allocate did not stop motion");
+  REQUIRE(h.core.link_lost(), "a frame that failed to allocate did not drop the link");
+
+  // An outbound frame that lost fields to a failed allocation is dropped, never sent half-formed.
+  ov::Telemetry telemetry;
+  telemetry.has_battery = true;
+  telemetry.battery = 0.5;
+  h.sent.clear();
+  h.alloc.fail = true;
+  h.core.send_telemetry(telemetry);
+  h.alloc.fail = false;
+  REQUIRE(h.sent.empty(), "a frame that lost fields to allocation failure was sent");
+  return "";
+}
+
+std::string scenarioLongIds(const std::string& hello, const std::string& config) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  h.sent.clear();
+  h.core.feed(commandFrame(std::string(200, 'a'), "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  REQUIRE(h.drives.empty(), "a command with a 200-byte id reached the motors");
+  REQUIRE(h.sent.empty(), "a command with a 200-byte id was answered or echoed");
+
+  const std::string big_kind = std::string("k") + std::string(150, 'k');
+  h.core.feed(commandFrame("cmd_bigkind", big_kind, "{}", h.now, h.now + 300));
+  std::string fault;
+  std::string message;
+  REQUIRE(h.lastNack("cmd_bigkind", fault, message), "a 151-byte kind was not nacked");
+  REQUIRE(fault == "unsupported", "a 151-byte kind nacked " + fault);
+  REQUIRE(message == "unknown kind", "the cached nack echoes the kind: " + message);
+  h.sent.clear();
+  h.core.feed(commandFrame("cmd_bigkind", big_kind, "{}", h.now, h.now + 300));
+  REQUIRE(h.lastNack("cmd_bigkind", fault, message) && message == "unknown kind", "the cached nack changed");
+  return "";
+}
+
+std::string scenarioDedupTtl(const std::string& hello, const std::string& config) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  const std::string id = "cmd_ttl";
+  h.core.feed(commandFrame(id, "drive", "{\"throttle\":0.3}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 1, "the first command did not run");
+  h.core.feed(commandFrame(id, "drive", "{\"throttle\":0.9}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 1, "a repeat inside ten minutes ran again");
+
+  // The cache lives across reconnects (protocol §Commands step 1).
+  h.core.on_close(4000);
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  h.core.feed(commandFrame(id, "drive", "{\"throttle\":0.9}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 1, "a repeat after a reconnect ran again");
+
+  // ... and expires after the spec's ten minutes.
+  h.now += ov::kDedupTTLMS + 1;
+  h.core.feed(commandFrame(id, "drive", "{\"throttle\":0.2}", h.now, h.now + 300));
+  REQUIRE(h.drives.size() == 2, "an id older than ten minutes was still answered from the cache");
+  return "";
+}
+
+std::string scenarioHeartbeatCap(const std::string& hello) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(configFrameRaw(1.0, 1.0, 1000, 2000000000, "false")); // a server trying to stretch the deadman for weeks
+  h.sent.clear();
+  h.core.tick();
+  REQUIRE(countType(h.sent, "heartbeat") == 1, "no heartbeat after hello");
+  h.now = kT + 4999;
+  h.core.tick();
+  REQUIRE(countType(h.sent, "heartbeat") == 1, "a heartbeat went out before the capped interval");
+  h.now = kT + 5000;
+  h.core.tick();
+  REQUIRE(countType(h.sent, "heartbeat") == 2, "the heartbeat interval was not capped at 5000 ms");
+  h.stops.clear();
+  h.now = kT + 10000;
+  h.core.tick();
+  REQUIRE(!h.core.link_lost(), "the deadman fired before 2 x the capped heartbeat");
+  h.now = kT + 10001;
+  h.core.tick();
+  REQUIRE(h.core.link_lost(), "the deadman did not fire at 2 x the capped heartbeat (overflow?)");
+  return "";
+}
+
+std::string scenarioLinkLostGuard(const std::string& hello, const std::string& config, const std::string& drive_fixture) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  h.core.feed(drive_fixture);
+  REQUIRE(h.drives.size() == 1, "the drive before the deadman did not run");
+  h.core.tick();
+  h.now += 2001;
+  h.core.tick();
+  REQUIRE(h.core.link_lost(), "the deadman did not drop the link");
+  h.stops.clear();
+  h.core.feed(commandFrame("cmd_lost", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  std::string fault;
+  std::string message;
+  REQUIRE(h.lastNack("cmd_lost", fault, message), "a guarded command was not answered while the link is lost");
+  REQUIRE(fault == "not_connected", "a guarded command while the link is lost nacked " + fault);
+  REQUIRE(h.stops.empty(), "a guarded command reached the motors while the link is lost");
+  h.core.feed(commandFrame("cmd_lost_halt", "halt", "{}", h.now, h.now + 300));
+  bool acked = false;
+  for (const auto& frame : h.sent) {
+    JsonDocument d;
+    if (parse(frame, d) && std::strcmp(d["type"] | "", "ack") == 0 && std::string(d["id"] | "") == "cmd_lost_halt") {
+      acked = true;
+    }
+  }
+  REQUIRE(acked, "halt was refused while the link is lost");
+  return "";
+}
+
+std::string scenarioBackoffReset(const std::string& hello) {
+  H h;
+  h.now = kT;
+  int max_delay = 0;
+  for (int i = 0; i < 10; ++i) {
+    h.core.connect();
+    h.core.feed(hello);
+    h.core.on_close(0); // an unknown close after hello: the normal exponential backoff
+    max_delay = std::max(max_delay, h.core.next_reconnect_delay_ms());
+  }
+  REQUIRE(max_delay > ov::kBackoffMinMS + 500, "the backoff never grew across ten drops");
+  // A link that stays up for kStableLinkMS resets it: the next drop is back at the minimum.
+  h.core.connect();
+  h.core.feed(hello);
+  h.now += ov::kStableLinkMS;
+  h.core.tick();
+  h.core.on_close(0);
+  REQUIRE(h.core.next_reconnect_delay_ms() <= ov::kBackoffMinMS + 500, "the backoff was not reset after a stable link");
+  return "";
+}
+
+std::string scenarioRefusedFloor(const std::string& hello) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.on_close(4003);
+  REQUIRE(h.core.next_reconnect_delay_ms() >= ov::kCredentialRetryMinMS, "4003 used less than the 10 s floor");
+  // The reconnect is refused again before hello; the transport reports code 0 ("the library cannot know").
+  h.core.connect();
+  h.core.on_close(0);
+  REQUIRE(h.core.next_reconnect_delay_ms() >= ov::kCredentialRetryMinMS,
+          "a reconnect refused before hello used less than the 10 s floor");
+  REQUIRE(h.core.credential_refused(), "a pre-hello drop was not marked as the refused case");
+  bool uncertain = false;
+  for (const auto& l : h.logs) {
+    if (l.find("cannot know the close code") != std::string::npos) uncertain = true;
+  }
+  REQUIRE(uncertain, "the pre-hello drop did not say the cause is uncertain");
+  // An unknown close after hello is an ordinary drop and keeps the ordinary backoff.
+  H h2;
+  h2.now = kT;
+  h2.core.connect();
+  h2.core.feed(hello);
+  h2.core.on_close(0);
+  REQUIRE(h2.core.next_reconnect_delay_ms() < ov::kCredentialRetryMinMS,
+          "an unknown close after hello used the credential floor");
+  return "";
+}
+
 std::string scenarioFixtures(const std::string& dir) {
   const char* names[] = {"ack",          "command_actuator", "command_drive", "config",     "error",
                          "estop",        "estop_state",      "heartbeat",     "heartbeat_ack", "heartbeat_ack_echo",
@@ -547,6 +907,16 @@ int main(int argc, char** argv) {
   report("unknown kind and malformed value nack codes", scenarioNacks(hello, config));
   report("job refused on a device without the worker", scenarioJob(hello, config));
   report("close codes and reconnect policy", scenarioClose(hello, config));
+  report("the wall clock stepping backwards leaves the safety timers alone", scenarioClock(hello, config));
+  report("64-bit monotonic time across the 32-bit millis wrap", scenarioMonotonic64(hello, config));
+  report("wrong-typed latched/estop_latched keep the latch", scenarioWrongTypedLatch(hello, config));
+  report("oversize, too-deep and allocation-failing frames stop motion", scenarioFrameLimits(hello, config));
+  report("long command ids and kinds are rejected", scenarioLongIds(hello, config));
+  report("the dedup cache expires after ten minutes", scenarioDedupTtl(hello, config));
+  report("heartbeat_ms is capped and the deadman cannot overflow", scenarioHeartbeatCap(hello));
+  report("guarded commands are refused while the link is lost", scenarioLinkLostGuard(hello, config, drive_fixture));
+  report("the reconnect backoff resets after a stable link", scenarioBackoffReset(hello));
+  report("the 10 s floor after a refused reconnect", scenarioRefusedFloor(hello));
 
   if (failures > 0) {
     std::cout << failures << " scenario(s) failed\n";

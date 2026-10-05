@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace ov {
 namespace {
@@ -174,7 +175,10 @@ bool valid_job_inputs(JsonObjectConst j) {
 
 } // namespace
 
-Core::Core(NowFn now, SendFn send) : now_(std::move(now)), send_(std::move(send)) {}
+Core::Core(NowFn now, WallFn wall, SendFn send)
+    : now_(std::move(now)), wall_(std::move(wall)), send_(std::move(send)) {}
+
+int64_t Core::wall_ms() const { return wall_ ? wall_() : now_(); }
 
 void Core::set_callbacks(DriveFn drive, ActuatorFn actuator, StopFn stop, LogFn log) {
   drive_ = std::move(drive);
@@ -207,12 +211,17 @@ void Core::notify_latch() const {
 }
 
 void Core::emit(const char* type, const std::function<void(JsonObject)>& fill) {
-  JsonDocument doc;
+  JsonDocument doc(json_allocator_ ? json_allocator_ : ArduinoJson::detail::DefaultAllocator::instance());
   doc["v"] = kVersion;
   doc["seq"] = ++seq_;
-  doc["ts"] = now_();
+  doc["ts"] = wall_ms();
   doc["type"] = type;
   fill(doc.as<JsonObject>());
+  if (doc.overflowed()) {
+    // An ack/nack without its id (or any frame that lost fields to a failed allocation) must not go out half-formed.
+    log("error", "could not build a frame: out of memory; dropping it");
+    return;
+  }
   std::string out;
   serializeJson(doc, out);
   if (send_) send_(out);
@@ -244,16 +253,25 @@ void Core::connect() {
   const int64_t now = now_();
   last_rx_ms_ = now;
   next_hb_ms_ = now;
+  connected_at_ms_ = 0;
 }
 
 void Core::on_close(int code) {
   // Every close stops every actuator at once (protocol §Heartbeat, deadman, reconnect and §3).
+  const bool was_up = up_;
   stop_motion();
   up_ = false;
   configured_ = false;
-  if (code == kCloseInvalid || code == kCloseRevoked) {
+  if (code == kCloseInvalid || code == kCloseRevoked || (code == 0 && !was_up)) {
+    // A drop before hello is assumed to be the refused case (the arduinoWebSockets library does not surface the close
+    // code or the upgrade's HTTP status); the log says the cause is uncertain rather than asserting a refusal.
     credential_refused_ = true;
-    log("error", "the server refused this device's credential: pair again, or import the owner's rotation");
+    if (code == 0) {
+      log("warn", "the link ended before hello (the transport cannot know the close code: a refused credential, a "
+                  "network drop or a timeout); retrying no sooner than 10 s");
+    } else {
+      log("error", "the server refused this device's credential: pair again, or import the owner's rotation");
+    }
     const int ceil = kBackoffMaxMS;
     next_delay_ms_ = kCredentialRetryMinMS + static_cast<int>(next_random() % static_cast<uint32_t>(ceil + 1));
   } else {
@@ -288,12 +306,30 @@ uint32_t Core::next_random() {
 
 // ---- server frames ----
 
-void Core::feed(const std::string& text) {
+void Core::feed(const char* data, size_t length) {
   const int64_t now = now_();
-  JsonDocument doc;
-  const DeserializationError err = deserializeJson(doc, text);
+  if (length > kMaxFrameBytes) {
+    // Too big to be any frame this device handles; an estop could be hiding in it, so treat it as unreadable.
+    log("error", "frame of " + std::to_string(length) + " bytes is over the " + std::to_string(kMaxFrameBytes) +
+                     "-byte device limit; stopping and dropping the link");
+    stop_motion();
+    link_lost_ = true;
+    return;
+  }
+  JsonDocument doc(json_allocator_ ? json_allocator_ : ArduinoJson::detail::DefaultAllocator::instance());
+  const DeserializationError err =
+      deserializeJson(doc, data, length, DeserializationOption::NestingLimit(kMaxJsonDepth));
   if (err) {
-    log("warn", std::string("bad frame: ") + err.c_str());
+    if (err == DeserializationError::NoMemory || err == DeserializationError::TooDeep) {
+      // The frame could not be parsed for lack of memory or depth: it may have been an estop, so fail safe by stopping
+      // and dropping the link; the reconnect re-reads config.estop_latched.
+      log("error", std::string("frame could not be decoded safely (") + err.c_str() +
+                       "); stopping and dropping the link");
+      stop_motion();
+      link_lost_ = true;
+    } else {
+      log("warn", std::string("bad frame: ") + err.c_str());
+    }
     return;
   }
   const int v = doc["v"] | -1;
@@ -355,15 +391,28 @@ void Core::handle_hello(JsonDocument& doc, int64_t now) {
   }
   last_rx_ms_ = now;
   next_hb_ms_ = now; // the first heartbeat goes out promptly once hello is up
+  connected_at_ms_ = now;
   log("info", "link up: device " + device_id_ + ", session " + session_id_);
 }
 
 void Core::handle_config(JsonDocument& doc) {
+  // A wrong-typed estop_latched is a malformed frame (Go's json.Unmarshal would reject it whole): apply nothing and
+  // keep the latch exactly as it is, rather than reading `"false"` or `0` as false and releasing the e-stop.
+  JsonVariantConst estopv = doc["estop_latched"];
+  if (!estopv.isNull() && !estopv.is<bool>()) {
+    log("warn", "config with a non-boolean estop_latched ignored; the latch is unchanged");
+    return;
+  }
+
   int hb = doc["heartbeat_ms"] | 0;
   if (hb <= 0) hb = doc["limits"]["heartbeat_ms"] | 0;
   if (hb <= 0) hb = kDefaultHeartbeatMS;
+  if (hb > kMaxHeartbeatMS) {
+    log("warn", "config.heartbeat_ms " + std::to_string(hb) + " capped at " + std::to_string(kMaxHeartbeatMS) + " ms");
+    hb = kMaxHeartbeatMS;
+  }
   hb_ms_ = hb;
-  deadman_ms_ = 2 * hb;
+  deadman_ms_ = 2 * static_cast<int64_t>(hb); // 64-bit: no overflow however the server sets hb
 
   double server_speed = 1.0;
   double server_turn = 1.0;
@@ -398,7 +447,7 @@ void Core::handle_config(JsonDocument& doc) {
   }
 
   // The server's estop_latched is the owner's latch, which may have been set or cleared while the link was down.
-  const bool estop = doc["estop_latched"] | false;
+  const bool estop = estopv.is<bool>() && estopv.as<bool>();
   if (estop && !remote_stop_) {
     set_remote_stop(true, "latched on the server", true);
   } else if (!estop && remote_stop_) {
@@ -413,13 +462,21 @@ void Core::handle_config(JsonDocument& doc) {
 }
 
 void Core::handle_command(JsonDocument& doc, int64_t ts, int64_t now) {
-  const std::string id = doc["id"] | "";
-  if (id.empty()) {
+  // Bound the id before copying it: an id longer than kMaxIdBytes is not echoed (it is not cached either), so a
+  // hostile server cannot make the dedup cache hold kilobyte ids.
+  JsonVariantConst idv = doc["id"];
+  if (!idv.is<const char*>() || *idv.as<const char*>() == '\0') {
     log("warn", "command without id ignored");
     return;
   }
+  const size_t id_len = std::strlen(idv.as<const char*>());
+  if (id_len > kMaxIdBytes) {
+    log("warn", "command id longer than " + std::to_string(kMaxIdBytes) + " bytes ignored");
+    return;
+  }
+  const std::string id(idv.as<const char*>(), id_len);
   DedupResult cached;
-  if (recall(id, cached)) {
+  if (recall(id, cached, now)) {
     if (cached.ok) {
       send_ack(id, 0);
     } else {
@@ -427,12 +484,14 @@ void Core::handle_command(JsonDocument& doc, int64_t ts, int64_t now) {
     }
     return;
   }
-  const std::string kind = doc["kind"] | "";
+  // The kind is bounded too; it is never echoed into a cached message (a fixed message keeps the cache's size fixed).
+  JsonVariantConst kindv = doc["kind"];
+  const std::string kind = kindv.is<const char*>() ? std::string(kindv.as<const char*>()) : std::string();
   const bool known = kind == kKindDrive || kind == kKindActuator || kind == kKindPTZ || kind == kKindSay ||
                      kind == kKindDisplay || kind == kKindHalt;
-  if (!known) {
-    send_nack(id, kFaultUnsupported, "unknown kind " + kind);
-    remember(id, DedupResult{false, kFaultUnsupported, "unknown kind " + kind});
+  if (!known || kind.size() > kMaxKindBytes) {
+    send_nack(id, kFaultUnsupported, "unknown kind");
+    remember(id, DedupResult{false, kFaultUnsupported, "unknown kind"});
     return;
   }
   if (kind == kKindHalt) {
@@ -454,6 +513,14 @@ void Core::handle_command(JsonDocument& doc, int64_t ts, int64_t now) {
   }
   const bool guarded = kind == kKindDrive || kind == kKindPTZ || kind == kKindActuator;
   if (guarded) {
+    if (link_lost_) {
+      // The core has decided to drop the link but the transport has not torn the socket down yet: a guarded command
+      // arriving in that window is not safe to run.
+      const std::string msg = "the control link is down";
+      send_nack(id, kFaultNotConnected, msg);
+      remember(id, DedupResult{false, kFaultNotConnected, msg});
+      return;
+    }
     if (local_stop_) {
       const std::string msg = "stopped on the device with the local kill switch";
       send_nack(id, kFaultLocalStop, msg);
@@ -527,7 +594,14 @@ void Core::handle_command(JsonDocument& doc, int64_t ts, int64_t now) {
 }
 
 void Core::handle_estop(JsonDocument& doc) {
-  const bool latched = doc["latched"] | false;
+  JsonVariantConst latchedv = doc["latched"];
+  if (!latchedv.isNull() && !latchedv.is<bool>()) {
+    // Wrong type: ignore the frame and keep the latch (Go's json.Unmarshal rejects it too). Reading `"false"` or 0 as
+    // false would release the e-stop on a malformed frame.
+    log("warn", "estop with a non-boolean latched ignored; the latch is unchanged");
+    return;
+  }
+  const bool latched = latchedv.is<bool>() && latchedv.as<bool>();
   if (latched) {
     const std::string by = doc["by"] | "";
     set_remote_stop(true, by.empty() ? std::string("the remote e-stop is latched") : ("by " + by), true);
@@ -653,6 +727,8 @@ void Core::handle_job(JsonDocument& doc) {
 // ---- time, clamping, routing helpers ----
 
 void Core::observe(int64_t ts, int64_t now) {
+  // The skew is estimated against the monotonic clock: the server's Unix ts advances at the same rate, and a wall-clock
+  // step (NTP, a backwards correction) cannot poison the estimate and open an expired deadline.
   if (ts <= 0) return;
   if (!has_skew_) {
     has_skew_ = true;
@@ -773,18 +849,25 @@ void Core::send_nack(const std::string& id, const char* fault, const std::string
   });
 }
 
-void Core::remember(const std::string& id, const DedupResult& result) {
+void Core::remember(const std::string& id, DedupResult result) {
   if (dedup_.find(id) == dedup_.end()) dedup_order_.push_back(id);
-  dedup_[id] = result;
+  result.at_ms = now_();
+  dedup_[id] = std::move(result);
   while (dedup_order_.size() > 256) {
     dedup_.erase(dedup_order_.front());
     dedup_order_.erase(dedup_order_.begin());
   }
 }
 
-bool Core::recall(const std::string& id, DedupResult& result) const {
+bool Core::recall(const std::string& id, DedupResult& result, int64_t now) {
   const auto it = dedup_.find(id);
   if (it == dedup_.end()) return false;
+  if (now - it->second.at_ms > kDedupTTLMS) {
+    // The spec's ten minutes have passed: forget it, so the id runs again rather than being answered from a stale entry.
+    dedup_.erase(it);
+    dedup_order_.erase(std::remove(dedup_order_.begin(), dedup_order_.end(), id), dedup_order_.end());
+    return false;
+  }
   result = it->second;
   return true;
 }
@@ -839,6 +922,11 @@ void Core::set_local_stop(bool on) {
 
 void Core::tick() {
   const int64_t now = now_();
+  // A session that has been up for kStableLinkMS resets the reconnect backoff, exactly as the Go Node's Run does after
+  // a session of more than 30 s; otherwise a handful of drops would leave the delay at its maximum forever.
+  if (up_ && reconnect_attempt_ > 0 && connected_at_ms_ > 0 && now - connected_at_ms_ >= kStableLinkMS) {
+    reconnect_attempt_ = 0;
+  }
   if (!up_) {
     const int64_t allowance = std::max<int64_t>(deadman_ms_, kHelloAllowanceMS);
     if (!link_lost_ && now - last_rx_ms_ > allowance) {
@@ -865,13 +953,14 @@ void Core::tick() {
 }
 
 void Core::send_heartbeat() {
-  const int64_t t = now_();
+  const int64_t t = wall_ms(); // protocol §Device → server: the heartbeat's send time in Unix ms
+  const int64_t at = now_();
   emit("heartbeat", [&](JsonObject o) {
     o["seq"] = seq_; // the envelope's seq, as older servers echo
     o["t"] = t;
     if (has_rtt_) o["rtt_ms"] = last_rtt_ms_;
   });
-  hb_sent_[seq_] = HbSend{t, now_()};
+  hb_sent_[seq_] = HbSend{t, at};
   for (auto it = hb_sent_.begin(); it != hb_sent_.end();) {
     if (it->first + 8 < seq_) {
       it = hb_sent_.erase(it);
@@ -902,7 +991,7 @@ void Core::send_estop_state() {
   emit("estop_state", [&](JsonObject o) {
     o["latched"] = estopped();
     o["by"] = "device";
-    o["at"] = iso8601_utc(now_());
+    o["at"] = iso8601_utc(wall_ms());
     if (robot_ids_.size() == 1) o["robot_id"] = robot_ids_[0];
     o["local_stop"] = local_stop_;
     if (!remote_reason_.empty()) o["reason"] = remote_reason_;
