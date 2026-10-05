@@ -6,6 +6,8 @@ doc are pinned verbatim in [`internal/protocol/testdata/bot`](../internal/protoc
 Bot commit). `go test ./internal/protocol ./internal/link` decodes every one of them and drives the fake server
 (`internal/fakebot`) through pair → connect → command → ack → reconnect with those exact bytes.
 
+An ESP32 library ([`esp32/`](../esp32/README.md), `OpenVibeNode`) implements this device side minus jobs and video: pairing, the control link, drive/actuator/halt, telemetry, heartbeat, deadman and the e-stop.
+
 ## 1. Pairing
 
 The owner adds a robot on openvibe.bot and gets an 8-character code (shown `XXXX-XXXX`, 10 minutes, single use, 5 wrong
