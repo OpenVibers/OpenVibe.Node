@@ -7,8 +7,8 @@
 // e-stop, clamping, nack codes, a job refusal, close codes, heartbeat cadence, hello/config ordering) plus the safety
 // hardening scenarios (a wall clock that steps backwards, 64-bit monotonic time across the millis() wrap, wrong-typed
 // latch frames, oversize/too-deep/allocation-failing frames, over-long ids and kinds, the dedup cache's ten-minute
-// limit, the heartbeat cap, guarded commands while the link is lost, the backoff reset and the refused-reconnect
-// floor).
+// limit, the heartbeat cap, guarded commands while the link is lost, the backoff reset, the refused-reconnect floor,
+// the pre-hello timer with the transport down, a bounded e-stop reason and an overflowing command value).
 //
 // Exit status is non-zero if any scenario fails; every scenario prints one PASS/FAIL line.
 #include <ArduinoJson.h>
@@ -113,10 +113,13 @@ struct FailingAllocator : ArduinoJson::Allocator {
 struct H {
   int64_t now = kT;       // monotonic milliseconds: every core timer runs on this clock
   int64_t wall_shift = 0; // Unix milliseconds = now + wall_shift; only the envelope ts/at/heartbeat t read it
-  FailingAllocator alloc;
+  FailingAllocator alloc;       // the frame/envelope seam (feed and emit)
+  FailingAllocator value_alloc; // the command-value seam (clamp_command and the actuator re-parse)
   std::vector<std::string> sent;
   std::vector<std::string> drives;
   std::vector<std::string> stops;
+  std::vector<std::string> actuator_names;
+  std::vector<std::string> actuator_values;
   std::vector<std::string> logs;
   std::string last_drive;
   std::string last_actuator_name;
@@ -128,6 +131,7 @@ struct H {
       : core([this]() { return now; }, [this]() { return now + wall_shift; },
              [this](const std::string& s) { sent.push_back(s); }) {
     core.set_json_allocator(&alloc);
+    core.set_value_allocator(&value_alloc);
     core.set_descriptor("openvibe-esp32-0.1.0", "esp32", "{\"esp32\":{\"drive\":{\"type\":\"differential\"}}}");
     core.set_local_limits(1.0, 1.0, 1000);
     core.set_callbacks(
@@ -139,6 +143,8 @@ struct H {
         [this](const std::string& n, const std::string& v, int /*d*/) {
           last_actuator_name = n;
           last_actuator_value = v;
+          actuator_names.push_back(n);
+          actuator_values.push_back(v);
         },
         [this]() { stops.push_back("stop"); },
         [this](const char* l, const std::string& m) { logs.push_back(std::string(l) + ": " + m); });
@@ -767,6 +773,115 @@ std::string scenarioRefusedFloor(const std::string& hello) {
   return "";
 }
 
+std::string scenarioPreHelloTimer() {
+  H h;
+  h.now = kT;
+  // While the socket is up and no hello has arrived, the pre-hello allowance still fires: the device must not wait
+  // forever on a server that upgraded the socket and then said nothing.
+  h.core.connect();
+  h.now = kT + ov::kHelloAllowanceMS + 1;
+  h.core.tick();
+  REQUIRE(h.core.link_lost(), "the pre-hello timer did not fire while the socket was up");
+  h.core.clear_link_lost();
+  // Once the transport is down (the socket ended) no timer may fire: nothing can arrive, and a firing timer would
+  // cancel the in-flight reconnect on every loop() pass and flood the log. on_close() is what tells the core.
+  h.core.on_close(0);
+  h.stops.clear();
+  h.sent.clear();
+  for (int i = 0; i < 20; ++i) {
+    h.now += 1000;
+    h.core.tick();
+  }
+  REQUIRE(!h.core.link_lost(), "the pre-hello timer fired with the transport down");
+  REQUIRE(h.stops.empty(), "a tick with the transport down stopped motion");
+  return "";
+}
+
+std::string scenarioEstopReasonBound(const std::string& hello, const std::string& config) {
+  H h;
+  h.now = kT;
+  h.core.connect();
+  h.core.feed(hello);
+  h.core.feed(config);
+  h.sent.clear();
+  const std::string big_by(16000, 'x'); // under the frame limit, far over the reason cap
+  h.core.feed("{\"v\":1,\"seq\":5,\"ts\":" + std::to_string(h.now) +
+              ",\"type\":\"estop\",\"latched\":true,\"by\":\"" + big_by + "\"}");
+  REQUIRE(h.core.estopped(), "the e-stop with a huge by did not latch");
+  JsonDocument st;
+  REQUIRE(lastOfType(h.sent, "estop_state", st), "no estop_state for the huge-by latch");
+  const std::string reason = st["reason"] | "";
+  REQUIRE(reason.size() <= ov::kMaxEstopReasonBytes,
+          "estop_state.reason is " + std::to_string(reason.size()) + " bytes");
+  // The same bounded reason is copied into the dedup cache on the estopped nack, so the cache cannot grow to megabytes.
+  std::string fault;
+  std::string message;
+  h.core.feed(commandFrame("cmd_bigreason", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  REQUIRE(h.lastNack("cmd_bigreason", fault, message), "a drive after the huge-by latch was not nacked");
+  REQUIRE(fault == "estopped", "the drive after the huge-by latch nacked " + fault);
+  REQUIRE(message.size() <= ov::kMaxEstopReasonBytes,
+          "the cached estopped message is " + std::to_string(message.size()) + " bytes");
+  h.core.feed(commandFrame("cmd_bigreason", "drive", "{\"throttle\":0.5}", h.now, h.now + 300));
+  REQUIRE(h.lastNack("cmd_bigreason", fault, message) && message.size() <= ov::kMaxEstopReasonBytes,
+          "the cached estopped message grew on a repeat");
+  return "";
+}
+
+std::string scenarioValueOverflow(const std::string& hello, const std::string& config) {
+  // The document a command's value is copied into can fail to allocate under memory pressure. The value that reaches
+  // a driver must then be refused (bad_value), never a truncated document with a field missing. Only the value-document
+  // seam is stressed (the frame parser and emit keep their own healthy allocator), so the frame still decodes and the
+  // refusal can go out.
+  const char* kinds[] = {"drive", "actuator"};
+  const char* values[] = {"{\"throttle\":0.5,\"steer\":0.1}", "{\"name\":\"pan\",\"value\":0.5}"};
+  for (int k = 0; k < 2; ++k) {
+    const std::string id = std::string("cmd_overflow_") + kinds[k];
+    const std::string frame = commandFrame(id, kinds[k], values[k], kT, kT + 300);
+    H h;
+    h.now = kT;
+    h.core.connect();
+    h.core.feed(hello);
+    h.core.feed(config);
+    h.sent.clear();
+    h.value_alloc.fail = true; // every allocation of the value document fails
+    h.core.feed(frame);
+    h.value_alloc.fail = false;
+    REQUIRE(!h.core.link_lost(), "the frame parser failed although only the value document was stressed");
+    REQUIRE(h.drives.empty(), "a drive reached the driver while its value document could not be built");
+    REQUIRE(h.actuator_names.empty(), "an actuator reached the driver while its value document could not be built");
+    std::string fault;
+    std::string message;
+    REQUIRE(h.lastNack(id, fault, message), std::string("an overflowing ") + kinds[k] + " command was not refused");
+    REQUIRE(fault == "bad_value", std::string("an overflowing ") + kinds[k] + " command nacked " + fault);
+    // A repeat answers from the cache with the same refusal.
+    h.value_alloc.fail = true;
+    h.core.feed(frame);
+    h.value_alloc.fail = false;
+    REQUIRE(h.lastNack(id, fault, message) && fault == "bad_value", "the cached refusal changed");
+    // With the allocator healthy the same command runs and reaches the driver whole.
+    H ok;
+    ok.now = kT;
+    ok.core.connect();
+    ok.core.feed(hello);
+    ok.core.feed(config);
+    ok.sent.clear();
+    ok.core.feed(frame);
+    if (k == 0) {
+      REQUIRE(ok.drives.size() == 1, "the drive command did not run when the value allocator was healthy");
+      JsonDocument d;
+      REQUIRE(parse(ok.drives[0], d) && !d["throttle"].isNull(),
+              "the healthy drive reached the driver without a throttle");
+    } else {
+      REQUIRE(ok.actuator_names.size() == 1 && ok.actuator_names[0] == "pan",
+              "the actuator command did not run when the value allocator was healthy");
+      JsonDocument d;
+      REQUIRE(parse(ok.actuator_values[0], d) && std::string(d["name"] | "") == "pan",
+              "the healthy actuator reached the driver without its name");
+    }
+  }
+  return "";
+}
+
 std::string scenarioFixtures(const std::string& dir) {
   const char* names[] = {"ack",          "command_actuator", "command_drive", "config",     "error",
                          "estop",        "estop_state",      "heartbeat",     "heartbeat_ack", "heartbeat_ack_echo",
@@ -917,6 +1032,9 @@ int main(int argc, char** argv) {
   report("guarded commands are refused while the link is lost", scenarioLinkLostGuard(hello, config, drive_fixture));
   report("the reconnect backoff resets after a stable link", scenarioBackoffReset(hello));
   report("the 10 s floor after a refused reconnect", scenarioRefusedFloor(hello));
+  report("the pre-hello timer does not fire with the transport down", scenarioPreHelloTimer());
+  report("a huge e-stop by is bounded in every cached message", scenarioEstopReasonBound(hello, config));
+  report("an overflowing command or actuator value is refused", scenarioValueOverflow(hello, config));
 
   if (failures > 0) {
     std::cout << failures << " scenario(s) failed\n";

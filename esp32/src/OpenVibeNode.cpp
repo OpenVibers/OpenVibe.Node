@@ -37,6 +37,19 @@ std::string pairingMessage(int status, const std::string& code, const std::strin
   return "pairing refused with HTTP " + std::to_string(status);
 }
 
+// A URL authority's port must be explicit, decimal and in range: atoi() would read ":abc" as 0 and ":70000" would wrap
+// through uint16_t, either of which would send the pairing code or the credential to the wrong place.
+bool parsePort(const std::string& text, uint16_t& out) {
+  if (text.empty() || text.size() > 5) return false;
+  for (char c : text) {
+    if (c < '0' || c > '9') return false;
+  }
+  const long value = std::strtol(text.c_str(), nullptr, 10);
+  if (value <= 0 || value > 65535) return false;
+  out = static_cast<uint16_t>(value);
+  return true;
+}
+
 } // namespace
 
 OpenVibeNode::OpenVibeNode()
@@ -83,6 +96,7 @@ void OpenVibeNode::wsSend(const std::string& text) { ws_.sendTXT(text.c_str(), t
 
 bool OpenVibeNode::parseServer(const std::string& url, std::string& host, uint16_t& port, std::string& path,
                                bool& secure) {
+  host.clear(); // a refused origin must never leave a usable host behind (startLink() only checks host_.empty())
   std::string rest;
   if (url.rfind("https://", 0) == 0) {
     secure = true;
@@ -110,7 +124,10 @@ bool OpenVibeNode::parseServer(const std::string& url, std::string& host, uint16
   const size_t colon = authority.find(':');
   if (colon != std::string::npos) {
     host = authority.substr(0, colon);
-    port = static_cast<uint16_t>(std::atoi(authority.substr(colon + 1).c_str()));
+    if (!parsePort(authority.substr(colon + 1), port)) {
+      host.clear();
+      return false;
+    }
   } else {
     host = authority;
   }
@@ -119,7 +136,10 @@ bool OpenVibeNode::parseServer(const std::string& url, std::string& host, uint16
   // Protocol §1: plain http is only for localhost test servers. Anywhere else it would send the pairing code and then
   // the Bearer credential in cleartext, so the server is refused and no link starts. Build the library with
   // -DOPENVIBE_ALLOW_INSECURE_HTTP to opt in (and only against a test server).
-  if (!secure && host != "localhost" && host != "127.0.0.1") return false;
+  if (!secure && host != "localhost" && host != "127.0.0.1") {
+    host.clear();
+    return false;
+  }
 #endif
   return true;
 }
@@ -290,17 +310,23 @@ void OpenVibeNode::begin(const char* ssid, const char* password, const char* rob
   core_.set_local_limits(1.0, 1.0, ov::kDefaultMaxCommandMS);
 
   // Parse the server before pairing: the scheme decides TLS for both the pair POST and the link, and a cleartext
-  // server that is not localhost is refused outright.
-  if (!parseServer(server_, host_, port_, path_, secure_)) {
+  // server that is not localhost is refused outright. A refusal clears host_ and keeps server_ok_ false, so loop()
+  // starts neither a pairing POST nor a link.
+  server_ok_ = parseServer(server_, host_, port_, path_, secure_);
+  if (!server_ok_) {
+    host_.clear();
     logLine("error",
             "server must be https:// or wss:// (plain http:// or ws:// is only for localhost; build with "
-            "OPENVIBE_ALLOW_INSECURE_HTTP for a test server)");
+            "OPENVIBE_ALLOW_INSECURE_HTTP for a test server); no pairing or link will start");
   }
 
   // NVS before WiFi, so a board that rebooted with the local kill switch latched comes back latched.
   prefs_open_ = prefs_.begin("openvibe", false);
-  if (!prefs_open_) logLine("error", "could not open NVS; pairing and the kill switch will not persist");
-  if (prefs_open_ && prefs_.getBool("local_stop", false)) {
+  if (!prefs_open_) {
+    // The persisted kill switch cannot be read, so fail closed: treat it as latched until the sketch calls resume().
+    core_.set_local_stop(true);
+    logLine("error", "could not open NVS; treating the local kill switch as latched until resume()");
+  } else if (prefs_.getBool("local_stop", false)) {
     core_.set_local_stop(true);
     logLine("warn", "the local kill switch was latched before the reboot; call resume() to clear it");
   }
@@ -326,7 +352,7 @@ bool OpenVibeNode::buildExtraHeaders() {
 }
 
 bool OpenVibeNode::startLink() {
-  if (host_.empty()) return false; // parseServer() refused it; begin() already logged why
+  if (!server_ok_ || host_.empty()) return false; // parseServer() refused it; begin() already logged why
   if (!buildExtraHeaders()) return false;
   // The credential goes in the upgrade's Authorization header only, never in the URL. extra_headers_ is a member, and
   // the library copies it into its own String, so neither side can outlive the other.
@@ -388,6 +414,10 @@ void OpenVibeNode::maybePublishTelemetry() {
 }
 
 void OpenVibeNode::loop() {
+  if (!server_ok_) {
+    delay(1000); // begin() logged why; never POST the code or present the credential to an origin we refused
+    return;
+  }
   if (!paired()) {
     // Pairing is retried with backoff; after a definitive 4xx refusal pairOverHttps() stops trying until a reboot.
     if (pairing_given_up_) {

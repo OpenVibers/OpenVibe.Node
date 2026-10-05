@@ -91,6 +91,7 @@ class OpenVibeNode {
   int pair_attempts_ = 0;
   bool pairing_given_up_ = false;
   bool link_started_ = false;
+  bool server_ok_ = false; // parseServer() accepted the origin; host_ is cleared and this stays false on any refusal
   bool prefs_open_ = false;
   int64_t epoch_offset_ms_ = -1;
 

@@ -50,6 +50,10 @@ inline constexpr size_t kMaxFrameBytes = 16384;
 inline constexpr size_t kMaxJsonDepth = 10; // ArduinoJson's own default nesting limit, passed explicitly
 inline constexpr size_t kMaxIdBytes = 64;   // command ids (and kinds) longer than this are rejected unread
 inline constexpr size_t kMaxKindBytes = 64;
+// The e-stop reason (`by`, or a cached nack message) is bounded too: an estop frame can carry a `by` up to the frame
+// limit, and that string is copied into every dedup entry that answers an estopped command. 64 bytes keeps the cache's
+// total size small while leaving room for the "by " prefix.
+inline constexpr size_t kMaxEstopReasonBytes = 64;
 
 // Close codes the server ends the socket with (protocol §2).
 inline constexpr int kCloseReplaced = 4000;
@@ -149,10 +153,13 @@ class Core {
   // object. Nothing here ever adds a `worker` capability (this device runs no jobs).
   void set_descriptor(const std::string& firmware, const std::string& driver, const std::string& capabilities_json);
 
-  // The JSON allocator seam: null (the default) leaves ArduinoJson's default allocator in place; the desktop harness
-  // passes a failing allocator so the NoMemory path can be exercised on a machine that cannot run out of heap. The
-  // allocator must outlive the Core.
+  // The JSON allocator seams (test-only; both default to null, so production uses ArduinoJson's default allocator):
+  // json_allocator_ is used for the inbound frame and every envelope the core emits, and value_allocator_ for the
+  // document a command's `value` is copied into (clamp_command and the actuator re-parse). They are separate so the
+  // desktop harness can make a value document overflow without also breaking the frame parser's own allocations. The
+  // allocators must outlive the Core.
   void set_json_allocator(ArduinoJson::Allocator* allocator) { json_allocator_ = allocator; }
+  void set_value_allocator(ArduinoJson::Allocator* allocator) { value_allocator_ = allocator; }
 
   const std::string& firmware() const { return firmware_; }
   const std::string& driver() const { return driver_; }
@@ -234,6 +241,7 @@ class Core {
   WallFn wall_;
   SendFn send_;
   ArduinoJson::Allocator* json_allocator_ = nullptr;
+  ArduinoJson::Allocator* value_allocator_ = nullptr;
   DriveFn drive_;
   ActuatorFn actuator_;
   StopFn stop_;
@@ -248,6 +256,7 @@ class Core {
   Limits limits_{};
 
   bool up_ = false;
+  bool transport_up_ = false; // the socket is connected/handshaking (hello may still be pending); set by connect()
   bool configured_ = false;
   bool remote_stop_ = false;
   bool local_stop_ = false;

@@ -234,6 +234,7 @@ void Core::connect() {
   // config has been applied yet (so only halt runs, and the first status/estop_state wait for config).
   seq_ = 0;
   up_ = false;
+  transport_up_ = true;
   configured_ = false;
   allowed_present_ = false;
   allowed_.clear();
@@ -261,6 +262,7 @@ void Core::on_close(int code) {
   const bool was_up = up_;
   stop_motion();
   up_ = false;
+  transport_up_ = false;
   configured_ = false;
   if (code == kCloseInvalid || code == kCloseRevoked || (code == 0 && !was_up)) {
     // A drop before hello is assumed to be the refused case (the arduinoWebSockets library does not surface the close
@@ -573,8 +575,14 @@ void Core::handle_command(JsonDocument& doc, int64_t ts, int64_t now) {
     return;
   }
   if (kind == kKindActuator) {
-    JsonDocument vd;
-    deserializeJson(vd, value_json);
+    JsonDocument vd(value_allocator_ ? value_allocator_ : ArduinoJson::detail::DefaultAllocator::instance());
+    const DeserializationError verr = deserializeJson(vd, value_json);
+    if (verr || vd.overflowed()) {
+      // The re-parse of the clamped value failed or lost its fields (an actuator must keep its name and value).
+      send_nack(id, kFaultBadValue, "the actuator value could not be decoded safely");
+      remember(id, DedupResult{false, kFaultBadValue, "the actuator value could not be decoded safely"});
+      return;
+    }
     const std::string name = vd["name"] | "";
     if (!actuator_) {
       send_nack(id, kFaultUnsupported, "no driver on this device handles actuator");
@@ -603,7 +611,10 @@ void Core::handle_estop(JsonDocument& doc) {
   }
   const bool latched = latchedv.is<bool>() && latchedv.as<bool>();
   if (latched) {
-    const std::string by = doc["by"] | "";
+    std::string by = doc["by"] | "";
+    // The frame can carry up to kMaxFrameBytes, and this string is copied into every dedup entry that answers an
+    // estopped command: bound it so the cache cannot be filled with megabytes.
+    if (by.size() > kMaxEstopReasonBytes) by.resize(kMaxEstopReasonBytes);
     set_remote_stop(true, by.empty() ? std::string("the remote e-stop is latched") : ("by " + by), true);
   } else {
     set_remote_stop(false, "", true);
@@ -747,7 +758,7 @@ int64_t Core::server_now(int64_t ts, int64_t now) const {
 
 bool Core::clamp_command(const std::string& kind, JsonVariantConst value, std::string& out, std::string& fault,
                          std::string& message) const {
-  JsonDocument vd;
+  JsonDocument vd(value_allocator_ ? value_allocator_ : ArduinoJson::detail::DefaultAllocator::instance());
   if (!value.isNull()) {
     if (!value.is<JsonObjectConst>()) {
       fault = kFaultBadValue;
@@ -757,6 +768,13 @@ bool Core::clamp_command(const std::string& kind, JsonVariantConst value, std::s
     vd.set(value);
   }
   if (!vd.is<JsonObject>()) vd.to<JsonObject>();
+  if (vd.overflowed()) {
+    // The copy lost fields to a failed allocation (for example a throttle is gone): a driver must never see a
+    // truncated value, so refuse the command rather than clamping what is left.
+    fault = kFaultBadValue;
+    message = "value is too large to handle safely";
+    return false;
+  }
   JsonObject v = vd.as<JsonObject>();
 
   auto num = [&](const char* k, JsonVariantConst raw, double& result) -> bool {
@@ -889,10 +907,10 @@ void Core::stop_motion() {
 void Core::set_remote_stop(bool on, const std::string& reason, bool notify) {
   if (on) {
     remote_stop_ = true;
-    remote_reason_ = reason;
+    remote_reason_ = reason.size() > kMaxEstopReasonBytes ? reason.substr(0, kMaxEstopReasonBytes) : reason;
     stop_motion();
     if (notify) {
-      log("warn", "e-stop latched: " + reason);
+      log("warn", "e-stop latched: " + remote_reason_); // the bounded copy, so a huge `by` cannot flood the log either
       notify_latch();
     }
   } else {
@@ -928,11 +946,15 @@ void Core::tick() {
     reconnect_attempt_ = 0;
   }
   if (!up_) {
-    const int64_t allowance = std::max<int64_t>(deadman_ms_, kHelloAllowanceMS);
-    if (!link_lost_ && now - last_rx_ms_ > allowance) {
-      link_lost_ = true;
-      stop_motion();
-      log("error", "no hello from the server in time; closing the link");
+    // Only while the socket is up and we are waiting for hello. With the transport down (between reconnects) nothing
+    // can arrive, and a stale last_rx_ms_ would otherwise fire this on every loop() pass and cancel the reconnect.
+    if (transport_up_ && !link_lost_) {
+      const int64_t allowance = std::max<int64_t>(deadman_ms_, kHelloAllowanceMS);
+      if (now - last_rx_ms_ > allowance) {
+        link_lost_ = true;
+        stop_motion();
+        log("error", "no hello from the server in time; closing the link");
+      }
     }
     return;
   }

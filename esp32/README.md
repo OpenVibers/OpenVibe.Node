@@ -15,8 +15,10 @@ ArduinoJson (7.4.2) and WebSockets (2.6.1). Nothing here has been on real hardwa
   `I`/`L` → `1`, `O` → `0`); the device id and credential are kept in NVS. A refusal is turned into the same sentence
   the Node prints. A 4xx answer (wrong, used, locked or expired code) is definitive: the board stops trying until it
   is rebooted with a new code, so it never burns extra tries toward Bot's 5-try lock. Transport errors and 5xx answers
-  retry with backoff (30 s doubling to 5 min). Plain `http://`/`ws://` is refused unless the host is `localhost` or
-  `127.0.0.1` (or the library is built with `-DOPENVIBE_ALLOW_INSECURE_HTTP` for a test server).
+  retry with backoff (30 s doubling to 5 min). A plain `http://`/`ws://` origin whose host is not `localhost` or
+  `127.0.0.1` is refused outright — the host is cleared and both the pairing POST and the control link are suppressed
+  — unless the library is built with `-DOPENVIBE_ALLOW_INSECURE_HTTP` for a test server. A malformed port (empty,
+  non-numeric, 0, or over 65535) is refused the same way.
 - **The control link** — one outbound WebSocket to the control URL, the credential in the upgrade's `Authorization`
   header only. The device sends nothing until the server's `hello`, and the first `status`/`estop_state` wait for the
   connection's `config`.
@@ -24,7 +26,8 @@ ArduinoJson (7.4.2) and WebSockets (2.6.1). Nothing here has been on real hardwa
   clamped in the core, before any driver sees them, to the stricter of the server's `config.limits` and the local caps.
   `ptz`, `say` and `display` are valid protocol kinds this device has no driver for, so they are `nack unsupported`.
   A command id or kind over 64 bytes is rejected, and the dedup cache answers a repeated id for the spec's 10 minutes
-  (across reconnects) while storing only fixed-size messages.
+  (across reconnects) while every cached message stays within a fixed bound: the id and kind are rejected or not
+  echoed, and a hostile e-stop reason is truncated before it is copied into an entry.
 - **Telemetry** — `battery`, `voltage`, `rssi` and `sensors`, at most every 500 ms (Bot's cap).
 - **Heartbeat and deadman** — a `heartbeat` every `config.heartbeat_ms` (capped at 5000 ms so a server cannot stretch
   the deadman for hours) once `hello` has arrived, both `heartbeat_ack` shapes (the newer `echo`/`t` and the older
@@ -35,7 +38,8 @@ ArduinoJson (7.4.2) and WebSockets (2.6.1). Nothing here has been on real hardwa
 - **E-stop** — the server's `estop` latches or clears the remote stop (`config.estop_latched` re-applies a latch set
   while offline); a frame with a wrong-typed `latched`/`estop_latched` is ignored and keeps the latch, as the Go Node's
   decoder does. The local kill switch (`setLocalStop(true)` / `resume()`) is persisted in NVS and restored in
-  `begin()` before WiFi comes up; only `resume()` clears it. Every stop path calls `on_stop`.
+  `begin()` before WiFi comes up; if NVS cannot be opened, `begin()` fails closed and treats the switch as latched
+  until the sketch calls `resume()`. Only `resume()` clears it. Every stop path calls `on_stop`.
 - **Credential rotation** — `importCredential()` takes the owner's `POST /api/v1/devices/:id/rotate` response, refuses
   it when it is for another device, rewrites the stored credential without pairing again, and the next reconnect uses
   it. A failed NVS write is logged rather than passed over silently.
@@ -113,7 +117,9 @@ scenario and exits non-zero on a failure. Its scenarios cover the fixtures, the 
 wrong-typed frames), clamping, nack codes, job refusals, close codes, heartbeat cadence, a wall clock that steps
 backwards, 64-bit monotonic time across the 32-bit `millis()` wrap, oversize/too-deep/allocation-failing frames,
 over-long ids and kinds, the dedup cache's 10-minute limit, the heartbeat cap, guarded commands while the link is
-lost, the backoff reset after a stable link, and the 10 s floor after a refused reconnect.
+lost, the backoff reset after a stable link, the 10 s floor after a refused reconnect, the pre-hello timer staying
+quiet while the transport is down, a hostile e-stop `by` being bounded in the latch and in every cached message, and a
+command or actuator value document that overflows being refused rather than reaching a driver truncated.
 
 ## Limitations
 
