@@ -253,7 +253,7 @@ checked in this order:
 | `missing or malformed job id`                | `bad_value`   | `id` is not `job_` + 26 ULID characters (the nack echoes it) |
 | `malformed job`                              | `bad_frame`   | the `job` object does not decode (a field of the wrong type) |
 | `unknown class`                              | `unsupported` | `class` is not one of `function`, `code`, `browser`, `linux`, `desktop`, `gpu` |
-| `function, code or linux job needs an artifact with an exact version` | `bad_value` | a `function`, `code` or `linux` job without `artifact`, or a name or version outside the contract's pattern (a range) |
+| `function or code job needs an artifact with an exact version` | `bad_value` | a `function` or `code` job without `artifact`, or a name or version outside the contract's pattern (a range) |
 | `net policy not supported`                   | `unsupported` | `net` is present and not one of `deny`, `none`, `public`, `openvibe-only`, or is one the host cannot enforce |
 | `invalid inputs`                             | `bad_value`   | an entry of `inputs` outside the contract's patterns, a repeated name, or more than 32 |
 | `job inputs not supported`                   | `unsupported` | the job carries `inputs`: this Node cannot stage and check them yet, so it never runs it with them dropped |
@@ -303,7 +303,7 @@ worker caps in `status.capabilities.worker`:
 `capabilities` holds one `worker:<class>` name per entry in `runtime_classes` (the `platform.resource-offer@1`
 capabilities namespace OpenVibe.Run routes on; the names are reserved in OpenVibe.Contracts and no schema change
 was needed), so only classes this Node actually runs are advertised: `worker:function` when a `function` entry is declared,
-`worker:code` when a `code` entry is (`"runtime_classes":["function","code"]`, in that order, with both). The limits are `worker.caps` with defaults applied; the key is absent while the worker is off or
+`worker:code` when a `code` entry is, and `worker:linux` when a `linux` entry is (`"runtime_classes":["function","code","linux"]`, in that order, with all three). A Node's `linux` class runs one declared Linux command per job, single-shot like `code`: it is not the persistent environment that lives across commands which `platform.runtime-class@1` also lets `linux` mean, so a linux job without an `artifact` naming a declared entry is refused (`unknown artifact`). The limits are `worker.caps` with defaults applied; the key is absent while the worker is off or
 declares no `functions` entry (a probe that passes with none advertises nothing, so Fabric places no job this Node would
 refuse), and `worker` is reserved as a plugin name.
 

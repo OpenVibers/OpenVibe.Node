@@ -6,6 +6,8 @@ and the Node runs it only if the owner declared that artifact, at that exact ver
 config. Nothing is downloaded and no path comes from the server. The worker is **off by default**; off, the Node refuses
 every job `class not available`, as before. A `linux` entry is an arbitrary declared Linux command, not a language
 runtime: it runs through the same isolate path as a `code` entry, with the same sandbox, limits and net policy.
+It is single-shot like a `code` job: the Node does not offer the persistent Linux environment that lives across
+commands, which `platform.runtime-class@1` also lets `linux` describe.
 
 ## Config
 
