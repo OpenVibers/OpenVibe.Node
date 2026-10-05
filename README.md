@@ -29,6 +29,8 @@ openvibe-node resume
   Kit [`adeept_adr036`](plugins/adeept_adr036/README.md), and [`cozmo`](plugins/cozmo/README.md) through PyCozmo. Each
   plugin stops its own actuators when stdin closes, at a command's deadline and after 1 s without a heartbeat, so the
   core dying never leaves motors running.
+- **ESP32 library** ([`esp32/`](esp32/README.md), `OpenVibeNode`): the device side of the protocol for ESP32 boards —
+  pairing, the control link, drive/actuator commands, telemetry, heartbeat, deadman and e-stop — but no jobs or video.
 
 Docs: [protocol](docs/protocol.md) (the wire format with OpenVibe.Bot), [plugins](docs/plugins.md) (the driver
 protocol, the bundled drivers, and where Actor's computer-control plugin attaches), [install](docs/install.md).
