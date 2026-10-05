@@ -1,11 +1,11 @@
-// Package worker runs `function` jobs (OpenVibe.Contracts platform.job@1) from the control link. It runs only the
-// functions the owner declared in the local config, each job as one child process in a sandbox: its own process group,
-// user, mount, network (no network at all), PID, IPC, UTS and cgroup namespaces, a private read-only root holding only
-// the system paths and the function's artifact, its own cgroup v2 (cpu, memory, pids, io), rlimits, no_new_privs and a
-// seccomp allowlist, with a scrubbed environment and a fresh /tmp. It kills a job at its ttl, at its limits, on
-// job_cancel and while the stop latch is set. It never runs a job with less isolation: a job whose sandbox cannot be
-// set up fails without running, and a Node whose boot-time Probe fails does not advertise the class. docs/worker.md
-// has the model and its limits.
+// Package worker runs `function`, `code` and `linux` jobs (OpenVibe.Contracts platform.job@1) from the control link. It
+// runs only the functions the owner declared in the local config, each job as one child process in a sandbox: its own
+// process group, user, mount, network (no network at all), PID, IPC, UTS and cgroup namespaces, a private read-only root
+// holding only the system paths and the function's artifact, its own cgroup v2 (cpu, memory, pids, io), rlimits,
+// no_new_privs and a seccomp allowlist, with a scrubbed environment and a fresh /tmp. It kills a job at its ttl, at its
+// limits, on job_cancel and while the stop latch is set. It never runs a job with less isolation: a job whose sandbox
+// cannot be set up fails without running, and a Node whose boot-time Probe fails does not advertise the class.
+// docs/worker.md has the model and its limits.
 package worker
 
 import (
@@ -136,7 +136,7 @@ func (w *Worker) Admit(j protocol.Job) (fault, reason string) {
 	if w.closed {
 		return protocol.FaultShuttingDown, protocol.JobNotAvailable
 	}
-	if j.Class != protocol.ClassFunction && j.Class != protocol.ClassCode {
+	if j.Class != protocol.ClassFunction && j.Class != protocol.ClassCode && j.Class != protocol.ClassLinux {
 		return protocol.FaultUnsupported, protocol.JobNotAvailable
 	}
 	// inputs are fetched from worker.media and checked against their digests before the job starts (platform.job@1):

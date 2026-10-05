@@ -1,9 +1,13 @@
-# The job worker (`function` and `code` jobs)
+# The job worker (`function`, `code` and `linux` jobs)
 
-The Node can run **function and code jobs** (OpenVibe.Contracts `platform.job@1`, class `function` or `code`) sent over
-the control link ([protocol.md](protocol.md#jobs)). A job is untrusted input: it names an artifact, and the Node runs it
-only if the owner declared that artifact, at that exact version and for that class, in the local config. Nothing is downloaded and no path comes from
-the server. The worker is **off by default**; off, the Node refuses every job `class not available`, as before.
+The Node can run **function, code and linux jobs** (OpenVibe.Contracts `platform.job@1`, class `function`, `code` or
+`linux`) sent over the control link ([protocol.md](protocol.md#jobs)). A job is untrusted input: it names an artifact,
+and the Node runs it only if the owner declared that artifact, at that exact version and for that class, in the local
+config. Nothing is downloaded and no path comes from the server. The worker is **off by default**; off, the Node refuses
+every job `class not available`, as before. A `linux` entry is an arbitrary declared Linux command, not a language
+runtime: it runs through the same isolate path as a `code` entry, with the same sandbox, limits and net policy.
+It is single-shot like a `code` job: the Node does not offer the persistent Linux environment that lives across
+commands, which `platform.runtime-class@1` also lets `linux` describe.
 
 ## Config
 
@@ -46,10 +50,11 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
 
 - `functions`: `name` and `version` match a job's `artifact` exactly (the contract's patterns; listed once per class);
   `command[0]` is an absolute path. `env` is added to the job's environment. `class` is the runtime class the entry
-  implements: `function` (the default) or `code`; `browser`, `linux`, `desktop` and `gpu` are refused at load. A job
-  runs only an entry of its own class: a `code` job naming a `function` entry is an `unknown artifact`, and the
-  reverse. A `code` entry is a local declared runtime like a function (nothing is fetched); its job gets exactly the
-  same sandbox, limits and checks as a function job, never weaker. `artifact_dir` (default: the directory
+  implements: `function` (the default), `code` or `linux`; `browser`, `desktop` and `gpu` are refused at load. A job
+  runs only an entry of its own class: a `code` or `linux` job naming a `function` entry is an `unknown artifact`, and
+  the reverse. A `code` or `linux` entry is a local declared command like a function (nothing is fetched), and a `linux`
+  one is an arbitrary Linux command, not a language runtime; its job gets exactly the same sandbox, limits and checks as
+  a function job, never weaker. `artifact_dir` (default: the directory
   of `command[0]`) is the one host directory a job gets besides the system paths, as a **copy** made as the job
   starts, read-only, at the same path: nothing the host adds to it or changes in it later reaches the job (a Unix
   socket or a FIFO that appears there, say, through which a job could reach a host process). The Node opens the
@@ -120,8 +125,9 @@ the server. The worker is **off by default**; off, the Node refuses every job `c
   and no error; it is sent only to `endpoint`'s own host. `max_bytes` caps each input and each uploaded result.
   Off, a job naming `inputs` is refused and a result over 256 KiB ends the job `limit`, as before.
 
-The classes `function` and `code` — advertised as the reserved Fabric capabilities `worker:function` and `worker:code` in
-`status.capabilities.worker` (the `platform.resource-offer@1` namespace OpenVibe.Run routes on) — are each offered only when `enabled` is true, the OS is Linux
+The classes `function`, `code` and `linux` — advertised as the reserved Fabric capabilities `worker:function`,
+`worker:code` and `worker:linux` in `status.capabilities.worker` (the `platform.resource-offer@1` namespace OpenVibe.Run
+routes on) — are each offered only when `enabled` is true, the OS is Linux
 (amd64 or arm64: the architectures with a seccomp allowlist), at least one `functions` entry of that class is declared and a **boot-time probe** passes: it starts `/bin/sh`
 the way a job is started and checks every control from the host: the sandbox was set up; the process has user,
 mount, network, PID, IPC, UTS and cgroup namespaces of its own, `NoNewPrivs` and a seccomp filter; nothing in its
@@ -292,7 +298,7 @@ Refused with `nack` (keyed by the job id; the first matching row wins, after the
 
 | `message`                             | `fault_code`               | when                                                    |
 |---------------------------------------|----------------------------|---------------------------------------------------------|
-| `class not available`                 | `unsupported`              | the worker is off (disabled, not Linux, probe failed), or no declared entry has the job's class (`function` or `code`) |
+| `class not available`                 | `unsupported`              | the worker is off (disabled, not Linux, probe failed), or no declared entry has the job's class (`function`, `code` or `linux`) |
 | `job inputs not supported`            | `unsupported`              | the job carries `inputs` and `media` is off: this Node never runs a job with them silently dropped |
 | `net policy not supported`            | `unsupported`              | the job names a `net` this host cannot enforce (`public` or `openvibe-only` while `egress` is `none`) |
 | `the e-stop or local stop is latched` | `estopped` or `local_stop` | the stop latch is set                                   |

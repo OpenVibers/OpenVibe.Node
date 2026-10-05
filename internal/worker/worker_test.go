@@ -212,6 +212,36 @@ func TestAdmitByClass(t *testing.T) {
 	w.Close()
 }
 
+// TestAdmitLinux: a declared linux entry is a declared-command class like code — its job is admitted and matched by
+// name, version and class — while browser, desktop and gpu jobs stay refused class not available.
+func TestAdmitLinux(t *testing.T) {
+	cfg := helperConfig(t, config.WorkerCaps{MaxJobs: 8}, "sleep")
+	tool := cfg.Functions[0]
+	tool.Name, tool.Class = "tool", config.ClassLinux
+	cfg.Functions = append([]config.FunctionConfig{tool}, cfg.Functions...)
+	w := New(cfg, (&sink{}).send, quiet())
+	if c := w.Classes(); !slices.Equal(c, []string{protocol.ClassFunction, protocol.ClassLinux}) {
+		t.Fatalf("classes %v", c)
+	}
+	job := func(n int, class, name string) protocol.Job {
+		j := testJob(n, name)
+		j.Class = class
+		return j
+	}
+	if f, r := w.Admit(job(1, protocol.ClassLinux, "tool")); f != "" {
+		t.Fatalf("a declared linux entry: %s %s", f, r)
+	}
+	if f, r := w.Admit(job(2, protocol.ClassLinux, "sleep")); f != protocol.FaultUnsupported || r != protocol.JobUnknownArtifact {
+		t.Fatalf("a linux job naming a function entry: %q %q", f, r)
+	}
+	for i, class := range []string{protocol.ClassBrowser, protocol.ClassDesktop, protocol.ClassGPU} {
+		if f, r := w.Admit(job(3+i, class, "tool")); f != protocol.FaultUnsupported || r != protocol.JobNotAvailable {
+			t.Errorf("%s: %q %q, want %q %q", class, f, r, protocol.FaultUnsupported, protocol.JobNotAvailable)
+		}
+	}
+	w.Close()
+}
+
 // TestIsolationUnavailableRefused: when the namespaces cannot be created the probe fails (the class is not
 // advertised), and a job whose isolation fails ends `failed` without its process ever starting.
 func TestIsolationUnavailableRefused(t *testing.T) {

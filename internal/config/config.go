@@ -109,7 +109,7 @@ type Config struct {
 	// Python is the interpreter for plugins without an explicit command (default: <state>/venv/bin/python, then python3).
 	Python   string `json:"python,omitempty"`
 	LogLevel string `json:"log_level,omitempty"`
-	// Worker runs `function` and `code` jobs from the control link (docs/worker.md). Off unless enabled.
+	// Worker runs `function`, `code` and `linux` jobs from the control link (docs/worker.md). Off unless enabled.
 	Worker WorkerConfig `json:"worker,omitzero"`
 }
 
@@ -209,8 +209,9 @@ const (
 type FunctionConfig struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
-	// Class is the runtime class this entry implements: function (the default) or code. A job runs it only when its
-	// class matches; browser, linux, desktop and gpu are refused at load.
+	// Class is the runtime class this entry implements: function (the default), code or linux. A job runs it only when
+	// its class matches; browser, desktop and gpu are refused at load. A linux entry is an arbitrary declared Linux
+	// command, not a language runtime.
 	Class   string            `json:"class,omitempty"`
 	Command []string          `json:"command"` // Command[0] is an absolute path
 	Env     map[string]string `json:"env,omitempty"`
@@ -223,6 +224,7 @@ type FunctionConfig struct {
 const (
 	ClassFunction = "function"
 	ClassCode     = "code"
+	ClassLinux    = "linux"
 )
 
 // EffectiveClass is the entry's runtime class, function when none is set.
@@ -439,8 +441,8 @@ func (w WorkerConfig) validate() error {
 		if !functionNameRe.MatchString(f.Name) || !functionVersionRe.MatchString(f.Version) {
 			return fmt.Errorf("config: worker function %q version %q: name or version is not a valid artifact name or exact version", f.Name, f.Version)
 		}
-		if c := f.EffectiveClass(); c != ClassFunction && c != ClassCode {
-			return fmt.Errorf("config: worker function %s@%s has class %q: only function or code are implemented", f.Name, f.Version, f.Class)
+		if c := f.EffectiveClass(); c != ClassFunction && c != ClassCode && c != ClassLinux {
+			return fmt.Errorf("config: worker function %s@%s has class %q: only function, code or linux are implemented", f.Name, f.Version, f.Class)
 		}
 		key := f.Name + "@" + f.Version + "@" + f.EffectiveClass()
 		if seen[key] {
