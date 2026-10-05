@@ -122,7 +122,7 @@ const (
 	JobBadID          = "missing or malformed job id"
 	JobBadFrame       = "malformed job"
 	JobUnknownClass   = "unknown class"
-	JobNoArtifact     = "function or code job needs an artifact with an exact version"
+	JobNoArtifact     = "function, code or linux job needs an artifact with an exact version"
 	JobNetUnsupported = "net policy not supported"
 	JobBadInputs      = "invalid inputs"
 	JobInputsRefused  = "job inputs not supported"
@@ -387,7 +387,7 @@ func (r JobRequest) Check(available []string) (fault, reason string) {
 		return FaultBadFrame, JobBadFrame
 	case !contains(RuntimeClasses, j.Class):
 		return FaultUnsupported, JobUnknownClass
-	case (j.Class == ClassFunction || j.Class == ClassCode) && (j.Artifact == nil || !artifactRe.MatchString(j.Artifact.Name) || !artifactVerRe.MatchString(j.Artifact.Version)):
+	case (j.Class == ClassFunction || j.Class == ClassCode || j.Class == ClassLinux) && (j.Artifact == nil || !artifactRe.MatchString(j.Artifact.Name) || !artifactVerRe.MatchString(j.Artifact.Version)):
 		return FaultBadValue, JobNoArtifact
 	case j.Net != "" && j.Net != NetDeny && j.Net != NetNone && j.Net != NetPublic && j.Net != NetOpenVibeOnly:
 		return FaultUnsupported, JobNetUnsupported

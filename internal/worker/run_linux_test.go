@@ -1220,6 +1220,22 @@ func TestShortLivedJob(t *testing.T) {
 	}
 }
 
+// TestRunLinuxClass: a declared linux entry runs an arbitrary command through the same isolate path as a code entry:
+// the process starts once, its result reaches job_exit and its exit code is 0.
+func TestRunLinuxClass(t *testing.T) {
+	cfg := helperConfig(t, config.WorkerCaps{}, "quick")
+	cfg.Functions[0].Class = config.ClassLinux
+	w, s := newRunWorkerConfig(t, cfg)
+	j := testJob(1, "quick")
+	j.Class = protocol.ClassLinux
+	run(t, w, j)
+	ex := s.exit(t, j.ID)
+	if ex.Reason != protocol.ExitExited || ex.Code == nil || *ex.Code != 0 || string(ex.Result) != `{"ok":true}` ||
+		s.count(protocol.TypeJobStarted, j.ID) != 1 {
+		t.Fatalf("%+v %s", ex, ex.Result)
+	}
+}
+
 // TestForkBomb: pids.max and RLIMIT_NPROC stop a job that starts processes without end; the Node is untouched and the
 // job ends when its first process exits, taking the others with it.
 func TestForkBomb(t *testing.T) {
