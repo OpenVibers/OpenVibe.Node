@@ -298,7 +298,7 @@ if [ ! -x "$STATE/venv/bin/python" ]; then
 fi
 PIP="$STATE/venv/bin/pip"
 $SUDO "$PIP" install --quiet --upgrade pip >/dev/null 2>&1 || true
-$SUDO "$PIP" install --quiet "$STATE/plugins/sdk" "$STATE/plugins/dryrun"
+$SUDO "$PIP" install --quiet "$STATE/plugins/sdk" "$STATE/plugins/dryrun" "$STATE/plugins/relay"
 PLUGINS='[{"name": "dryrun"}]'
 KIND=onboard
 VIDEO='"source": "auto"'

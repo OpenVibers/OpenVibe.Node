@@ -24,7 +24,7 @@ done
 # The plugin bundle: the Python packages without their tests.
 tar -czf dist/openvibe-node-plugins.tar.gz -C plugins \
 	--exclude=tests --exclude=__pycache__ --exclude='*.egg-info' --exclude=.pytest_cache --exclude=build \
-	sdk dryrun adeept_adr036 cozmo
+	sdk dryrun adeept_adr036 cozmo relay
 # OpenVibe.Bot's GET /install route and BOT_INSTALLER_SOURCE_URL are documented to serve this asset name:
 # https://github.com/OpenVibers/OpenVibe.Node/releases/latest/download/install.sh — do not rename it.
 cp install/install.sh dist/install.sh

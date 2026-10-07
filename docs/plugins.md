@@ -5,7 +5,7 @@ object per line, UTF-8). Its stderr goes to the Node's log. The core never links
 in any language; the robot drivers are Python 3 because the kit libraries and PyCozmo are.
 
 Bundled plugins: [`dryrun`](../plugins/dryrun), [`adeept_adr036`](../plugins/adeept_adr036/README.md),
-[`cozmo`](../plugins/cozmo/README.md). Python plugins use the runtime in [`plugins/sdk`](../plugins/sdk) (package
+[`cozmo`](../plugins/cozmo/README.md), [`relay`](../plugins/relay). Python plugins use the runtime in [`plugins/sdk`](../plugins/sdk) (package
 `openvibe_plugin`), which implements everything in "Safety rules" below, so a driver only says how to move its
 hardware.
 
@@ -104,6 +104,8 @@ the panel (ADR-043 decision 7: names are open strings checked against a registry
 | `actuator` | `{"names": ["lift", …] \| ["any"], "ranges": {…}}`                                       | `actuator`  |
 | `say`      | `{…}`                                                                                    | `say`       |
 | `display`  | `{"width", "height", "text", "faces", "image"}`                                          | `display`   |
+| `button`   | `{…}`                                                                                    | `button`    |
+| `point`    | `{…}`                                                                                    | `point`     |
 | `camera`   | `{"h264_command": [argv]}` (the core runs it), `{"jpeg": true}` (frames by `video`), or `{"source": "test_pattern"}` | video |
 | `battery`, `sensors`, `lights`, `bridge` | informational                                              | —           |
 
@@ -140,6 +142,42 @@ The computer running the Node joins Cozmo's Wi-Fi on one interface and the inter
 camera frames (320 × 240) as JPEG files. A cliff or pick-up stops the wheels inside the event callback and emits an
 event; while at a cliff only backing away is allowed, while picked up nothing drives. Firmware other than PyCozmo's
 supported version (2381, `allow_firmware`) is reported as `firmware_unsupported`.
+
+### `relay` — existing OpenVibe.Live hardware clients
+
+Use this when the owner already has a local script receiving Live stream controls. In `config.json`, replace the
+`dryrun` plugin entry with one of these (the release bundle and installer include `relay`):
+
+```json
+{"name": "relay", "config": {"output": "child", "argv": ["python3", "/home/pi/controls.py", "--stdin"]}}
+```
+
+The child receives one JSON object per line on **its stdin**. `argv` is passed directly to the OS, never a shell
+command. If it exits, the relay restarts it with backoff. On Node shutdown, the relay closes its stdin and stops
+the process. A script that already uses Live's WebSocket protocol may instead use:
+
+```json
+{"name": "relay", "config": {"output": "websocket", "port": 8765}}
+```
+
+It listens only on `127.0.0.1` (default port 8765) and broadcasts to every connected client. The one-line change for
+an existing Pi script is its Live socket URL — for Live's own example
+[`control-bridge-example-cozmo.py`](https://github.com/OpenVibers/OpenVibe.Live/blob/main/control-bridge-example-cozmo.py)
+that is line 27, `WS_URL = "wss://openvibe.live/ws/control?mode=hardware&stream_key=YOUR_STREAM_KEY"` →
+`ws://127.0.0.1:8765/ws/control?mode=hardware`; no stream key is needed locally, and the relay ignores the path and
+query. The WebSocket server uses only Python's standard library. Clients may send nothing; text messages are ignored
+and protocol pings receive pongs.
+
+Both outputs carry the hardware-facing Live fields exactly as Live's hardware socket sends them
+(`server/controls/control-server.js:360,475,527`, dispatched by `control-bridge-example-cozmo.py:148-156`):
+`{"type":"command","command":"forward"}` for a press, `{"type":"key_down","command":"forward"}` /
+`{"type":"key_up","command":"forward"}` for a hold, and `{"type":"video_click","x":0.25,"y":0.75}` for a point
+(rounded to four decimal places, as Live does). The Bot button `name` is the old Live button's **command string**,
+not its label. Live's `key_held` / `key_released` names are viewer status broadcasts on its control socket, never the
+hardware messages; the hardware socket, and so this relay, sends `key_down` / `key_up`. The old `control_id`,
+`from_user` and `timestamp` fields are unavailable in Bot's Node → plugin command; Live's example bridge reads
+`from_user` only for logging and defaults it, so hardware clients treat all three as optional. The SDK releases all
+held buttons on deadline, missed heartbeat, stop, e-stop, halt and stdin close.
 
 ## Writing a plugin in Python
 

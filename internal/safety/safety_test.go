@@ -106,15 +106,31 @@ func TestClamp(t *testing.T) {
 	if v["pan"] != 1 || v["tilt"] != -0.5 {
 		t.Fatalf("%s", out)
 	}
+	out, _ = l.Clamp("button", json.RawMessage(`{"name":"forward","state":"down"}`))
+	var b map[string]any
+	json.Unmarshal(out, &b)
+	if b["name"] != "forward" || b["state"] != "down" {
+		t.Fatalf("%s", out)
+	}
+	out, _ = l.Clamp("point", json.RawMessage(`{"x":0.25,"y":1}`))
+	json.Unmarshal(out, &v)
+	if v["x"] != 0.25 || v["y"] != 1 {
+		t.Fatalf("%s", out)
+	}
 	for kind, bad := range map[string]string{
 		"drive":    `{"throttle":"fast"}`,
 		"ptz":      `{"pan":null}`,
 		"actuator": `{"value":1}`,
 		"say":      `{}`,
+		"button":   `{"state":"down"}`,
+		"point":    `{"x":2,"y":0}`,
 	} {
 		if _, err := l.Clamp(kind, json.RawMessage(bad)); err == nil {
 			t.Errorf("%s %s accepted", kind, bad)
 		}
+	}
+	if _, err := l.Clamp("button", json.RawMessage(`{"name":"forward","state":"sideways"}`)); err == nil {
+		t.Error("bad button state accepted")
 	}
 	if _, err := l.Clamp("drive", json.RawMessage(`[1]`)); err == nil {
 		t.Error("array accepted")

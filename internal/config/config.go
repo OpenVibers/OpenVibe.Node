@@ -335,6 +335,7 @@ var Bundled = map[string]string{
 	"dryrun":        "openvibe_dryrun",
 	"adeept_adr036": "openvibe_adeept_adr036",
 	"cozmo":         "openvibe_cozmo",
+	"relay":         "openvibe_relay",
 }
 
 // Default is the config written by `openvibe-node pair` when none exists: the dry-run plugin and its test pattern.
