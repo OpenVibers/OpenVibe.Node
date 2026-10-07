@@ -143,6 +143,22 @@ func (l Limits) Clamp(kind string, value json.RawMessage) (json.RawMessage, erro
 		if s, ok := v["text"].(string); !ok || s == "" || len(s) > 1000 {
 			return nil, badValue("say needs text (1 to 1000 bytes)")
 		}
+	case protocol.KindButton:
+		name, ok := v["name"].(string)
+		if !ok || name == "" {
+			return nil, badValue("button needs a name")
+		}
+		if state, present := v["state"]; present && state != "down" && state != "up" {
+			return nil, badValue("button state must be down or up")
+		}
+	case protocol.KindPoint:
+		for _, key := range []string{"x", "y"} {
+			f, err := num(key, v[key])
+			if err != nil || f < 0 || f > 1 {
+				return nil, badValue("point %s must be a number from 0 to 1", key)
+			}
+			v[key] = f
+		}
 	}
 	out, err := json.Marshal(v)
 	if err != nil {

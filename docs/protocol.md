@@ -195,14 +195,16 @@ at most every 500 ms (≤ 2 Hz, Bot's cap). There is no separate `event` message
 | `actuator` | `{"name": "lift", "value": …}` — number, object or bool per actuator ([plugins.md](plugins.md))        | guarded |
 | `say`      | `{"text": "…"}` (1–1000 bytes; plugins may cap lower)                                                    | no     |
 | `display`  | `{"text": "…"}`, `{"face": "happy"}` or `{"image_png_b64": "…"}`                                        | no     |
+| `button`   | `{"name": "forward"}` press; `{"name": …, "state": "down"\|"up"}` hold (names from the robot's profile)   | guarded |
+| `point`    | `{"x": 0..1, "y": 0..1}` normalised click on the video, for the [`relay`](plugins.md) plugin              | guarded |
 | `halt`     | `{}` — stop every actuator now (not latched); always accepted                                           | —      |
 
 Sign conventions: `throttle`/`x` positive = forward; `steer` positive = turn right; `y` positive = strafe left;
 `rotation` positive = counter-clockwise (left); `pan` positive = right, `tilt` positive = up (plugins can invert a
 servo in their config to make the hardware match).
 
-`deadline_ms` is an **absolute** instant in Unix milliseconds on the server's clock, present on `drive`, `actuator` and
-`ptz`. A device's clock may be minutes off, so the Node never compares it with its own clock: it estimates the
+`deadline_ms` is an **absolute** instant in Unix milliseconds on the server's clock, present on `drive`, `actuator`,
+`ptz` and `button` (a held button is re-sent, so its deadline releases the hold — see the [`relay`](plugins.md) plugin). A device's clock may be minutes off, so the Node never compares it with its own clock: it estimates the
 server's clock from the `ts` of every frame on the connection (the largest `ts` − receive time: the skew less the
 fastest transit, kept for the whole connection so a run of delayed frames cannot reopen an expired deadline) and
 compares `deadline_ms` with that at receipt. A command that arrives at or after its deadline →
@@ -217,11 +219,13 @@ What the Node does with a command, in order:
 2. Unknown kind → `nack unsupported`.
 3. `halt` → every plugin stops, `ack`.
 4. No `config` yet on this connection → `nack not_ready`. Kind not in `config.allowed_commands` → `nack not_allowed`.
-5. `drive`, `ptz`, `actuator` while the local kill switch is latched → `nack local_stop`; while the remote e-stop is
-   latched → `nack estopped`; past its `deadline_ms` → `nack expired`.
+5. `drive`, `ptz`, `actuator`, `button` and `point` while the local kill switch is latched → `nack local_stop`; while
+   the remote e-stop is latched → `nack estopped`; past its `deadline_ms` → `nack expired`.
 6. The value is clamped in the core, before any plugin sees it: `throttle`, `x`, `y` to ±`max_speed`; `steer`,
-   `rotation` to ±`max_turn`; `pan`, `tilt`, `zoom` and a numeric actuator `value` to ±1. The limits are the stricter of
-   the server's `config.limits` and the local config's `limits`. Non-numbers → `nack bad_value`.
+   `rotation` to ±`max_turn`; `pan`, `tilt`, `zoom` and a numeric actuator `value` to ±1; a `point`'s `x`/`y` must be
+   numbers in 0..1. The limits are the stricter of the server's `config.limits` and the local config's `limits`.
+   Non-numbers, a `button` without a `name` or with a `state` other than `down`/`up`, or a `point` out of range →
+   `nack bad_value`.
 7. It goes to the plugin named by `target`, or the first plugin whose `describe` declares the kind (for actuators, the
    first listing the name). None → `nack unsupported`.
 8. The plugin's `ack`/`nack` is relayed. No answer within max(deadline, 1 s) → the plugin is told to stop and the

@@ -153,13 +153,15 @@ const (
 	KindSay      = "say"
 	KindDisplay  = "display"
 	KindHalt     = "halt"
+	KindButton   = "button"
+	KindPoint    = "point"
 )
 
 // Kinds lists every command kind the Node understands.
-var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt}
+var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint}
 
 // GuardedKinds move something and are refused while an e-stop or the local kill switch is latched.
-var GuardedKinds = map[string]bool{KindDrive: true, KindActuator: true, KindPTZ: true}
+var GuardedKinds = map[string]bool{KindDrive: true, KindActuator: true, KindPTZ: true, KindButton: true, KindPoint: true}
 
 // Fault codes carried in nack.fault_code and status.faults[].code.
 const (

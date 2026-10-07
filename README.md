@@ -26,9 +26,9 @@ openvibe-node resume
   clamped before any driver sees a value, a persisted e-stop, the local kill switch), the plugin supervisor, WHIP video
   publishing with pion, and the system service (systemd, launchd, Windows).
 - **Plugins** (separate processes, JSON lines over stdin/stdout): [`dryrun`](plugins/dryrun), the Adeept 4WD Smart Car
-  Kit [`adeept_adr036`](plugins/adeept_adr036/README.md), and [`cozmo`](plugins/cozmo/README.md) through PyCozmo. Each
-  plugin stops its own actuators when stdin closes, at a command's deadline and after 1 s without a heartbeat, so the
-  core dying never leaves motors running.
+  Kit [`adeept_adr036`](plugins/adeept_adr036/README.md), [`cozmo`](plugins/cozmo/README.md) through PyCozmo, and
+  [`relay`](plugins/relay) for existing Live hardware clients. Each plugin stops its own actuators when stdin closes,
+  at a command's deadline and after 1 s without a heartbeat, so the core dying never leaves motors running.
 - **ESP32 library** ([`esp32/`](esp32/README.md), `OpenVibeNode`): the device side of the protocol for ESP32 boards —
   pairing, the control link, drive/actuator commands, telemetry, heartbeat, deadman and e-stop — but no jobs or video.
 
@@ -41,7 +41,7 @@ Decisions: [ADR-043](docs/ADR-043-bot-devices-and-control.md).
 ```sh
 go vet ./... && go test -race ./...                    # the end-to-end tests run the Python dry-run plugin
 pip install pytest pillow numpy
-for p in sdk dryrun adeept_adr036 cozmo; do python3 -m pytest -q plugins/$p/tests; done
+for p in sdk dryrun adeept_adr036 cozmo relay; do python3 -m pytest -q plugins/$p/tests; done
 scripts/dist.sh v0.0.0-dev                             # every binary, the plugin bundle and SHA256SUMS in dist/
 ```
 

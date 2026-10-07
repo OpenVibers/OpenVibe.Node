@@ -23,7 +23,7 @@ jobs:
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: go vet ./... && go test -count=1 ./...
       - run: |
-          for p in sdk dryrun adeept_adr036 cozmo; do python -m pytest -q plugins/$p/tests; done
+          for p in sdk dryrun adeept_adr036 cozmo relay; do python -m pytest -q plugins/$p/tests; done
       - run: scripts/dist.sh "${GITHUB_REF_NAME}"
       # Every release must carry the installer OpenVibe.Bot's GET /install route and BOT_INSTALLER_SOURCE_URL are
       # documented to serve (releases/latest/download/install.sh), the plugin bundle the installer downloads, and the

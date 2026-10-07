@@ -15,6 +15,8 @@ var capabilityFor = map[string]string{
 	protocol.KindActuator: "actuator",
 	protocol.KindSay:      "say",
 	protocol.KindDisplay:  "display",
+	protocol.KindButton:   "button",
+	protocol.KindPoint:    "point",
 }
 
 // Manager supervises every configured plugin.
