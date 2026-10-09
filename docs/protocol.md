@@ -360,7 +360,7 @@ The latch file is `latch.json` in the state directory. A corrupt latch file is r
 ## 4. Video (WHIP)
 
 Bot hands out only the publish key (in the pairing answer); it does not own media and names no WHIP endpoint (the
-camera publishes to OpenRe). So the endpoint is local config, `video.whip_url` in `config.json`; without it video stays
+camera publishes to OpenRestream). So the endpoint is local config, `video.whip_url` in `config.json`; without it video stays
 off and the log says so. When it is set, the Node publishes one H.264 track (Constrained Baseline,
 `profile-level-id=42e01f`, packetization-mode 1) to it with `Authorization: Bearer <publish_key>`: `POST` with `Content-Type: application/sdp` → `201` with the
 answer and a `Location`; `DELETE <Location>` on shutdown. PLI/FIR from the far end request a keyframe. The session is
