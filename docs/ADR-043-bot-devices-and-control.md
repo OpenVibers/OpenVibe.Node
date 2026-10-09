@@ -12,7 +12,7 @@ a Cozmo-based robot).
 - Chat commands (`!forward`, `!headup`, `!say`…) reached the robot with no permission check; Live fb3957f put them behind
   the panel's rules as a stop-gap. Live also generates ~900 lines of Python per Cozmo owner (`routes.js`), because
   buttons are table rows rather than a profile.
-- OpenRe's webrtc worker (75a5dd7) takes WHIP ingest and serves viewers; Media records; Events carries events; Network
+- OpenRestream's webrtc worker (75a5dd7) takes WHIP ingest and serves viewers; Media records; Events carries events; Network
   issues service tokens and delegated grants.
 - The owner's first robot, the Adeept ADR036, is a Raspberry Pi with Adeept's Robot HAT: a PCA9685 at I²C 0x5f drives the
   four DC motors (channels 8–15) and the pan/tilt servos (0, 1); an ADS7830 at 0x48 reads battery voltage; ultrasonic,
@@ -43,8 +43,8 @@ a Cozmo-based robot).
    virtual environment with a systemd unit and the hardware watchdog.
 4. **Control runs over one outbound WebSocket per device; video over WHIP.** The device dials Bot
    (`wss://openvibe.bot/device`), authenticates with its credential, and keeps one connection for commands, telemetry and
-   heartbeats; this works behind any home router and on an ESP32. The camera publishes to OpenRe over WHIP; viewers watch
-   through OpenRe. Operators reach Bot over a WebSocket from the panel. A WebRTC data channel may be added later as a
+   heartbeats; this works behind any home router and on an ESP32. The camera publishes to OpenRestream over WHIP; viewers watch
+   through OpenRestream. Operators reach Bot over a WebSocket from the panel. A WebRTC data channel may be added later as a
    second control transport when measured latency asks for it; the message set does not change.
 5. **One message set** (JSON, fields `v`, `seq`, `ts` on every frame): server→device `hello`, `config` (limits, heartbeat,
    the operator's allowed commands), `command` (`id` as an idempotency key, `kind` drive/actuator/ptz/say/display/halt,
@@ -94,7 +94,7 @@ a Cozmo-based robot).
   the `bot` service manifest and its events.
 - Network: a `bot` service principal; the `bot.robot.control` grant for Live and Chat (on behalf of viewers) and for
   Actor agents (delegated).
-- OpenRe: per-device publish keys for WHIP sessions created by Bot.
+- OpenRestream: per-device publish keys for WHIP sessions created by Bot.
 - Live: the panel embed on channel pages, then the deletion in decision 10; Extensions `hardware/` becomes a pointer to
   the Bot agent.
 

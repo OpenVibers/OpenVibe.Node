@@ -1,4 +1,4 @@
-// Package video publishes the device camera to OpenRe over WHIP (RFC 9725) with pion/webrtc: H.264 from a test
+// Package video publishes the device camera to OpenRestream over WHIP (RFC 9725) with pion/webrtc: H.264 from a test
 // pattern, from a child process (rpicam-vid, ffmpeg), or from JPEG frames a plugin writes. Video runs on its own
 // goroutines and drops frames rather than wait, so it never blocks control.
 package video
