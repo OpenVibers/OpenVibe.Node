@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,28 @@ func TestLatchPersistsAcrossRestart(t *testing.T) {
 	}
 	if len(seen) != 4 {
 		t.Fatalf("callbacks %d", len(seen))
+	}
+}
+
+func TestLocalStopReason(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "latch.json")
+	l, _ := OpenLatch(p)
+	l.SetLocalWith("stop\x07 button\non the robot")
+	l.SetLocalWith("second press")
+	l2, _ := OpenLatch(p)
+	if st := l2.State(); !st.Local || st.LocalReason != "stop  button on the robot" {
+		t.Fatalf("reason not cleaned, kept first, or not persisted: %+v", st)
+	}
+	l.ClearRemote()
+	if st := l.State(); !st.Local || st.LocalReason == "" {
+		t.Fatalf("a remote clear touched the local stop: %+v", st)
+	}
+	l.Resume()
+	if st := l.State(); st.Local || st.LocalReason != "" {
+		t.Fatalf("resume left the reason: %+v", st)
+	}
+	if got := CleanReason(strings.Repeat("x", 200)); len(got) != 120 {
+		t.Fatalf("not capped: %d", len(got))
 	}
 }
 

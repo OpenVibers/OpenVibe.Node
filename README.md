@@ -8,8 +8,8 @@ for AI agents) can use the device. It connects out, needs no open ports, and kee
 curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept
 ```
 
-openvibe.bot shows this command with the robot's id and a fresh code. `--driver` is `adeept`, `adeept-mecanum`, `cozmo`
-or `none` (dry run; the old `--robot adeept` form still works but is deprecated). A robot paired through
+openvibe.bot shows this command with the robot's id and a fresh code. `--driver` is `adeept`, `adeept-mecanum`, `cozmo`,
+`looi` (the community's Generic LOOI driver, [docs/hardware-looi.md](docs/hardware-looi.md)) or `none` (dry run; the old `--robot adeept` form still works but is deprecated). A robot paired through
 OpenVibe.Network gets `--network <URL> --pairing pair_… --code ABCD-1234` instead of `--robot`. Details, manual
 install, Windows and configuration: [docs/install.md](docs/install.md).
 
@@ -27,7 +27,8 @@ openvibe-node resume
   publishing with pion, and the system service (systemd, launchd, Windows).
 - **Plugins** (separate processes, JSON lines over stdin/stdout): [`dryrun`](plugins/dryrun), the Adeept 4WD Smart Car
   Kit [`adeept_adr036`](plugins/adeept_adr036/README.md), [`cozmo`](plugins/cozmo/README.md) through PyCozmo, and
-  [`relay`](plugins/relay) for existing Live hardware clients. Each plugin stops its own actuators when stdin closes,
+  [`relay`](plugins/relay) for existing Live hardware clients. LOOI's driver is the community's
+  ([docs/hardware-looi.md](docs/hardware-looi.md) is its contract). Each plugin stops its own actuators when stdin closes,
   at a command's deadline and after 1 s without a heartbeat, so the core dying never leaves motors running.
 - **ESP32 library** ([`esp32/`](esp32/README.md), `OpenVibeNode`): the device side of the protocol for ESP32 boards —
   pairing, the control link, drive/actuator commands, telemetry, heartbeat, deadman and e-stop — but no jobs or video.

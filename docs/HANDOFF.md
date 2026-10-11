@@ -57,8 +57,9 @@ mode 0600 and its contents never appear in logs, errors or `status`.
   only the time left, and the plugin stops at that deadline unless a newer command arrived. Held controls are re-sent by the operator every 150 ms.
 - Stop all actuators on: 2 missed heartbeats, link loss, core shutdown, plugin crash (the core restarts it with backoff
   and it starts stopped), `openvibe-node stop`, an `estop`.
-- The e-stop is latched locally (persisted across restarts) and only a server `estop` `latched:false` from the owner (or the local
-  `resume`) clears it. Owner limits (`max_speed`, `max_turn`) clamp every value in the core before it reaches a plugin.
+- Two latches, both persisted across restarts. The **remote** e-stop: a server `estop` sets it, and the owner's `estop`
+  `latched:false` or the local `resume` clears it. The **local** stop (`openvibe-node stop`, or a driver's `local_stop`):
+  only the local `resume` clears it, never the owner. Owner limits (`max_speed`, `max_turn`) clamp every value in the core before it reaches a plugin.
 - Never run or expose a kit's stock control server (the Adeept kit ships one on 0.0.0.0:8888 with the fixed login
   `admin:123456` and an MJPEG stream on :5000 — the Node replaces it; `install.sh` disables it if it finds it enabled).
 

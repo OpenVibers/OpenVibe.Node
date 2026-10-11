@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,7 +17,8 @@ import (
 // LatchState is the persisted e-stop state. Two independent latches:
 //
 //   - Remote: set by a server `estop`; cleared by a server `estop` with latched:false (the owner) or a local `resume`.
-//   - Local: set by `openvibe-node stop` on the machine itself; cleared only by `openvibe-node resume`.
+//   - Local: set on the machine itself — `openvibe-node stop`, or a driver's own stop (`local_stop`); cleared only by
+//     `openvibe-node resume`. A remote clear never touches it.
 //
 // Anything that moves is refused while either is set.
 type LatchState struct {
@@ -24,6 +26,7 @@ type LatchState struct {
 	RemoteReason string    `json:"remote_reason,omitempty"`
 	RemoteAt     time.Time `json:"remote_at,omitempty"`
 	Local        bool      `json:"local"`
+	LocalReason  string    `json:"local_reason,omitempty"`
 	LocalAt      time.Time `json:"local_at,omitempty"`
 }
 
@@ -144,13 +147,34 @@ func (l *Latch) ClearRemote() (LatchState, error) {
 }
 
 // SetLocal latches the local kill switch.
-func (l *Latch) SetLocal() (LatchState, error) {
+func (l *Latch) SetLocal() (LatchState, error) { return l.SetLocalWith("") }
+
+// SetLocalWith latches the local stop and records why (the first reason stands until the resume: a stop pressed
+// twice keeps saying what stopped it first).
+func (l *Latch) SetLocalWith(reason string) (LatchState, error) {
+	reason = CleanReason(reason)
 	return l.update(func(s *LatchState) {
 		if !s.Local {
 			s.LocalAt = time.Now().UTC()
+			s.LocalReason = reason
 		}
 		s.Local = true
 	})
+}
+
+// CleanReason makes a stop reason safe to show: no control characters, at most 120 characters.
+func CleanReason(reason string) string {
+	out := make([]rune, 0, len(reason))
+	for _, r := range reason {
+		if r < 0x20 || r == 0x7f {
+			r = ' '
+		}
+		out = append(out, r)
+		if len(out) == 120 {
+			break
+		}
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // Resume clears both latches (`openvibe-node resume`).

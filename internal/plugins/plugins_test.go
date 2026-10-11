@@ -64,6 +64,9 @@ func fakePlugin(logPath string, in io.Reader, out io.Writer) {
 			}
 			w.Encode(map[string]any{"op": "ready"})
 			w.Encode(map[string]any{"op": "event", "name": "booted"})
+			if mode == "local_stop" {
+				w.Encode(map[string]any{"op": "local_stop", "reason": "stop button"})
+			}
 		case "command":
 			switch m["kind"] {
 			case "crash":
@@ -185,6 +188,14 @@ func TestHelloDescribeCommand(t *testing.T) {
 		t.Fatalf("%+v", o)
 	}
 	if o := fx.waitOutput(OutEvent); o.Data["name"] != "booted" {
+		t.Fatalf("%+v", o)
+	}
+}
+
+func TestLocalStopIsForwarded(t *testing.T) {
+	fx := start(t, "local_stop")
+	fx.waitState(StateReady)
+	if o := fx.waitOutput(OutLocalStop); o.Data["reason"] != "stop button" || o.Plugin != "fake" {
 		t.Fatalf("%+v", o)
 	}
 }
