@@ -494,6 +494,10 @@ func (p *Plugin) readStdout(r io.Reader, described chan struct{}) {
 			}
 			p.log.Info("plugin described", "driver", d.Driver, "version", d.Version)
 		case "ready":
+			// Ready again after a fault (the robot came back): the fault is over, so status stops reporting it.
+			p.mu.Lock()
+			p.fault = nil
+			p.mu.Unlock()
 			p.setState(StateReady)
 		case "ack", "nack":
 			id, _ := m["id"].(string)

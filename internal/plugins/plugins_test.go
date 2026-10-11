@@ -62,6 +62,9 @@ func fakePlugin(logPath string, in io.Reader, out io.Writer) {
 				w.Encode(map[string]any{"op": "fault", "fault_code": "firmware_unsupported", "message": "v1 not v2"})
 				continue
 			}
+			if mode == "recover" {
+				w.Encode(map[string]any{"op": "fault", "fault_code": "not_connected", "message": "robot unreachable"})
+			}
 			w.Encode(map[string]any{"op": "ready"})
 			w.Encode(map[string]any{"op": "event", "name": "booted"})
 			if mode == "local_stop" {
@@ -189,6 +192,24 @@ func TestHelloDescribeCommand(t *testing.T) {
 	}
 	if o := fx.waitOutput(OutEvent); o.Data["name"] != "booted" {
 		t.Fatalf("%+v", o)
+	}
+}
+
+// A plugin that faults (the robot unreachable) and then reports ready again (it came back) carries no fault: status
+// stops reporting it and commands reach the plugin again.
+func TestReadyAfterFaultClearsIt(t *testing.T) {
+	fx := start(t, "recover")
+	fx.waitState(StateReady)
+	p := fx.m.Get("fake")
+	deadline := time.Now().Add(5 * time.Second)
+	for p.Info().Fault != nil && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if f := p.Info().Fault; f != nil || p.Info().State != StateReady {
+		t.Fatalf("after ready: state %s, fault %+v", p.Info().State, f)
+	}
+	if r := p.Command(context.Background(), "c1", "drive", json.RawMessage(`{"throttle":0.2}`), 300); !r.OK {
+		t.Fatalf("a command after recovery: %+v", r)
 	}
 }
 
