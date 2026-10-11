@@ -1,7 +1,7 @@
 #!/bin/sh
 # OpenVibe Node installer.
 #
-#   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|none]
+#   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|looi|none]
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> [--driver …]
 #
 # Detects the OS and CPU, downloads the openvibe-node binary and the plugin bundle (checking their SHA-256), creates
@@ -16,7 +16,8 @@
 #   --network URL    pair through OpenVibe.Network at URL (the machine gets a node credential, then Bot binds it).
 #   --pairing ID     the pair_… id of that Network pairing; a code given here instead (with no --code) is the code.
 #   --name NAME      the device's name on openvibe.bot (default: the hostname).
-#   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), none (dry run). Default: none.
+#   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), looi (bridge, Bluetooth), none (dry run).
+#                    Default: none.
 #   --no-service     install and pair, but do not install the service.
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
 #                    downloading.
@@ -46,7 +47,7 @@ TAG="latest"
 
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
-	echo "                  [--driver adeept|adeept-mecanum|cozmo|none] [--no-service] [--local DIR] [--version TAG]"
+	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|none] [--no-service] [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.network --pairing pair_… --code ABCD-1234"
 }
@@ -83,7 +84,7 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-case "$DRIVER" in adeept|adeept-mecanum|cozmo|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo or none" ;; esac
+case "$DRIVER" in adeept|adeept-mecanum|cozmo|looi|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo, looi or none" ;; esac
 case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
 # --pairing takes the pair_… id; with no --code, anything else there is the code itself.
 case "$PAIRING" in ""|pair_*) ;; *) [ -z "$CODE" ] || die "--pairing must be a pair_… id"; CODE="$PAIRING"; PAIRING="" ;; esac
@@ -314,6 +315,16 @@ cozmo)
 	PLUGINS='[{"name": "cozmo"}]'
 	KIND=bridge
 	command -v espeak-ng >/dev/null 2>&1 || say "tip: install espeak-ng so Cozmo can speak (sudo apt install espeak-ng)"
+	;;
+looi)
+	# LOOI's camera is its phone, which streams on its own (docs/hardware-looi.md): the Node publishes no video.
+	PLUGINS='[{"name": "looi"}]'
+	KIND=bridge
+	VIDEO='"source": "off"'
+	if ! "$STATE/venv/bin/python" -c 'import openvibe_looi' >/dev/null 2>&1; then
+		say "the Generic LOOI driver is not in $STATE/venv yet: install it with \"$SUDO $PIP install <the driver>\", then"
+		say "restart the Node's service. Until then the panel shows the plugin's fault and LOOI never moves."
+	fi
 	;;
 esac
 if [ ! -f "$CONF/config.json" ]; then

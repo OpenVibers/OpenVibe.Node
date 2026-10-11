@@ -520,7 +520,15 @@ func (n *Node) sendEstopState() {
 	n.mu.Unlock()
 	st := n.latch.State()
 	n.send(protocol.EstopState{Latched: st.Stopped(), By: "device", At: time.Now().UTC().Format(time.RFC3339Nano),
-		RobotID: robot, LocalStop: st.Local, Reason: st.RemoteReason})
+		RobotID: robot, LocalStop: st.Local, Reason: estopReason(st)})
+}
+
+// estopReason is what stopped the device: the local stop's reason while it holds, else the server's.
+func estopReason(st safety.LatchState) string {
+	if st.Local && st.LocalReason != "" {
+		return st.LocalReason
+	}
+	return st.RemoteReason
 }
 
 // ---- plugin output ----
@@ -570,6 +578,17 @@ func (n *Node) output(o plugins.Output) {
 			if p, ok := o.Data["path"].(string); ok {
 				j.Push(p)
 			}
+		}
+	case plugins.OutLocalStop:
+		// A driver's own stop: everything stops at once, then the local latch is persisted with its reason. It is
+		// never a clear: nothing a plugin says releases a latch.
+		n.mgr.EstopAll()
+		reason, _ := o.Data["reason"].(string)
+		if reason = safety.CleanReason(reason); reason == "" {
+			reason = o.Plugin + " stop"
+		}
+		if _, err := n.latch.SetLocalWith(reason); err != nil {
+			n.log.Error("a plugin latched the local stop, but the latch could not be saved", "plugin", o.Plugin, "err", err)
 		}
 	case plugins.OutFault, plugins.OutState:
 		n.sendStatus()
@@ -858,7 +877,7 @@ func (n *Node) control(r localctl.Request) localctl.Response {
 	switch r.Cmd {
 	case localctl.CmdStop:
 		n.mgr.EstopAll() // at once, then persist
-		if _, err := n.latch.SetLocal(); err != nil {
+		if _, err := n.latch.SetLocalWith("openvibe-node stop"); err != nil {
 			return localctl.Response{OK: true, Error: "stopped, but the latch could not be saved: " + err.Error()}
 		}
 		return localctl.Response{OK: true}

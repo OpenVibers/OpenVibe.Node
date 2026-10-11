@@ -50,7 +50,8 @@ Usage:
   openvibe-node credential import   store the credential from a rotate response, read as JSON on stdin
   openvibe-node run [--dry-run]
   openvibe-node install [--user NAME]
-  openvibe-node uninstall
+  openvibe-node install --user-session --home DIR    Windows: start at sign-in in your own session (Bluetooth bridges)
+  openvibe-node uninstall [--user-session]
   openvibe-node status [--json]
   openvibe-node stop        stop every actuator now and hold them stopped
   openvibe-node resume      release the stop
@@ -101,6 +102,7 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		dryRun  = fs.Bool("dry-run", false, "run only the dry-run plugin and the test pattern (run)")
 		asJSON  = fs.Bool("json", false, "print JSON (status, plugins)")
 		svcUser = fs.String("user", "", "run the service as this account (install)")
+		session = fs.Bool("user-session", false, "Windows: start at sign-in in your own session instead of as a service (install, uninstall)")
 	)
 	// Accept flags anywhere: split positionals out.
 	var positional []string
@@ -147,8 +149,16 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	case "run":
 		err = cmdRun(g, *dryRun)
 	case "install":
+		if *session {
+			err = cmdInstallUserSession(g, stdout)
+			break
+		}
 		err = cmdInstall(g, *svcUser, stdout)
 	case "uninstall":
+		if *session {
+			err = cmdUninstallUserSession(stdout)
+			break
+		}
 		err = service.Control(serviceOptions(g, ""), "stop")
 		if uerr := service.Control(serviceOptions(g, ""), "uninstall"); uerr != nil {
 			err = uerr

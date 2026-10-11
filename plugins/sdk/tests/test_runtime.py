@@ -147,6 +147,21 @@ class RuntimeTest(unittest.TestCase):
         rt.feed_line(json.dumps({"op": "command", "id": "c4", "kind": "drive"}))
         self.assertEqual(lines(out)[-1]["op"], "ack")
 
+    def test_local_stop_latches_and_ignores_a_crossing_resume(self):
+        rt, p, out, clock = make()
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "command", "id": "c1", "kind": "drive"}))
+        p.local_stop("stop button")
+        self.assertFalse(p.moving)
+        self.assertEqual(lines(out)[-1], {"op": "local_stop", "reason": "stop button"})
+        rt.feed_line(json.dumps({"op": "resume"}))  # sent before the core saw the local stop
+        rt.feed_line(json.dumps({"op": "command", "id": "c2", "kind": "drive"}))
+        self.assertEqual(lines(out)[-1]["fault_code"], "estopped")
+        rt.feed_line(json.dumps({"op": "estop"}))  # the core latched it
+        rt.feed_line(json.dumps({"op": "resume"}))  # `openvibe-node resume` on the machine
+        rt.feed_line(json.dumps({"op": "command", "id": "c3", "kind": "drive"}))
+        self.assertEqual(lines(out)[-1]["op"], "ack")
+
     def test_halt_always_accepted(self):
         rt, p, out, clock = make()
         self.hello(rt)

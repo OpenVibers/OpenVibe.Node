@@ -73,6 +73,9 @@ const (
 	OutVideo     = "video"
 	OutFault     = "fault"
 	OutState     = "state"
+	// OutLocalStop: the driver latched the Node's local stop (its own stop button, a sensor it trusts). Only
+	// `openvibe-node resume` on the machine releases it.
+	OutLocalStop = "local_stop"
 )
 
 // Output is something a plugin said that the core forwards: telemetry, an event, a video frame, a fault or a state
@@ -524,6 +527,10 @@ func (p *Plugin) readStdout(r io.Reader, described chan struct{}) {
 			p.emit(Output{Kind: OutTelemetry, Data: m}, false)
 		case "event":
 			p.emit(Output{Kind: OutEvent, Data: m}, true)
+		case "local_stop":
+			reason, _ := m["reason"].(string)
+			p.log.Warn("plugin latched the local stop", "reason", truncate(reason, 120))
+			p.emit(Output{Kind: OutLocalStop, Data: m}, true)
 		case "video":
 			p.emit(Output{Kind: OutVideo, Data: m}, false)
 		default:

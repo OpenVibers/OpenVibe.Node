@@ -13,7 +13,7 @@ ports, works behind any home router), and a local kill switch stops everything i
    curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X --code ABCD-1234 --driver adeept
    ```
 
-   The shape is `--robot rob_… --code CODE [--driver adeept|adeept-mecanum|cozmo|none]`. `--robot` is the robot's
+   The shape is `--robot rob_… --code CODE [--driver adeept|adeept-mecanum|cozmo|looi|none]`. `--robot` is the robot's
    `rob_…` id and `--code` the pairing code (both from openvibe.bot; the code may also be the first argument).
    `--driver` names the plugin: `adeept` (Adeept 4WD Smart Car, ordinary wheels), `adeept-mecanum`, `cozmo`, or
    `none` (the default: the dry-run plugin with a test-pattern camera, for trying the Node on a laptop). `--name NAME`
@@ -75,6 +75,12 @@ openvibe-node --home ~/node run --dry-run      # foreground; Ctrl-C stops it
 and `openvibe-node install` (the service runs as LocalSystem; files go to `%ProgramData%\OpenVibe Node`). Robot plugins
 need Python; set `"python"` in `config.json`.
 
+A driver that needs your signed-in session (Bluetooth through the Windows runtime, as a LOOI bridge does) runs the
+Node there instead, with no administrator: `openvibe-node pair <CODE> --home "%LOCALAPPDATA%\OpenVibe Node"`, then
+`openvibe-node install --user-session --home "%LOCALAPPDATA%\OpenVibe Node"`. It starts when you sign in, in a
+console window that shows its log; closing the window stops the Node and every actuator. `openvibe-node uninstall
+--user-session` removes it. See [hardware-looi.md](hardware-looi.md).
+
 ## Commands
 
 | command                                   | what it does                                                               |
@@ -83,6 +89,8 @@ need Python; set `"python"` in `config.json`.
 | `openvibe-node run [--dry-run]`           | run in the foreground (what the service runs)                              |
 | `openvibe-node install [--user NAME]`     | install and start the service                                              |
 | `openvibe-node uninstall`                 | stop and remove the service (config and credential are kept)               |
+| `openvibe-node install --user-session --home DIR` | Windows: start at sign-in in your own session instead of as a service |
+| `openvibe-node uninstall --user-session`  | Windows: remove that sign-in start                                         |
 | `openvibe-node status [--json]`           | link, stop latch, limits, plugins, video, battery, running jobs            |
 | `openvibe-node stop`                      | **kill switch**: stop every actuator now and hold it stopped              |
 | `openvibe-node resume`                    | release the local stop (and a server e-stop)                               |

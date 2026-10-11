@@ -284,6 +284,33 @@ func TestOwnerLatchAcrossReconnects(t *testing.T) {
 	}
 }
 
+// A driver's own stop (`local_stop` from the plugin) is the local latch with the driver's reason: Bot sees it as a
+// local stop, the owner's clear does not lift it, and only the local resume does.
+func TestPluginLocalStop(t *testing.T) {
+	e := start(t)
+	e.node.output(plugins.Output{Kind: plugins.OutLocalStop, Plugin: "dryrun", Data: map[string]any{"reason": "LOOI stop button"}})
+	m, err := e.conn.Expect(protocol.TypeEstopState, 5*time.Second, func(m protocol.Message) bool {
+		s := m.(protocol.EstopState)
+		return s.Latched && s.LocalStop
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := m.Msg.(protocol.EstopState).Reason; r != "LOOI stop button" {
+		t.Fatalf("reason %q", r)
+	}
+	if st := e.node.latch.State(); !st.Local || st.LocalReason != "LOOI stop button" {
+		t.Fatalf("latch %+v", st)
+	}
+	e.conn.Send(protocol.Estop{Latched: false, By: "usr_owner", At: time.Now().UTC().Format(time.RFC3339Nano)})
+	e.expectEstopState(true, true)
+	if c := nackCode(e.cmd(protocol.KindDrive, `{"throttle":0.3}`, 300)); c != protocol.FaultLocalStop {
+		t.Fatalf("after the owner's clear: %q", c)
+	}
+	e.ctl(localctl.CmdResume)
+	e.expectEstopState(false, false)
+}
+
 // A remote clear never clears the local latch (`openvibe-node stop`): the device keeps refusing motion and keeps
 // reporting itself latched, across a reconnect, until the local resume (which clears both latches on the device).
 // Its latched:false after the resume is only a report; Bot's latch stays for the owner to clear.

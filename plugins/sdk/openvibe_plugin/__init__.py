@@ -120,6 +120,13 @@ class Plugin:
         if self.runtime is not None:
             self.runtime.send(dict(op="telemetry", **fields))
 
+    def local_stop(self, reason=""):
+        """Latch the Node's local stop: the driver's own stop button, or a sensor it trusts. Every actuator stops now,
+        the panel shows the robot as stopped on the robot, and only ``openvibe-node resume`` on this machine releases
+        it (the owner's remote clear does not). Safe to call from any thread."""
+        if self.runtime is not None:
+            self.runtime.local_stop(reason)
+
     def log(self, msg, *args):
         sys.stderr.write((msg % args if args else msg) + "\n")
         sys.stderr.flush()
@@ -143,6 +150,8 @@ class Runtime:
         self.probe = False
         self.ready = False
         self.estopped = False
+        # True from a local_stop until the core's estop confirms it: a resume crossing it on the wire is ignored.
+        self.local_stop_pending = False
         self.motion_deadline = None
         self.last_heartbeat = None
         self.heartbeat_lost = False
@@ -173,6 +182,13 @@ class Runtime:
             except Exception as e:  # a failing stop is the worst case; report it loudly
                 self.plugin.log("stop failed (%s): %r", reason, e)
                 self.send({"op": "event", "name": "stop_failed", "reason": reason, "error": str(e)})
+
+    def local_stop(self, reason=""):
+        with self.lock:
+            self.estopped = True
+            self.local_stop_pending = True
+        self.safe_stop("local_stop")
+        self.send({"op": "local_stop", "reason": str(reason or "")[:120]})
 
     def tick(self):
         """Run time-based safety checks. Called by the loop at least every 20 ms."""
@@ -212,9 +228,13 @@ class Runtime:
             self.safe_stop("stop")
         elif op == "estop":
             self.estopped = True
+            self.local_stop_pending = False
             self.safe_stop("estop")
         elif op == "resume":
-            self.estopped = False
+            if self.local_stop_pending:
+                self.plugin.log("resume ignored: the local stop has not reached the core yet")
+            else:
+                self.estopped = False
         else:
             self.plugin.log("unknown op %r", op)
 

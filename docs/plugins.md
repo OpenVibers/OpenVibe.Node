@@ -69,6 +69,7 @@ describes itself and waits for EOF without opening any hardware.
 | `telemetry` | `battery` {`volts`, `percent`}, `rssi`, `sensors` {…}, `faults` […]                         |
 | `event`     | `name` (`cliff`, `picked_up`, `low_battery`, `heartbeat_lost`, `stop_failed`, …), any fields |
 | `video`     | `format` (`jpeg`), `path`, optional `width`, `height`, `seq`                                |
+| `local_stop` | `reason` — the driver's own stop (a button, a sensor it trusts): latches the Node's local stop, see below |
 
 For `video`, the plugin writes each frame to a file (write to a temporary name, then rename, and rotate a few names so
 a slow reader never sees a partial file) and announces it with `{"op": "video", "format": "jpeg", "path": …}`
@@ -86,6 +87,13 @@ A plugin must stop every actuator itself — the core dying must never leave mot
 - when it has **not heard a heartbeat for 1 s** (and refuse motion with `no_heartbeat` until heartbeats return);
 - on `stop`, `estop` and a `halt` command;
 - when its own sensors say so (Cozmo: cliff, pick-up).
+
+**A driver's own stop.** A driver with a stop of its own (a stop button on the robot, a hotkey on a bridge computer,
+a sensor it trusts) sends `local_stop` (Python: `self.local_stop("reason")`). The core stops every plugin at once and
+latches its **local** stop with that reason, persisted across restarts; Bot shows the robot as stopped on the robot.
+Only `openvibe-node resume` on that machine releases it: the owner's remote clear does not, and nothing a plugin sends
+releases a latch. The Python runtime refuses motion from the moment it is called and ignores a `resume` that crosses it
+on the wire. `openvibe-node stop` sets the same latch from a terminal.
 
 `stop` must be idempotent and safe at any time, including before setup. Handlers must not block: slow work (speech
 synthesis, file I/O) goes on a thread. Nothing but protocol lines may go to stdout; the Python runtime enforces this by
