@@ -63,7 +63,7 @@ describes itself and waits for EOF without opening any hardware.
 |-------------|---------------------------------------------------------------------------------------------|
 | `describe`  | `driver`, `version`, `protocol` (1), `capabilities` {…}, `motion_kinds` [kinds]             |
 | `ready`     | — setup finished, every actuator stopped                                                    |
-| `fault`     | `fault_code`, `message` — the plugin runs but cannot drive (commands get this code as nack) |
+| `fault`     | `fault_code`, `message` — the plugin runs but cannot drive (commands get this code as nack); `ready` again when it can (the robot came back) ends the fault |
 | `ack`       | `id`                                                                                        |
 | `nack`      | `id`, `fault_code`, `message`                                                               |
 | `telemetry` | `battery` {`volts`, `percent`}, `rssi`, `sensors` {…}, `faults` […]                         |
