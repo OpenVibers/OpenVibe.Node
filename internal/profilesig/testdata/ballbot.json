@@ -1,0 +1,68 @@
+{
+ "served": {
+  "profile": {
+   "id": "community.ballbot",
+   "version": 1,
+   "name": "Ballbot \"Mk\\2\" é ✓   \u0007 tab\there",
+   "vendor": "Mia",
+   "kind": "onboard",
+   "description": "A self-balancing ball robot on an ESP32, driven by a community Node plugin. <b>&</b>",
+   "capabilities": [
+    "drive.differential",
+    "battery"
+   ],
+   "mapping": {
+    "plugin": "ballbot",
+    "driver": "plugin"
+   },
+   "commands": {
+    "drive": {
+     "axes": {
+      "throttle": [
+       -1,
+       1
+      ],
+      "steer": [
+       -1.5,
+       1e+21,
+       0.1,
+       1e-7
+      ]
+     }
+    }
+   },
+   "widgets": [
+    {
+     "type": "drive",
+     "label": "Drive",
+     "capability": "drive.differential",
+     "order": 1,
+     "command": {
+      "kind": "drive"
+     }
+    }
+   ],
+   "limits": {
+    "max_turn": 0.6,
+    "max_speed": 0.5,
+    "max_command_ms": 300,
+    "heartbeat_ms": 1000,
+    "Zeta": null,
+    "alpha": true,
+    "é": 1,
+    "Z": 2
+   }
+  },
+  "signature": {
+   "alg": "Ed25519",
+   "key_id": "a7a0f02462c68119",
+   "value": "rnwR4vMilhtNtDPTNmpm2W3zPPfduwUVDPLry9WJyarnipsCJit/DlEkekDK3ZQqRnP5v8Yo5AMpjcWKTbufAQ=="
+  }
+ },
+ "key": {
+  "alg": "Ed25519",
+  "key_id": "a7a0f02462c68119",
+  "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA8NQGtoP2IvafI+EuePwk1L+bAf1ahWx65v474RSPoxM=\n-----END PUBLIC KEY-----\n"
+ },
+ "canonical": "{\"capabilities\":[\"drive.differential\",\"battery\"],\"commands\":{\"drive\":{\"axes\":{\"steer\":[-1.5,1e+21,0.1,1e-7],\"throttle\":[-1,1]}}},\"description\":\"A self-balancing ball robot on an ESP32, driven by a community Node plugin. <b>&</b>\",\"id\":\"community.ballbot\",\"kind\":\"onboard\",\"limits\":{\"Z\":2,\"Zeta\":null,\"alpha\":true,\"heartbeat_ms\":1000,\"max_command_ms\":300,\"max_speed\":0.5,\"max_turn\":0.6,\"é\":1},\"mapping\":{\"driver\":\"plugin\",\"plugin\":\"ballbot\"},\"name\":\"Ballbot \\\"Mk\\\\2\\\" é ✓   \\u0007 tab\\there\",\"vendor\":\"Mia\",\"version\":1,\"widgets\":[{\"capability\":\"drive.differential\",\"command\":{\"kind\":\"drive\"},\"label\":\"Drive\",\"order\":1,\"type\":\"drive\"}]}"
+}
