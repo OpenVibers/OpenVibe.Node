@@ -153,6 +153,9 @@ for k, v in {
 }.items():
     caps.setdefault(k, v)
 worker['caps'] = caps
+# A job resolves names only through resolvers it can reach by address (docs/worker.md, "DNS"): two public ones, kept
+# when the owner already chose others.
+worker.setdefault('dns', ['1.1.1.1', '9.9.9.9'])
 functions = [f for f in worker.get('functions') or [] if f.get('name') != 'openvibe-codes']
 if node and codes:
     previous = next((f for f in worker.get('functions') or [] if f.get('name') == 'openvibe-codes'), {})

@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 )
 
@@ -139,6 +140,10 @@ type WorkerConfig struct {
 	// EgressDeny is more IPv4 CIDRs a public or openvibe-only job is refused (the Node's cell, WireGuard peers with
 	// public addresses), on top of the ranges always refused.
 	EgressDeny []string `json:"egress_deny,omitempty"`
+	// DNS is up to three IPv4 resolvers written to the /etc/resolv.conf of a job that runs with a network (public or
+	// openvibe-only); none by default, when a job resolves no names (the host's resolver is out of its reach). Only
+	// addresses such a job could reach anyway: public ones, and under openvibe-only ones inside EgressAllow.
+	DNS []string `json:"dns,omitempty"`
 	// Media is where a job's inputs come from and a result over 256 KiB is uploaded to. Off (the default), a job
 	// naming inputs is refused and a result over 256 KiB ends the job limit.
 	Media MediaConfig `json:"media,omitzero"`
@@ -470,6 +475,9 @@ func (w WorkerConfig) validate() error {
 			}
 		}
 	}
+	if err := w.validateDNS(); err != nil {
+		return err
+	}
 	switch {
 	case w.Egress == EgressOpenVibeOnly && len(w.EgressAllow) == 0:
 		return errors.New("config: worker.egress openvibe-only needs worker.egress_allow, the CIDRs a job may reach")
@@ -511,4 +519,31 @@ func (c *Config) PythonPath(paths Paths) string {
 		return "python"
 	}
 	return "python3"
+}
+
+// validateDNS checks worker.dns: at most three IPv4 resolvers (the most a resolv.conf is read for), only with a policy
+// that gives jobs a network, each public, and under openvibe-only inside egress_allow.
+func (w WorkerConfig) validateDNS() error {
+	if len(w.DNS) == 0 {
+		return nil
+	}
+	if w.Egress != EgressPublic && w.Egress != EgressOpenVibeOnly {
+		return errors.New("config: worker.dns needs worker.egress public or openvibe-only (a job without a network resolves nothing)")
+	}
+	if len(w.DNS) > 3 {
+		return errors.New("config: worker.dns lists at most three resolvers")
+	}
+	for _, d := range w.DNS {
+		a, err := netip.ParseAddr(d)
+		if err != nil || !a.Is4() || !a.IsGlobalUnicast() || a.IsPrivate() || netip.MustParsePrefix("100.64.0.0/10").Contains(a) {
+			return fmt.Errorf("config: worker.dns %q is not a public IPv4 address such as 1.1.1.1", d)
+		}
+		if w.Egress == EgressOpenVibeOnly && !slices.ContainsFunc(w.EgressAllow, func(c string) bool {
+			p, err := netip.ParsePrefix(c)
+			return err == nil && p.Contains(a)
+		}) {
+			return fmt.Errorf("config: worker.dns %s is outside worker.egress_allow, so an openvibe-only job could not reach it", d)
+		}
+	}
+	return nil
 }

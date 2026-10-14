@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -51,6 +52,8 @@ type sandboxSpec struct {
 	Limits   []rlimit   `json:"limits"`
 	Argv     []string   `json:"argv"`
 	Env      []string   `json:"env"`
+	// Resolvers are the nameservers of the job's /etc/resolv.conf (worker.dns, for a job with a network); none, none.
+	Resolvers []string `json:"resolvers,omitempty"`
 }
 
 // bindSpec bind-mounts the host's path at the same path in the private root, read-only unless it is a device node.
@@ -164,6 +167,9 @@ func enterSandbox() error {
 		}
 	}
 	if err := step("copying the CA certificates", stageCA(r, caPaths)); err != nil {
+		return err
+	}
+	if err := step("writing /etc/resolv.conf", writeResolvConf(r, s.Resolvers)); err != nil {
 		return err
 	}
 	var artifactDev uint64
@@ -413,6 +419,27 @@ func inRoot(r, path string) (string, error) {
 
 // maxCAFile is the largest CA certificate file copied (a bundle of every public CA is about 250 KiB).
 const maxCAFile = 4 << 20
+
+// writeResolvConf writes the private root r's /etc/resolv.conf naming resolvers, the job's only way to resolve a name
+// (the host's resolver, 127.0.0.53 on most systems, is out of its reach); nothing for no resolvers. It is a file of
+// the private root, never the host's, and read-only once the root is.
+func writeResolvConf(r string, resolvers []string) error {
+	if len(resolvers) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	for _, a := range resolvers {
+		if ip, err := netip.ParseAddr(a); err != nil || !ip.Is4() {
+			return fmt.Errorf("%q is not an IPv4 address", a)
+		}
+		b.WriteString("nameserver " + a + "\n")
+	}
+	b.WriteString("options timeout:2 attempts:2\n")
+	if err := os.MkdirAll(r+"/etc", 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(r+"/etc/resolv.conf", []byte(b.String()), 0o644)
+}
 
 // stageCA copies the CA certificates at paths (those that exist) to the same paths under the private root r, as the
 // job's user, and nothing else: of a regular file, only the PEM CERTIFICATE blocks that parse as X.509 certificates,

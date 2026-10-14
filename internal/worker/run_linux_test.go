@@ -100,6 +100,10 @@ func TestHelperProcess(t *testing.T) {
 			}()
 		}
 		wg.Wait()
+		got["resolv.conf"] = "absent"
+		if b, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+			got["resolv.conf"] = string(b)
+		}
 		_ = json.NewEncoder(result).Encode(got)
 	case "escape": // every attempt must fail but the write to /tmp; the result is each attempt's error
 		node := os.Getenv("OPENVIBE_TEST_NODE_DIR")
@@ -1334,6 +1338,34 @@ func TestEgress(t *testing.T) {
 				if got[a] != want {
 					t.Errorf("%s: %s, want %s (all: %v)", a, got[a], want, got)
 				}
+			}
+		})
+	}
+}
+
+// TestEgressDNS: worker.dns becomes the /etc/resolv.conf of a job that runs with a network, and of no other.
+func TestEgressDNS(t *testing.T) {
+	if _, err := egressReady(); errors.Is(err, errEgressTool) {
+		t.Skip(err)
+	}
+	for _, c := range []struct{ name, net, want string }{
+		{"public", protocol.NetPublic, "nameserver 1.1.1.1\nnameserver 9.9.9.9\noptions timeout:2 attempts:2\n"},
+		{"no net", "", "absent"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := helperConfig(t, config.WorkerCaps{}, "egress")
+			cfg.Egress, cfg.DNS = config.EgressPublic, []string{"1.1.1.1", "9.9.9.9"}
+			w, s := newRunWorkerConfig(t, cfg)
+			j := testJob(1, "egress")
+			j.Net = c.net
+			run(t, w, j)
+			ex := s.exit(t, j.ID)
+			var got map[string]string
+			if err := json.Unmarshal(ex.Result, &got); err != nil || ex.Reason != protocol.ExitExited {
+				t.Fatalf("%+v %s: %v", ex, ex.Result, err)
+			}
+			if got["resolv.conf"] != c.want {
+				t.Errorf("resolv.conf %q, want %q", got["resolv.conf"], c.want)
 			}
 		})
 	}
