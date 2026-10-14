@@ -58,7 +58,7 @@ TAG="latest"
 WORKER=0
 COMPUTER=""
 # The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0).
-CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.3.0}"
+CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.3.1}"
 CODES_DIR=/opt/openvibe-codes
 
 usage() {
