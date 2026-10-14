@@ -221,6 +221,12 @@ func TestComputerLocalStopLeavesObserveOnly(t *testing.T) {
 	if d := dataOf(t, e.computerCmd("s3", protocol.KindFS, map[string]any{"op": "stat", "path": work}, 5*time.Second)); d["type"] != "dir" {
 		t.Fatalf("observing while stopped: %v", d)
 	}
+	if d := dataOf(t, e.computerCmd("s3p", protocol.KindProbe, map[string]any{"target": "tcp://127.0.0.1:1", "timeout_s": 2}, 10*time.Second)); d["open"] != false {
+		t.Fatalf("a probe is read-only and runs while stopped: %v", d)
+	}
+	if nk := nackOf(t, e.computerCmd("s3q", protocol.KindProbe, map[string]any{"target": "http://1.1.1.1/"}, 10*time.Second)); nk.FaultCode != protocol.FaultNotAllowed {
+		t.Fatalf("a public probe: %+v", nk)
+	}
 	if r, err := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdResume}, 2*time.Second); err != nil || !r.OK {
 		t.Fatal(err, r.Error)
 	}

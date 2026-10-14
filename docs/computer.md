@@ -56,6 +56,7 @@ waits is denied, and the core also refuses `exec` and file writes until `openvib
 |----------|-----------------------------------------------------------------------------------------------|---------------------|
 | `exec`   | `argv` (a program and its arguments: never a shell line), `cwd`, `timeout_s`, `stdin` (≤ 64 KB) | `exit_code`, `stdout`, `stderr` (each cut at `max_output_bytes`), `truncated`, `timed_out`, `duration_ms` |
 | `fs`     | `op` `list` / `stat` / `read` (`offset`, `length`) / `write` (`content_b64`, `mode` `create`, `overwrite` or `append`) / `mkdir`, and an absolute `path` | `entries` (≤ 1000), the stat, `content_b64` (≤ `max_read_bytes`), `written`, `created` |
+| `probe`  | `target`: `http(s)://…` (one GET, no redirect followed) or `tcp://host:port`; `timeout_s` | `status`, `content_type`, `etag`, `last_modified`, `body` (≤ 64 KB), `ms`; or `open`, `ms` |
 | `screen` | `max_width` (default 1280)                                                                    | `format` (`jpeg` with Pillow, else `png` ≤ 300 KB), `width`, `height`, `content_b64` |
 
 A program runs in its own process group with the Node account's rights, at most 2 at a time, and is killed at
@@ -75,6 +76,7 @@ your graphical session for `screen`; without one the plugin simply does not offe
 | `max_read_bytes`     | 262144 (≤ 256 KB) | the most one read or write moves |
 | `approval_timeout_s` | 120 (≤ 600)    | how long a request waits for you |
 | `notify`             | `true`         | a desktop notification when a request waits (graphical session only) |
+| `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
 
 `describe` reports `terminal`, `files` and `screen` with the level and folders, so Bot shows what the machine allows;
 telemetry carries the sensors `computer_level` (observe while a stop is latched), `computer_waiting` and

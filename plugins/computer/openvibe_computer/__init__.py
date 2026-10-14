@@ -19,10 +19,18 @@ Command kinds and their answers (the ack's ``data``):
 * ``fs`` ``{"op": "list"|"stat"|"read"|"write"|"mkdir", "path", …}``: ``read`` takes ``offset``/``length`` and answers
   ``content_b64``; ``write`` takes ``content_b64`` and ``mode`` (``create``, ``overwrite`` or ``append``).
 * ``screen`` ``{"max_width"?}`` → ``{format, width, height, content_b64}`` (JPEG through Pillow when it is installed).
+* ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
+  etag, last_modified, body, truncated, ms}``; for ``tcp://host:port``: ``{open, ms, error?}``. Read-only, so it runs at
+  every level, and only towards the machine's own network: every address the name resolves to must be private,
+  loopback or link-local, and the connection goes to the address that was checked. Config ``probe: false`` turns it off.
 """
 
 import base64
+import http.client
+import ipaddress
 import os
+import socket
+import ssl
 import shlex
 import shutil
 import stat
@@ -31,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 from openvibe_plugin import Deferred, Fault, Plugin
 
@@ -60,7 +69,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.2.0"
+    version = "0.3.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -76,6 +85,7 @@ class Computer(Plugin):
         self.max_output = 64 * 1024
         self.max_read = 256 * 1024
         self.allow_exec = True
+        self.allow_probe = True
         self.notify = True
         self.approval_timeout_s = 120
         self.pending = {}  # command id -> (run, expires_at, summary)
@@ -100,6 +110,7 @@ class Computer(Plugin):
         self.max_read = _int(config.get("max_read_bytes"), "max_read_bytes", 1024, MAX_READ_CAP, 256 * 1024)
         self.approval_timeout_s = _int(config.get("approval_timeout_s"), "approval_timeout_s", 10, 600, 120)
         self.allow_exec = config.get("allow_exec", True) is not False
+        self.allow_probe = config.get("probe", True) is not False
         self.notify = config.get("notify", True) is not False
 
     def describe(self, config):
@@ -113,6 +124,8 @@ class Computer(Plugin):
         tool = self._screen_tool()
         if tool:
             caps["screen"] = {"level": self.level, "tool": tool[0]}
+        if self.allow_probe:
+            caps["probe"] = {"lan_only": True, "schemes": ["http", "https", "tcp"]}
         return caps
 
     def setup(self, config):
@@ -203,6 +216,11 @@ class Computer(Plugin):
                 raise Fault("bad_value", "op is list, stat, read, write or mkdir")
             run, summary = self._fs_write_op(op, v, level)
             return self._act(cmd, level, run, summary, threaded=False)
+        if cmd.kind == "probe":
+            if not self.allow_probe:
+                raise Fault("unsupported", "this machine does not allow probes")
+            target, timeout = self._probe_target(v)
+            return self._start(cmd, lambda: self._probe(target, timeout))
         if cmd.kind == "exec":
             if not self.allow_exec:
                 raise Fault("unsupported", "this machine does not allow running programs")
@@ -375,6 +393,76 @@ class Computer(Plugin):
         return {"exit_code": code, "stdout": text(got["out"][0]), "stderr": text(got["err"][0]),
                 "truncated": got["out"][1] > cap or got["err"][1] > cap, "timed_out": timed_out,
                 "duration_ms": int((self.clock() - started) * 1000)}
+
+    # ---- probe (the node carrier of OpenVibe.Watch) -----------------------------------------------------------------
+    @staticmethod
+    def _lan(addr):
+        ip = ipaddress.ip_address(addr)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+
+    def _probe_target(self, v):
+        raw = v.get("target")
+        if not isinstance(raw, str) or len(raw) > 2048:
+            raise Fault("bad_value", "target is http(s)://host/path or tcp://host:port")
+        u = urllib.parse.urlsplit(raw)
+        if u.scheme not in ("http", "https", "tcp") or not u.hostname or u.username or u.password:
+            raise Fault("bad_value", "target is http(s)://host/path or tcp://host:port, with no credentials")
+        try:
+            port = u.port or {"http": 80, "https": 443}.get(u.scheme)
+        except ValueError:
+            raise Fault("bad_value", "the port is not a number")
+        if not port:
+            raise Fault("bad_value", "a tcp target names its port")
+        timeout = _int(v.get("timeout_s"), "timeout_s", 1, 30, 10)
+        return {"scheme": u.scheme, "host": u.hostname, "port": port, "path": (u.path or "/") + ("?" + u.query if u.query else ""), "raw": raw}, timeout
+
+    def _resolve_lan(self, host, port):
+        """The first address of host, when every address it resolves to is on this machine's own network."""
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            raise Fault("bad_value", "%s does not resolve: %s" % (host, e))
+        addrs = [i[4][0] for i in infos]
+        if not addrs or not all(self._lan(a) for a in addrs):
+            raise Fault("not_allowed", "a probe reaches this machine's own network only (private, loopback or link-local addresses); %s is not" % host)
+        return infos[0][0], addrs[0]
+
+    def _probe(self, t, timeout):
+        family, addr = self._resolve_lan(t["host"], t["port"])
+        started = self.clock()
+        ms = lambda: int((self.clock() - started) * 1000)
+        if t["scheme"] == "tcp":
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as s:
+                    s.settimeout(timeout)
+                    s.connect((addr, t["port"]))
+                return {"open": True, "ms": ms()}
+            except OSError as e:
+                return {"open": False, "ms": ms(), "error": str(e)[:200]}
+        raw = socket.create_connection((addr, t["port"]), timeout=timeout)
+        try:
+            if t["scheme"] == "https":
+                raw = ssl.create_default_context().wrap_socket(raw, server_hostname=t["host"])
+            conn = http.client.HTTPConnection(t["host"], t["port"], timeout=timeout)
+            conn.sock = raw
+            conn.request("GET", t["path"], headers={"User-Agent": "OpenVibe-Node-probe/1", "Accept": "*/*", "Connection": "close"})
+            res = conn.getresponse()
+            cap = min(self.max_output, 64 * 1024)
+            body = res.read(cap + 1)
+            return {"status": res.status, "content_type": res.getheader("Content-Type"), "etag": res.getheader("ETag"),
+                    "last_modified": res.getheader("Last-Modified"), "location": res.getheader("Location"),
+                    "body": body[:cap].decode("utf-8", "replace"), "truncated": len(body) > cap, "ms": ms()}
+        except ssl.SSLError as e:
+            raise Fault("hardware", "TLS failed: %s" % str(e)[:200])
+        except (OSError, http.client.HTTPException) as e:
+            raise Fault("hardware", "the probe failed: %s" % str(e)[:200])
+        finally:
+            try:
+                raw.close()
+            except OSError:
+                pass
 
     # ---- files -----------------------------------------------------------------------------------------------------
     @staticmethod
