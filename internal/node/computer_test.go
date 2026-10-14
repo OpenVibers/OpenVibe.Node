@@ -218,6 +218,9 @@ func TestComputerLocalStopLeavesObserveOnly(t *testing.T) {
 	if nk := nackOf(t, e.computerCmd("s2", protocol.KindFS, map[string]any{"op": "write", "path": filepath.Join(work, "x"), "content_b64": "eA=="}, 5*time.Second)); nk.FaultCode != protocol.FaultLocalStop {
 		t.Fatalf("write while stopped: %+v", nk)
 	}
+	if nk := nackOf(t, e.computerCmd("s2i", protocol.KindInput, map[string]any{"action": "key", "keys": "Return"}, 5*time.Second)); nk.FaultCode != protocol.FaultLocalStop {
+		t.Fatalf("input while stopped: %+v", nk)
+	}
 	if d := dataOf(t, e.computerCmd("s3", protocol.KindFS, map[string]any{"op": "stat", "path": work}, 5*time.Second)); d["type"] != "dir" {
 		t.Fatalf("observing while stopped: %v", d)
 	}
