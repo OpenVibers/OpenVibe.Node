@@ -20,6 +20,11 @@ ports, works behind any home router), and a local kill switch stops everything i
    names the device on openvibe.bot (default: the hostname).
 3. Confirm the new device on openvibe.bot.
 
+**A machine that runs your jobs, not a robot:** openvibe.bot/machines prints the Network form with `--worker` (and no
+`--driver`). It turns the job worker on with a dedicated `openvibe-job` user and the OpenVibe.Codes job runner, so a
+coding task you start on openvibe.codes/run runs on this machine. [worker.md](worker.md#a-machine-that-runs-your-coding-tasks---worker)
+has the details.
+
 **Two pairing paths.** Which one the command uses is up to openvibe.bot; the installer takes both.
 
 - **Bot pairing** (the form above): `--robot rob_… --code CODE`. The Node redeems the code at

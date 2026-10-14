@@ -9,6 +9,27 @@ runtime: it runs through the same isolate path as a `code` entry, with the same 
 It is single-shot like a `code` job: the Node does not offer the persistent Linux environment that lives across
 commands, which `platform.runtime-class@1` also lets `linux` describe.
 
+## A machine that runs your coding tasks (`--worker`)
+
+The simplest way to turn the worker on is the installer's `--worker` (Linux), which openvibe.bot/machines prints with a
+one-time code: `curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_… --code … --worker`. It:
+
+- pairs the machine for its owner's own jobs (a Network pairing with ref `worker:<owner>`; OpenVibe.Bot reports it to
+  the network as a `user-owned` offer naming the owner, OpenVibe.Run places only that person's jobs on it, and Bot
+  refuses anyone else's);
+- runs the service as root and every job as the unprivileged system user `openvibe-job` (`run_as`), with public egress
+  (it installs `nftables`, `iproute2` and `util-linux` with apt when they are missing and turns IPv4 forwarding on);
+- installs the OpenVibe.Codes job runner (`openvibe-codes job`, artifact `openvibe-codes@1.0.0`) into
+  `/opt/openvibe-codes` when Node.js 20 or newer is installed system-wide, and declares it as a `code` entry;
+- sizes the caps for a coding task (an hour, 4 GiB of memory, 3 GiB of scratch, one job at a time). Your own values win
+  on a second run, and so do the keys you added.
+
+Then add your agent keys to the runner's `env` in `config.json` (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, and `GITHUB_TOKEN` to push branches and open pull requests), install any agent CLIs system-wide
+(`sudo npm install -g @anthropic-ai/claude-code @openai/codex`), and restart the service. A task started on
+openvibe.codes/run then clones the repository inside the job's sandbox, runs the agents there, and hands back the
+summary, the changed files and the patch; it never pushes to the branch it started from.
+
 ## Config
 
 `config.json`, section `worker` (defaults shown; a zero cap means the default):

@@ -3,6 +3,7 @@
 #
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none]
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> [--driver …]
+#   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> --worker
 #
 # Detects the OS and CPU, downloads the openvibe-node binary and the plugin bundle (checking their SHA-256), creates
 # a Python virtual environment for the plugins, disables the Adeept kit's stock control server if it finds it,
@@ -19,6 +20,10 @@
 #   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), looi (bridge, Bluetooth), ros2 (a ROS 2
 #                    robot through rosbridge), ros2-holonomic (mecanum or omni wheels), none (dry run).
 #                    Default: none.
+#   --worker         this machine runs its owner's jobs (openvibe.bot/machines): the job worker is turned on, jobs run
+#                    as the unprivileged user openvibe-job in the worker's sandbox with public egress (the service
+#                    runs as root, which run_as and the egress need), and the OpenVibe.Codes job runner is added when
+#                    Node.js 20+ is installed system-wide. Linux only. docs/worker.md has the details.
 #   --no-service     install and pair, but do not install the service.
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
 #                    downloading.
@@ -33,6 +38,8 @@
 #   OPENVIBE_CRONTAB_USER=FILE      edit FILE as the invoking user's crontab instead of the real one.
 #   OPENVIBE_RC_LOCAL=FILE          edit FILE as rc.local instead of /etc/rc.local.
 # OPENVIBE_INSTALL_PAIR_ARGS_ONLY=1 prints the `openvibe-node pair` arguments the flags make, one per line, and exits.
+# OPENVIBE_INSTALL_WORKER_CONFIG_ONLY=<config.json> writes the --worker section into that file (OPENVIBE_JOB_UID,
+#   OPENVIBE_JOB_GID, OPENVIBE_NODEJS and OPENVIBE_CODES_DIR stand in for the job user and the runner) and exits.
 set -eu
 
 REPO_URL="https://github.com/OpenVibers/OpenVibe.Node"
@@ -45,10 +52,15 @@ PAIRING=""
 SERVICE=1
 LOCAL=""
 TAG="latest"
+WORKER=0
+# The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0).
+CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.3.0}"
+CODES_DIR=/opt/openvibe-codes
 
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
-	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--no-service] [--local DIR] [--version TAG]"
+	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker] [--no-service]"
+	echo "                  [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.network --pairing pair_… --code ABCD-1234"
 }
@@ -76,6 +88,7 @@ while [ $# -gt 0 ]; do
 	--network=*) NETWORK="${1#*=}"; shift ;;
 	--pairing) PAIRING="${2:-}"; shift 2 ;;
 	--pairing=*) PAIRING="${1#*=}"; shift ;;
+	--worker) WORKER=1; shift ;;
 	--no-service) SERVICE=0; shift ;;
 	--local) LOCAL="${2:-}"; shift 2 ;;
 	--version) TAG="${2:-}"; shift 2 ;;
@@ -108,6 +121,65 @@ pair_with() {
 
 if [ "${OPENVIBE_INSTALL_PAIR_ARGS_ONLY:-0}" = 1 ]; then
 	pair_with printf '%s\n'
+	exit 0
+fi
+
+# write_worker_config <config.json> <job uid> <job gid> [<node.js> <codes dir>]: turn the job worker on in that config
+# (kept as it is otherwise, created when missing): jobs as the job user, public egress, caps sized for a coding task,
+# and, with a Node.js and a Codes install, the `openvibe-codes@1.0.0` job runner. Keys stay empty for the owner to add.
+write_worker_config() {
+	${SUDO:-} python3 - "$@" <<'PY'
+import json, os, sys
+path, uid, gid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+node = sys.argv[4] if len(sys.argv) > 4 else ''
+codes = sys.argv[5] if len(sys.argv) > 5 else ''
+try:
+    with open(path) as f:
+        conf = json.load(f)
+except FileNotFoundError:
+    conf = {}
+worker = conf.get('worker') or {}
+worker.update({
+    'enabled': True,
+    'run_as': {'uid': uid, 'gid': gid},
+    'allow_same_user': False,
+    'egress': 'public',
+})
+caps = worker.get('caps') or {}
+for k, v in {
+    'max_ttl_ms': 3600000, 'max_wall_ms': 3600000, 'max_cpu_ms': 3600000, 'max_mem_bytes': 4 << 30,
+    'max_output_bytes': 1 << 20, 'max_jobs': 1, 'max_cpu_millis': 2000, 'max_pids': 512,
+    'max_disk_bytes': 3 << 30, 'max_vm_bytes': 64 << 40,
+}.items():
+    caps.setdefault(k, v)
+worker['caps'] = caps
+functions = [f for f in worker.get('functions') or [] if f.get('name') != 'openvibe-codes']
+if node and codes:
+    previous = next((f for f in worker.get('functions') or [] if f.get('name') == 'openvibe-codes'), {})
+    env = {'HOME': '/tmp', 'OPENVIBE_CODES_HOME': '/tmp/.openvibe-codes', 'PATH': '/usr/local/bin:/usr/bin:/bin'}
+    for k, v in (previous.get('env') or {}).items():
+        env.setdefault(k, v)
+    for k in ('DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GITHUB_TOKEN'):
+        env.setdefault(k, '')
+    functions.append({
+        'name': 'openvibe-codes', 'version': '1.0.0', 'class': 'code',
+        'command': [node, os.path.join(codes, 'node_modules', 'openvibe-codes', 'bin', 'openvibe-codes.js'), 'job'],
+        'artifact_dir': codes, 'env': env,
+    })
+worker['functions'] = functions
+conf['worker'] = worker
+old = os.umask(0o077)
+with open(path + '.tmp', 'w') as f:
+    json.dump(conf, f, indent=2)
+    f.write('\n')
+os.umask(old)
+os.replace(path + '.tmp', path)
+PY
+}
+
+if [ -n "${OPENVIBE_INSTALL_WORKER_CONFIG_ONLY:-}" ]; then
+	write_worker_config "$OPENVIBE_INSTALL_WORKER_CONFIG_ONLY" "${OPENVIBE_JOB_UID:?}" "${OPENVIBE_JOB_GID:?}" \
+		${OPENVIBE_NODEJS:+"$OPENVIBE_NODEJS"} ${OPENVIBE_CODES_DIR:+"$OPENVIBE_CODES_DIR"}
 	exit 0
 fi
 
@@ -274,8 +346,11 @@ $SUDO install -m 0755 "$TMP/$BIN_NAME" "$BIN_DIR/openvibe-node"
 say "installed $BIN_DIR/openvibe-node ($("$BIN_DIR/openvibe-node" version))"
 
 # ---- service account (Linux): hardware groups, no login ----
+# A worker (--worker) runs the service as root: the job sandbox's run_as and its public egress (a veth, NAT and the
+# Node's nftables table) need it, and each job still runs as the unprivileged openvibe-job user.
 SVC_USER=""
-if [ "$OS" = linux ] && [ "$SERVICE" = 1 ]; then
+if [ "$WORKER" = 1 ] && [ "$OS" != linux ]; then die "--worker is for Linux"; fi
+if [ "$OS" = linux ] && [ "$SERVICE" = 1 ] && [ "$WORKER" = 0 ]; then
 	SVC_USER=openvibe-node
 	if ! id "$SVC_USER" >/dev/null 2>&1; then
 		$SUDO useradd --system --home-dir "$STATE" --no-create-home --shell /usr/sbin/nologin "$SVC_USER" 2>/dev/null ||
@@ -349,6 +424,52 @@ EOF
 	say "wrote $CONF/config.json"
 else
 	say "keeping the existing $CONF/config.json"
+fi
+
+# ---- the job worker (--worker): the job user, the egress tools, the Codes job runner, the worker config ----
+if [ "$WORKER" = 1 ]; then
+	if ! id openvibe-job >/dev/null 2>&1; then
+		$SUDO useradd --system --no-create-home --shell /usr/sbin/nologin --user-group openvibe-job 2>/dev/null ||
+			$SUDO adduser --system --no-create-home --shell /usr/sbin/nologin --group openvibe-job
+	fi
+	JOB_UID="$(id -u openvibe-job)"
+	JOB_GID="$(id -g openvibe-job)"
+	missing=""
+	for tool in nft ip nsenter; do command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"; done
+	if [ -n "$missing" ] && command -v apt-get >/dev/null 2>&1; then
+		say "installing what the worker's network sandbox needs:$missing"
+		$SUDO apt-get install -y nftables iproute2 util-linux >/dev/null 2>&1 || say "warning: apt-get could not install nftables iproute2 util-linux"
+	fi
+	for tool in nft ip nsenter; do command -v "$tool" >/dev/null 2>&1 || say "warning: $tool is missing: jobs that need the internet are refused until it is installed"; done
+	if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" != 1 ]; then
+		say "turning on IPv4 forwarding (the worker NATs each job's own network; /etc/sysctl.d/90-openvibe-node-worker.conf)"
+		$SUDO sh -c "printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/90-openvibe-node-worker.conf"
+		$SUDO sysctl -q -p /etc/sysctl.d/90-openvibe-node-worker.conf || say "warning: could not turn IPv4 forwarding on"
+	fi
+	NODEJS=""
+	for candidate in /usr/bin/node /usr/local/bin/node; do
+		if [ -x "$candidate" ] && [ "$("$candidate" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -ge 20 ]; then NODEJS="$candidate"; break; fi
+	done
+	if [ -n "$NODEJS" ]; then
+		say "adding the OpenVibe.Codes job runner $CODES_VERSION in $CODES_DIR"
+		$SUDO mkdir -p "$CODES_DIR"
+		$SUDO "$(dirname "$NODEJS")/npm" install --prefix "$CODES_DIR" --omit=dev --no-audit --no-fund --no-save --loglevel=error \
+			"https://codeload.github.com/OpenVibers/OpenVibe.Codes/tar.gz/refs/tags/$CODES_VERSION" >/dev/null ||
+			die "could not install OpenVibe.Codes $CODES_VERSION into $CODES_DIR"
+		$SUDO chown -R root:root "$CODES_DIR"
+		$SUDO chmod -R go-w "$CODES_DIR"
+		$SUDO touch "$CONF/config.json"
+		write_worker_config "$CONF/config.json" "$JOB_UID" "$JOB_GID" "$NODEJS" "$CODES_DIR"
+	else
+		say "no Node.js 20+ installed system-wide (/usr/bin/node or /usr/local/bin/node): the worker is on, but the coding"
+		say "job runner is not. Install Node.js 22 (https://nodejs.org) and run this installer again with --worker."
+		$SUDO touch "$CONF/config.json"
+		write_worker_config "$CONF/config.json" "$JOB_UID" "$JOB_GID"
+	fi
+	say "the job worker is on: jobs run as openvibe-job in the worker's sandbox, with public egress"
+	say "add your agent keys (DEEPSEEK_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, and GITHUB_TOKEN to push branches) to"
+	say "  worker.functions[openvibe-codes].env in $CONF/config.json, and install agent CLIs system-wide"
+	say "  (sudo npm install -g @anthropic-ai/claude-code @openai/codex), then: sudo systemctl restart openvibe-node"
 fi
 
 # ---- the Adeept kit's stock server: never run it (fixed admin:123456 login on 0.0.0.0:8888, MJPEG on :5000) ----
