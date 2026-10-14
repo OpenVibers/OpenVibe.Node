@@ -79,6 +79,9 @@ class Plugin:
     version = "0.0.0"
     motion_kinds = MOTION_KINDS
     telemetry_interval_s = 0.5
+    # Seconds between attempts to set up again after setup raised (the hardware or the robot's computer was not up
+    # yet). None: a failed setup stays failed until the core restarts the plugin.
+    retry_setup_s = None
 
     runtime = None  # set by Runtime
 
@@ -156,6 +159,7 @@ class Runtime:
         self.last_heartbeat = None
         self.heartbeat_lost = False
         self.next_poll = 0.0
+        self.setup_retry_at = None
         self.closed = False
         self.stop_reasons = []  # for tests: why stop() was called, in order
 
@@ -200,6 +204,9 @@ class Runtime:
             self.heartbeat_lost = True
             self.safe_stop("heartbeat")
             self.send({"op": "event", "name": "heartbeat_lost"})
+        if not self.ready and self.setup_retry_at is not None and now >= self.setup_retry_at and not self.closed:
+            self.setup_retry_at = None
+            self._setup(retrying=True)
         if self.ready and now >= self.next_poll:
             self.next_poll = now + self.plugin.telemetry_interval_s
             try:
@@ -251,6 +258,11 @@ class Runtime:
                    "motion_kinds": sorted(self.plugin.motion_kinds)})
         if self.probe:
             return
+        self._setup()
+
+    def _setup(self, retrying=False):
+        """Set the plugin up; ready on success, else a fault (sent once, not on every retry) and, when the plugin
+        sets retry_setup_s, another attempt that long from now. A later success sends ready, which ends the fault."""
         try:
             with self.lock:
                 self.plugin.setup(self.config)
@@ -258,10 +270,15 @@ class Runtime:
             self.ready = True
             self.last_heartbeat = self.clock()
             self.send({"op": "ready"})
+            return
         except Fault as f:
-            self.send({"op": "fault", "fault_code": f.code, "message": f.message})
+            fault = {"op": "fault", "fault_code": f.code, "message": f.message}
         except Exception as e:
-            self.send({"op": "fault", "fault_code": "hardware", "message": str(e)})
+            fault = {"op": "fault", "fault_code": "hardware", "message": str(e)}
+        if not retrying:
+            self.send(fault)
+        if self.plugin.retry_setup_s:
+            self.setup_retry_at = self.clock() + float(self.plugin.retry_setup_s)
 
     def on_command(self, msg, now=None):
         cid = msg.get("id")

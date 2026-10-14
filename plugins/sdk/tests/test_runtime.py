@@ -162,6 +162,49 @@ class RuntimeTest(unittest.TestCase):
         rt.feed_line(json.dumps({"op": "command", "id": "c3", "kind": "drive"}))
         self.assertEqual(lines(out)[-1]["op"], "ack")
 
+    def test_a_failed_setup_stays_failed_without_retry_setup_s(self):
+        class Down(Recorder):
+            def setup(self, config):
+                raise Fault("unreachable", "not up yet")
+        rt, p, out, clock = make(Down())
+        self.hello(rt)
+        clock.t += 60
+        rt.tick()
+        self.assertEqual([m["op"] for m in lines(out)], ["describe", "fault"])
+        self.assertEqual(p.calls.count("describe"), 1)
+
+    def test_retry_setup_s_sets_up_again_and_ready_ends_the_fault(self):
+        class Late(Recorder):
+            retry_setup_s = 2
+            tries = 0
+
+            def setup(self, config):
+                Late.tries += 1
+                if Late.tries < 3:
+                    raise Fault("unreachable", "not up yet")
+                self.calls.append("setup")
+        rt, p, out, clock = make(Late())
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "command", "id": "c0", "kind": "drive", "value": {}}))
+        self.assertEqual(lines(out)[-1]["fault_code"], "not_ready")
+        clock.t += 1
+        rt.tick()
+        self.assertEqual(Late.tries, 1, "not before retry_setup_s")
+        clock.t += 1.5
+        rt.tick()
+        self.assertEqual(Late.tries, 2)
+        self.assertEqual([m["op"] for m in lines(out)].count("fault"), 1, "the fault is sent once, not on every retry")
+        clock.t += 2.5
+        rt.tick()
+        self.assertEqual(Late.tries, 3)
+        self.assertEqual(lines(out)[-1]["op"], "ready")
+        self.assertTrue(rt.ready)
+        rt.feed_line(json.dumps({"op": "command", "id": "c1", "kind": "drive", "value": {}}))
+        self.assertEqual(lines(out)[-1], {"op": "ack", "id": "c1"})
+        clock.t += 10
+        rt.tick()
+        self.assertEqual(Late.tries, 3, "no more attempts once ready")
+
     def test_halt_always_accepted(self):
         rt, p, out, clock = make()
         self.hello(rt)

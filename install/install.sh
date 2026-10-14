@@ -1,7 +1,7 @@
 #!/bin/sh
 # OpenVibe Node installer.
 #
-#   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|looi|none]
+#   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none]
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> [--driver …]
 #
 # Detects the OS and CPU, downloads the openvibe-node binary and the plugin bundle (checking their SHA-256), creates
@@ -16,7 +16,8 @@
 #   --network URL    pair through OpenVibe.Network at URL (the machine gets a node credential, then Bot binds it).
 #   --pairing ID     the pair_… id of that Network pairing; a code given here instead (with no --code) is the code.
 #   --name NAME      the device's name on openvibe.bot (default: the hostname).
-#   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), looi (bridge, Bluetooth), none (dry run).
+#   --driver KIND    adeept (ordinary wheels), adeept-mecanum, cozmo (bridge), looi (bridge, Bluetooth), ros2 (a ROS 2
+#                    robot through rosbridge), ros2-holonomic (mecanum or omni wheels), none (dry run).
 #                    Default: none.
 #   --no-service     install and pair, but do not install the service.
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
@@ -47,7 +48,7 @@ TAG="latest"
 
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
-	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|none] [--no-service] [--local DIR] [--version TAG]"
+	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--no-service] [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.network --pairing pair_… --code ABCD-1234"
 }
@@ -84,7 +85,7 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-case "$DRIVER" in adeept|adeept-mecanum|cozmo|looi|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo, looi or none" ;; esac
+case "$DRIVER" in adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo, looi, ros2, ros2-holonomic or none" ;; esac
 case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
 # --pairing takes the pair_… id; with no --code, anything else there is the code itself.
 case "$PAIRING" in ""|pair_*) ;; *) [ -z "$CODE" ] || die "--pairing must be a pair_… id"; CODE="$PAIRING"; PAIRING="" ;; esac
@@ -315,6 +316,15 @@ cozmo)
 	PLUGINS='[{"name": "cozmo"}]'
 	KIND=bridge
 	command -v espeak-ng >/dev/null 2>&1 || say "tip: install espeak-ng so Cozmo can speak (sudo apt install espeak-ng)"
+	;;
+ros2|ros2-holonomic)
+	# A ROS 2 robot through rosbridge (plugins/ros2/README.md): no ROS 2 libraries are needed here, and the service
+	# needs no sourced ROS environment. Topics, speeds and the rosbridge address are plugin config in config.json.
+	$SUDO "$PIP" install --quiet "$STATE/plugins/ros2"
+	HOLO=false; [ "$DRIVER" = ros2-holonomic ] && HOLO=true
+	PLUGINS="[{\"name\": \"ros2\", \"config\": {\"transport\": \"rosbridge\", \"rosbridge_url\": \"ws://127.0.0.1:9090\", \"holonomic\": $HOLO}}]"
+	say "tip: on the robot, run a rosbridge server (ros2 launch rosbridge_server rosbridge_websocket_launch.xml) and set"
+	say "     rosbridge_url, cmd_vel, max_linear and image_topic in $CONF/config.json if yours differ"
 	;;
 looi)
 	# LOOI's camera is its phone, which streams on its own (docs/hardware-looi.md): the Node publishes no video.
