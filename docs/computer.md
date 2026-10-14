@@ -75,5 +75,7 @@ your graphical session for `screen`; without one the plugin simply does not offe
 | `max_read_bytes`     | 262144 (≤ 256 KB) | the most one read or write moves |
 | `approval_timeout_s` | 120 (≤ 600)    | how long a request waits for you |
 
-`describe` reports `terminal`, `files` and `screen` with the level and folders, so Bot shows what the machine allows.
+`describe` reports `terminal`, `files` and `screen` with the level and folders, so Bot shows what the machine allows;
+telemetry carries the sensors `computer_level` (observe while a stop is latched), `computer_waiting` and
+`computer_running`.
 Every request is logged by the Node (`journalctl -u openvibe-node`), with what it would do, approved or denied.

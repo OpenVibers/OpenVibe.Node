@@ -174,7 +174,7 @@ class ComputerTest(unittest.TestCase):
         self.plugin.pending[cid] = (self.plugin.pending[cid][0], t[0] + 10, "x")
         t[0] += 11
         tele = self.plugin.poll()
-        self.assertEqual(tele["computer"]["waiting"], 0)
+        self.assertEqual((tele["sensors"]["computer_waiting"], tele["sensors"]["computer_level"]), (0, "ask"))
         r = reply(self.out, cid)
         self.assertEqual(r["fault_code"], "not_allowed")
 

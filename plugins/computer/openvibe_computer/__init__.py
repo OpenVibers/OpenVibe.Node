@@ -158,7 +158,8 @@ class Computer(Plugin):
         for cid in expired:
             self.emit_event("approval_done", id=cid, approved=False, reason="expired")
             self.fail(cid, "not_allowed", "nobody answered on the machine in time")
-        return {"computer": {"level": self.effective_level(), "waiting": waiting, "running": running}}
+        # Sensors are what the core forwards to Bot: the machines page shows the level and what waits on the machine.
+        return {"sensors": {"computer_level": self.effective_level(), "computer_waiting": waiting, "computer_running": running}}
 
     # ---- paths -----------------------------------------------------------------------------------------------------
     def _inside(self, path):
