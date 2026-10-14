@@ -57,6 +57,9 @@ Usage:
   openvibe-node stop        stop every actuator now and hold them stopped
   openvibe-node resume      release the stop
   openvibe-node plugins [--json]
+  openvibe-node approvals [--json]   what the computer plugin waits to be approved (control level "ask")
+  openvibe-node approve <ID>         let it run
+  openvibe-node deny <ID>            refuse it
   openvibe-node profile verify community.<name> [--server URL] [--key-id ID]
                     check a community robot profile against the signature Bot made when it was reviewed
   openvibe-node version
@@ -178,6 +181,14 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		err = cmdResume(g, stdout)
 	case "plugins":
 		err = cmdPlugins(g, *asJSON, stdout)
+	case "approvals":
+		err = cmdApprovals(g, *asJSON, stdout)
+	case "approve", "deny":
+		if len(positional) != 1 {
+			fmt.Fprintf(stderr, "usage: openvibe-node %s <ID>   (openvibe-node approvals lists the ids)\n", cmd)
+			return 2
+		}
+		err = cmdAnswer(g, cmd, positional[0], stdout)
 	case "profile":
 		if len(positional) != 2 || positional[0] != "verify" {
 			fmt.Fprintln(stderr, "usage: openvibe-node profile verify community.<name> [--server URL] [--key-id ID]")
@@ -593,6 +604,56 @@ func cmdResume(g *globals, stdout io.Writer) error {
 		chownLikeDir(g.paths.LatchFile(), g.paths.StateDir)
 	}
 	fmt.Fprintln(stdout, "Resumed: the local stop and any server e-stop are released. Operators can drive again.")
+	return nil
+}
+
+// cmdApprovals lists what the computer plugin holds for its owner's answer (control level "ask").
+func cmdApprovals(g *globals, asJSON bool, stdout io.Writer) error {
+	resp, err := localctl.Call(g.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdApprovals}, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("the node is not running (%v)", err)
+	}
+	if !resp.OK {
+		return errors.New(resp.Error)
+	}
+	if asJSON {
+		_, err := stdout.Write(append(resp.Data, '\n'))
+		return err
+	}
+	var list []node.Approval
+	if err := json.Unmarshal(resp.Data, &list); err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Fprintln(stdout, "Nothing waits for approval.")
+		return nil
+	}
+	for _, a := range list {
+		age := time.Since(time.UnixMilli(a.At)).Round(time.Second)
+		fmt.Fprintf(stdout, "%s  %s, %s ago: %s\n", a.ID, a.Kind, age, a.Summary)
+	}
+	fmt.Fprintln(stdout, "\nopenvibe-node approve <ID> lets one run; openvibe-node deny <ID> refuses it.")
+	return nil
+}
+
+// cmdAnswer approves or denies one waiting computer command.
+func cmdAnswer(g *globals, cmd, id string, stdout io.Writer) error {
+	c := localctl.CmdApprove
+	if cmd == "deny" {
+		c = localctl.CmdDeny
+	}
+	resp, err := localctl.Call(g.paths.SocketPath(), localctl.Request{Cmd: c, ID: strings.TrimSpace(id)}, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("the node is not running (%v)", err)
+	}
+	if !resp.OK {
+		return errors.New(resp.Error)
+	}
+	if c == localctl.CmdApprove {
+		fmt.Fprintln(stdout, "Approved: it runs now.")
+	} else {
+		fmt.Fprintln(stdout, "Denied: it does not run.")
+	}
 	return nil
 }
 

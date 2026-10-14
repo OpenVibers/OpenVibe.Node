@@ -19,13 +19,15 @@ import sys
 import threading
 import time
 
-__all__ = ["Plugin", "Fault", "Command", "Runtime", "run", "clamp", "MOTION_KINDS", "HEARTBEAT_TIMEOUT_S",
+__all__ = ["Plugin", "Fault", "Deferred", "Command", "Runtime", "run", "clamp", "MOTION_KINDS", "HEARTBEAT_TIMEOUT_S",
            "DEFAULT_DEADLINE_MS", "PROTOCOL_VERSION"]
 
 PROTOCOL_VERSION = 1
 HEARTBEAT_TIMEOUT_S = 1.0
 DEFAULT_DEADLINE_MS = 300
 MAX_DEADLINE_MS = 5000
+# Kinds that move nothing (a computer's exec, fs and screen) keep a long deadline: the plugin answers within it.
+MAX_LONG_DEADLINE_MS = 600000
 # Kinds that move something continuously and therefore stop at their deadline. A plugin may widen this set
 # (Plugin.motion_kinds) for actuators it drives by speed rather than by position.
 MOTION_KINDS = frozenset({"drive"})
@@ -40,6 +42,19 @@ class Fault(Exception):
         super().__init__(message or code)
         self.code = code
         self.message = message
+
+
+class Deferred(Exception):
+    """Raised by handle() to answer later, with Plugin.complete(cmd.id, data) or Plugin.fail(cmd.id, code, message):
+    slow work done on a thread of the plugin's own, or a command held for its owner's approval on the machine. The core
+    waits for the answer until the command's deadline_ms (computer kinds carry long ones)."""
+
+
+def _ack(cid, data=None):
+    out = {"op": "ack", "id": cid}
+    if data is not None:
+        out["data"] = data
+    return out
 
 
 class Command:
@@ -93,7 +108,8 @@ class Plugin:
         """Open the hardware. Every actuator must be stopped when this returns."""
 
     def handle(self, cmd):
-        """Execute a command. Return normally for ack, raise Fault for nack."""
+        """Execute a command. Return normally for ack (a dict returned is the ack's data: what a computer command
+        answers), raise Fault for nack, raise Deferred to answer later with complete() or fail()."""
         raise Fault("unsupported", "kind %s not supported" % cmd.kind)
 
     def stop_motion(self):
@@ -110,7 +126,24 @@ class Plugin:
     def close(self):
         """Release the hardware. stop() has already been called."""
 
+    def on_approval(self, cid, approved):
+        """The owner answered, on the machine (`openvibe-node approve|deny <id>`), an approval this plugin asked for
+        with emit_event("approval", id=…). Runs on the runtime's main thread."""
+
     # Helpers for drivers.
+    def complete(self, cid, data=None):
+        """Answer a deferred command with ack (and its data). Safe from any thread."""
+        if self.runtime is not None:
+            self.runtime.send(_ack(cid, data))
+
+    def fail(self, cid, code, message=""):
+        """Answer a deferred command with nack. Safe from any thread."""
+        if self.runtime is not None:
+            out = {"op": "nack", "id": cid, "fault_code": code}
+            if message:
+                out["message"] = str(message)[:500]
+            self.runtime.send(out)
+
     def emit_event(self, name, **fields):
         if self.runtime is not None:
             self.runtime.send(dict(op="event", name=name, **fields))
@@ -237,6 +270,12 @@ class Runtime:
             self.estopped = True
             self.local_stop_pending = False
             self.safe_stop("estop")
+        elif op == "approval":
+            try:
+                with self.lock:
+                    self.plugin.on_approval(msg.get("id"), msg.get("approved") is True)
+            except Exception as e:
+                self.plugin.log("approval handler failed: %r", e)
         elif op == "resume":
             if self.local_stop_pending:
                 self.plugin.log("resume ignored: the local stop has not reached the core yet")
@@ -288,7 +327,8 @@ class Runtime:
             dl = int(msg.get("deadline_ms") or DEFAULT_DEADLINE_MS)
         except (TypeError, ValueError):
             dl = DEFAULT_DEADLINE_MS
-        dl = max(1, min(dl, MAX_DEADLINE_MS))
+        moves = kind in GUARDED_KINDS or kind in self.plugin.motion_kinds
+        dl = max(1, min(dl, MAX_DEADLINE_MS if moves else MAX_LONG_DEADLINE_MS))
         cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"))
         if kind == "halt":
             self.safe_stop("halt")
@@ -306,10 +346,12 @@ class Runtime:
                 return
         try:
             with self.lock:
-                self.plugin.handle(cmd)
+                data = self.plugin.handle(cmd)
                 if kind in self.plugin.motion_kinds:
                     self.motion_deadline = cmd.deadline
-            self.send({"op": "ack", "id": cid})
+            self.send(_ack(cid, data))
+        except Deferred:
+            return
         except Fault as f:
             out = {"op": "nack", "id": cid, "fault_code": f.code}
             if f.message:

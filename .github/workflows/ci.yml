@@ -91,18 +91,20 @@ jobs:
       - run: python -m pytest -q plugins/cozmo/tests
       - run: python -m pytest -q plugins/relay/tests
       - run: python -m pytest -q plugins/ros2/tests
+      - run: python -m pytest -q plugins/computer/tests
       - name: packages install
-        run: pip install ./plugins/sdk ./plugins/dryrun ./plugins/adeept_adr036 ./plugins/cozmo ./plugins/relay ./plugins/ros2
+        run: pip install ./plugins/sdk ./plugins/dryrun ./plugins/adeept_adr036 ./plugins/cozmo ./plugins/relay ./plugins/ros2 ./plugins/computer
 
   shell:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck -s sh install/install.sh scripts/dist.sh scripts/test-install-stock-server.sh scripts/test-install-pair-args.sh scripts/test-install-worker-config.sh
+      - run: shellcheck -s sh install/install.sh scripts/dist.sh scripts/test-install-stock-server.sh scripts/test-install-pair-args.sh scripts/test-install-worker-config.sh scripts/test-install-computer-config.sh
       - run: sh scripts/test-install-stock-server.sh
       - run: sh scripts/test-install-pair-args.sh
       - run: sh scripts/test-install-worker-config.sh
+      - run: sh scripts/test-install-computer-config.sh
 
   esp32-conformance:
     name: esp32 protocol conformance (desktop)
