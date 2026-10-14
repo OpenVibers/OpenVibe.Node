@@ -44,7 +44,7 @@ openvibe-node approve <ID>       # let it run
 openvibe-node deny <ID>          # refuse it
 ```
 
-At most 8 requests wait at once. The panel on openvibe.bot sees `approval` and `approval_done` events, so it can say
+When the Node runs in your graphical session, a waiting request also shows a desktop notification (`notify-send` on Linux, `osascript` on macOS; config `notify: false` turns it off). At most 8 requests wait at once. The panel on openvibe.bot sees `approval` and `approval_done` events, so it can say
 that a request is waiting on the machine.
 
 **Kill switch:** `openvibe-node stop` (and an owner's e-stop) drops the plugin to `observe`: what runs is killed, what
@@ -74,6 +74,7 @@ your graphical session for `screen`; without one the plugin simply does not offe
 | `max_output_bytes`   | 65536 (≤ 192 KB) | stdout and stderr are each cut there |
 | `max_read_bytes`     | 262144 (≤ 256 KB) | the most one read or write moves |
 | `approval_timeout_s` | 120 (≤ 600)    | how long a request waits for you |
+| `notify`             | `true`         | a desktop notification when a request waits (graphical session only) |
 
 `describe` reports `terminal`, `files` and `screen` with the level and folders, so Bot shows what the machine allows;
 telemetry carries the sensors `computer_level` (observe while a stop is latched), `computer_waiting` and

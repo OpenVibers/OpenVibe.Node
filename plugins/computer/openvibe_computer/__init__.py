@@ -60,7 +60,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.1.0"
+    version = "0.2.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -76,6 +76,7 @@ class Computer(Plugin):
         self.max_output = 64 * 1024
         self.max_read = 256 * 1024
         self.allow_exec = True
+        self.notify = True
         self.approval_timeout_s = 120
         self.pending = {}  # command id -> (run, expires_at, summary)
         self.procs = set()
@@ -99,6 +100,7 @@ class Computer(Plugin):
         self.max_read = _int(config.get("max_read_bytes"), "max_read_bytes", 1024, MAX_READ_CAP, 256 * 1024)
         self.approval_timeout_s = _int(config.get("approval_timeout_s"), "approval_timeout_s", 10, 600, 120)
         self.allow_exec = config.get("allow_exec", True) is not False
+        self.notify = config.get("notify", True) is not False
 
     def describe(self, config):
         try:
@@ -220,10 +222,30 @@ class Computer(Plugin):
                     raise Fault("not_ready", "%d requests already wait for approval on the machine" % MAX_WAITING)
                 self.pending[cmd.id] = ((run, threaded), self.clock() + self.approval_timeout_s, summary)
             self.emit_event("approval", id=cmd.id, kind=cmd.kind, summary=summary, expires_s=self.approval_timeout_s)
+            self._notify(cmd.id, summary)
             self.log("waiting for approval %s: %s", cmd.id, summary)
             raise Deferred()
         self.log("%s %s: %s", cmd.kind, cmd.id, summary)
         return self._start(cmd, run) if threaded else run()
+
+    def _notify(self, cid, summary):
+        """A desktop notification that a request waits (config `notify`, on by default), when the Node runs in a
+        graphical session: notify-send on Linux, osascript on macOS. Best effort: it never blocks or fails a command."""
+        if not self.notify:
+            return
+        title = "OpenVibe: your agent asks"
+        body = "%s\nopenvibe-node approve %s  (or deny %s)" % (summary[:200], cid, cid)
+        if self.platform.startswith("linux") and (self.env.get("DISPLAY") or self.env.get("WAYLAND_DISPLAY")) and self.which("notify-send"):
+            argv = ["notify-send", "--app-name=OpenVibe Node", title, body]
+        elif self.platform == "darwin" and self.which("osascript"):
+            quote = lambda s: '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+            argv = ["osascript", "-e", "display notification %s with title %s" % (quote(body), quote(title))]
+        else:
+            return
+        try:
+            self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
 
     def on_approval(self, cid, approved):
         with self.mu:

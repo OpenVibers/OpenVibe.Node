@@ -166,6 +166,25 @@ class ComputerTest(unittest.TestCase):
         self.assertEqual((r["fault_code"], r["message"]), ("not_allowed", "the owner denied it on the machine"))
         self.assertFalse(os.path.exists(os.path.join(self.dir, "denied.txt")))
 
+    def test_a_waiting_request_notifies_the_desktop(self):
+        self.boot("ask")
+        calls = []
+        real = self.plugin.popen
+        self.plugin.popen = lambda argv, **kw: calls.append(argv) if argv[0] in ("notify-send", "osascript") else real(argv, **kw)
+        self.plugin.which = lambda name: "/usr/bin/" + name
+        self.plugin.env = {"DISPLAY": ":0"}
+        cid = self.cmd("exec", {"argv": ["echo", "hi"]})
+        self.out.wait_for(lambda m: m.get("name") == "approval")
+        self.assertEqual(calls[0][:3], ["notify-send", "--app-name=OpenVibe Node", "OpenVibe: your agent asks"])
+        self.assertIn("openvibe-node approve %s" % cid, calls[0][3])
+        self.plugin.env = {}
+        self.cmd("exec", {"argv": ["echo", "again"]})
+        self.assertEqual(len(calls), 1, "no graphical session: no notification")
+        self.plugin.notify = False
+        self.plugin.env = {"DISPLAY": ":0"}
+        self.cmd("exec", {"argv": ["echo", "quiet"]})
+        self.assertEqual(len(calls), 1, "notify off")
+
     def test_unanswered_requests_expire(self):
         self.boot("ask", approval_timeout_s=10)
         t = [1000.0]
