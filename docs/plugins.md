@@ -5,7 +5,7 @@ object per line, UTF-8). Its stderr goes to the Node's log. The core never links
 in any language; the robot drivers are Python 3 because the kit libraries and PyCozmo are.
 
 Bundled plugins: [`dryrun`](../plugins/dryrun), [`adeept_adr036`](../plugins/adeept_adr036/README.md),
-[`cozmo`](../plugins/cozmo/README.md), [`relay`](../plugins/relay). Python plugins use the runtime in [`plugins/sdk`](../plugins/sdk) (package
+[`cozmo`](../plugins/cozmo/README.md), [`relay`](../plugins/relay), [`ros2`](../plugins/ros2/README.md). Python plugins use the runtime in [`plugins/sdk`](../plugins/sdk) (package
 `openvibe_plugin`), which implements everything in "Safety rules" below, so a driver only says how to move its
 hardware.
 
@@ -95,6 +95,10 @@ Only `openvibe-node resume` on that machine releases it: the owner's remote clea
 releases a latch. The Python runtime refuses motion from the moment it is called and ignores a `resume` that crosses it
 on the wire. `openvibe-node stop` sets the same latch from a terminal.
 
+A plugin whose setup can fail only because something is not up yet (the robot's computer still booting) sets
+`retry_setup_s` (Python): the runtime sends the fault once, sets up again that often, and sends `ready` when it works,
+which ends the fault. Without it, a failed setup stays failed until the core restarts the plugin.
+
 `stop` must be idempotent and safe at any time, including before setup. Handlers must not block: slow work (speech
 synthesis, file I/O) goes on a thread. Nothing but protocol lines may go to stdout; the Python runtime enforces this by
 pointing file descriptor 1 at stderr and keeping a private copy for the protocol, because hardware libraries print
@@ -150,6 +154,17 @@ The computer running the Node joins Cozmo's Wi-Fi on one interface and the inter
 camera frames (320 × 240) as JPEG files. A cliff or pick-up stops the wheels inside the event callback and emits an
 event; while at a cliff only backing away is allowed, while picked up nothing drives. Firmware other than PyCozmo's
 supported version (2381, `allow_firmware`) is reported as `firmware_unsupported`.
+
+### `ros2` — ROS 2 robots (rclpy or rosbridge)
+
+`drive` → `geometry_msgs/msg/Twist` on `cmd_vel` (`throttle`/`steer`, or `x`/`y`/`rotation` with `holonomic`), scaled by
+`max_linear` m/s and `max_angular` rad/s, and a zero Twist at every stop; `say` → `std_msgs/msg/String` on `say_topic`.
+Telemetry from `sensor_msgs/msg/BatteryState`, `sensor_msgs/msg/Range` or the front arc of a `sensor_msgs/msg/LaserScan`
+(`distance_cm`) and `nav_msgs/msg/Odometry`; camera frames from a JPEG `sensor_msgs/msg/CompressedImage`. It reaches ROS 2
+as a node of its own (`rclpy`, in a sourced ROS 2 environment) or through a rosbridge WebSocket server (no ROS 2
+libraries where the Node runs; the installer's `--driver ros2` sets this up). When ROS is not up yet, or the link drops,
+it reports `ros_unreachable` and tries again every `retry_s` seconds (`retry_setup_s` in the Python runtime). Topics,
+speeds and setup: [plugins/ros2/README.md](../plugins/ros2/README.md).
 
 ### `relay` — existing OpenVibe.Live hardware clients
 

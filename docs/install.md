@@ -13,10 +13,10 @@ ports, works behind any home router), and a local kill switch stops everything i
    curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_01J8Z4M2Q0R7T9YV3K6N8P1W2X --code ABCD-1234 --driver adeept
    ```
 
-   The shape is `--robot rob_… --code CODE [--driver adeept|adeept-mecanum|cozmo|looi|none]`. `--robot` is the robot's
+   The shape is `--robot rob_… --code CODE [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none]`. `--robot` is the robot's
    `rob_…` id and `--code` the pairing code (both from openvibe.bot; the code may also be the first argument).
-   `--driver` names the plugin: `adeept` (Adeept 4WD Smart Car, ordinary wheels), `adeept-mecanum`, `cozmo`, or
-   `none` (the default: the dry-run plugin with a test-pattern camera, for trying the Node on a laptop). `--name NAME`
+   `--driver` names the plugin: `adeept` (Adeept 4WD Smart Car, ordinary wheels), `adeept-mecanum`, `cozmo`, `ros2` (a
+   ROS 2 robot through rosbridge, [plugins/ros2/README.md](../plugins/ros2/README.md)), `ros2-holonomic`, or `none` (the default: the dry-run plugin with a test-pattern camera, for trying the Node on a laptop). `--name NAME`
    names the device on openvibe.bot (default: the hostname).
 3. Confirm the new device on openvibe.bot.
 
