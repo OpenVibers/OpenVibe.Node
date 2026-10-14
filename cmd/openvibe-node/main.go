@@ -380,7 +380,11 @@ func cmdPairNetwork(g *globals, a pairArgs, stdout io.Writer) error {
 		if err := saveCredentials(g, bound); err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "Bound as %s (robot %s).\n", bound.DeviceID, bound.RobotID)
+		if bound.RobotID != "" {
+			fmt.Fprintf(stdout, "Bound as %s (robot %s).\n", bound.DeviceID, bound.RobotID)
+		} else {
+			fmt.Fprintf(stdout, "Bound as %s (a machine for your jobs, no robot).\n", bound.DeviceID)
+		}
 	}
 	fmt.Fprintln(stdout, "Start it: `openvibe-node run` or `sudo openvibe-node install`.")
 	return finishPair(g, a, cfg, noConfig, stdout)

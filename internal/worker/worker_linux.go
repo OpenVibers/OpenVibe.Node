@@ -77,6 +77,9 @@ func isolate(cmd *exec.Cmd, cfg config.WorkerConfig, p plan) (*sandbox, error) {
 	if art != nil {
 		spec.Artifact = p.fn.Artifact()
 	}
+	if p.egress != "" {
+		spec.Resolvers = cfg.DNS
+	}
 	for _, b := range binds {
 		spec.Binds = append(spec.Binds, bindSpec{Path: b.path, Dev: b.dev})
 	}

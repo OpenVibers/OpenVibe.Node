@@ -25,6 +25,7 @@ assert w['caps']['max_wall_ms'] == 3600000 and w['caps']['max_mem_bytes'] == 4 <
 assert (f['name'], f['version'], f['class'], f['artifact_dir']) == ('openvibe-codes', '1.0.0', 'code', '/opt/openvibe-codes')
 assert f['command'] == ['/usr/bin/node', '/opt/openvibe-codes/node_modules/openvibe-codes/bin/openvibe-codes.js', 'job']
 assert f['env']['DEEPSEEK_API_KEY'] == '' and f['env']['HOME'] == '/tmp'
+assert w['dns'] == ['1.1.1.1', '9.9.9.9'], 'a coding job needs names resolved'
 PY
 # The owner adds a key and changes a cap; running the installer again keeps both and declares the runner once.
 python3 - "$conf" <<'PY'

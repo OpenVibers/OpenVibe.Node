@@ -45,6 +45,7 @@ summary, the changed files and the patch; it never pushes to the branch it start
   "run_as": {"uid": 2001, "gid": 2001},
   "allow_same_user": false,
   "egress": "none",
+  "dns": [],
   "media": {
     "enabled": false,
     "endpoint": "",
@@ -306,9 +307,11 @@ How `public` and `openvibe-only` are enforced (`internal/worker/egress_linux.go`
   `/usr/sbin`, `/sbin`, `/usr/bin` or `/bin`, IPv4 forwarding on (`sysctl net.ipv4.ip_forward=1`: the Node does not
   turn it on, which would make the host a router for every interface; the owner does) and an IPv4 default route.
   Without one of them the probe fails and so does every job.
-- **No DNS.** The Node runs no resolver for jobs, and the host's (`127.0.0.53` on most systems) is out of a job's
-  reach. A job resolves names only through a resolver its policy lets it reach by address (any public one under
-  `public`; one listed in `egress_allow` under `openvibe-only`), or connects by address.
+- **DNS.** The Node runs no resolver for jobs, and the host's (`127.0.0.53` on most systems) is out of a job's
+  reach. `worker.dns` (up to three IPv4 addresses, empty by default) becomes the `/etc/resolv.conf` of a job that runs
+  with a network: public addresses only, and under `openvibe-only` only inside `egress_allow`, so it names nothing a
+  job could not reach anyway. Without it a job resolves nothing and connects by address. `install.sh --worker` sets
+  `["1.1.1.1", "9.9.9.9"]` (Cloudflare and Quad9) unless the config already names others.
 - **`openvibe-only` is configured, not guessed.** No authoritative list of the OpenVibe network's ranges exists in
   this repository or OpenVibe.Contracts, so `egress_allow` must name them; without it the config does not load.
 

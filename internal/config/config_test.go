@@ -192,3 +192,30 @@ func TestWorkerMedia(t *testing.T) {
 		t.Fatal("a token written in the config file loaded")
 	}
 }
+
+// TestWorkerDNS: worker.dns takes up to three public IPv4 resolvers, only with a policy that gives jobs a network, and
+// under openvibe-only only inside egress_allow.
+func TestWorkerDNS(t *testing.T) {
+	ok := []WorkerConfig{{Egress: EgressPublic, DNS: []string{"1.1.1.1", "9.9.9.9"}},
+		{Egress: EgressOpenVibeOnly, EgressAllow: []string{"9.9.9.0/24"}, DNS: []string{"9.9.9.9"}}}
+	for _, w := range ok {
+		c := Default()
+		c.Worker = w
+		if err := c.Validate(); err != nil {
+			t.Fatalf("%+v: %v", w, err)
+		}
+	}
+	bad := []WorkerConfig{{DNS: []string{"1.1.1.1"}}, {Egress: EgressNone, DNS: []string{"1.1.1.1"}},
+		{Egress: EgressPublic, DNS: []string{"1.1.1.1", "1.0.0.1", "9.9.9.9", "8.8.8.8"}},
+		{Egress: EgressPublic, DNS: []string{"127.0.0.53"}}, {Egress: EgressPublic, DNS: []string{"192.168.1.1"}},
+		{Egress: EgressPublic, DNS: []string{"100.64.0.1"}}, {Egress: EgressPublic, DNS: []string{"169.254.169.253"}},
+		{Egress: EgressPublic, DNS: []string{"2606:4700:4700::1111"}}, {Egress: EgressPublic, DNS: []string{"dns.google"}},
+		{Egress: EgressOpenVibeOnly, EgressAllow: []string{"9.9.9.0/24"}, DNS: []string{"1.1.1.1"}}}
+	for _, w := range bad {
+		c := Default()
+		c.Worker = w
+		if err := c.Validate(); err == nil {
+			t.Fatalf("%+v was accepted", w)
+		}
+	}
+}
