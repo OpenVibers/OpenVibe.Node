@@ -1,8 +1,8 @@
 # OpenVibe Node
 
 One service for your computers, servers, Raspberry Pis, phones and robots: pair it once with OpenVibe and products
-like **OpenVibe.Bot** (robots: drive, cameras, sensors, with safety) and, later, **OpenVibe.Actor** (computer control
-for AI agents) can use the device. It connects out, needs no open ports, and keeps a local kill switch.
+like **OpenVibe.Bot** (robots: drive, cameras, sensors, with safety) and **OpenVibe.Actor** (computer control for AI
+agents, at the level you set on the machine) can use the device. It connects out, needs no open ports, and keeps a local kill switch.
 
 ```sh
 curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept
@@ -17,6 +17,7 @@ install, Windows and configuration: [docs/install.md](docs/install.md).
 openvibe-node status     # link, plugins, video, battery, stop latch
 openvibe-node stop       # kill switch: stop every motor now and keep it stopped
 openvibe-node resume
+openvibe-node approvals  # the computer plugin at level ask: what waits; approve <id> / deny <id>
 ```
 
 ## What is in here
@@ -40,6 +41,10 @@ signature against the key Bot publishes (`--key-id` pins one) and names the plug
 on a community profile runs the same check and warns when it fails. Install a community plugin only when it passes
 ([docs/plugins.md](docs/plugins.md#community-plugins)).
 
+**Your computer for your agents:** `--computer observe|ask|trusted|full` adds the `computer` plugin (terminal, files
+and screen for OpenVibe.Actor), running as your own account, at the level you set on the machine; `ask` waits for
+`openvibe-node approve <id>` ([docs/computer.md](docs/computer.md)).
+
 **A machine that runs your jobs:** add it on openvibe.bot/machines, which prints the same installer with `--worker`: the
 job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.Codes job runner lets you start a coding
 task on openvibe.codes/run from any browser and have this machine do it ([docs/worker.md](docs/worker.md)).
@@ -53,7 +58,7 @@ Decisions: [ADR-043](docs/ADR-043-bot-devices-and-control.md).
 ```sh
 go vet ./... && go test -race ./...                    # the end-to-end tests run the Python dry-run plugin
 pip install pytest pillow numpy
-for p in sdk dryrun adeept_adr036 cozmo relay; do python3 -m pytest -q plugins/$p/tests; done
+for p in sdk dryrun adeept_adr036 cozmo relay ros2 computer; do python3 -m pytest -q plugins/$p/tests; done
 scripts/dist.sh v0.0.0-dev                             # every binary, the plugin bundle and SHA256SUMS in dist/
 ```
 

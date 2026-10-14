@@ -17,6 +17,9 @@ var capabilityFor = map[string]string{
 	protocol.KindDisplay:  "display",
 	protocol.KindButton:   "button",
 	protocol.KindPoint:    "point",
+	protocol.KindExec:     "terminal",
+	protocol.KindFS:       "files",
+	protocol.KindScreen:   "screen",
 }
 
 // Manager supervises every configured plugin.

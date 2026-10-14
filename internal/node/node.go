@@ -86,6 +86,20 @@ type Node struct {
 	configured bool
 
 	robotIDs []string // the robots this device serves, from the connection's hello
+
+	// approvals waiting on the machine (the computer plugin at level "ask"), by command id: what
+	// `openvibe-node approvals` lists and `approve`/`deny` answer.
+	approvals map[string]Approval
+}
+
+// Approval is one computer command waiting for its owner's answer on the machine.
+type Approval struct {
+	ID       string `json:"id"`
+	Plugin   string `json:"plugin"`
+	Kind     string `json:"kind,omitempty"`
+	Summary  string `json:"summary,omitempty"`
+	At       int64  `json:"at"`
+	ExpiresS int64  `json:"expires_s,omitempty"`
 }
 
 // New builds a Node. Run starts it.
@@ -101,7 +115,7 @@ func New(opt Options) (*Node, error) {
 		opt.Log.Error("latch", "err", err)
 	}
 	n := &Node{opt: opt, log: opt.Log, latch: latch, dedup: safety.NewDedup(4096, 10*time.Minute),
-		jobs: newJobs(nil), telemetry: map[string]map[string]any{}, telemMS: 500}
+		jobs: newJobs(nil), telemetry: map[string]map[string]any{}, telemMS: 500, approvals: map[string]Approval{}}
 	n.limits = safety.Merge(protocol.Limits{}, opt.Config.Limits.MaxSpeed, opt.Config.Limits.MaxTurn, opt.Config.Limits.MaxCommandMS)
 
 	var specs []plugins.Spec
@@ -393,6 +407,10 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		nack(protocol.FaultNotAllowed, c.Kind+" is not in this robot's allowed_commands")
 		return
 	}
+	if protocol.ComputerKinds[c.Kind] {
+		n.computer(c, entry, sentMS, received, nack)
+		return
+	}
 	if protocol.GuardedKinds[c.Kind] {
 		st := n.latch.State()
 		if st.Local {
@@ -445,6 +463,64 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		} else {
 			msg = protocol.Nack{ID: c.ID, FaultCode: r.FaultCode, Message: r.Message}
 		}
+		n.dedup.Complete(entry, msg)
+		n.send(msg)
+	}()
+}
+
+// computer runs one exec, fs or screen command: no clamping, a long reply window (the server's deadline, at most
+// MaxComputerMS, else DefaultComputerMS), refused while the local stop or an e-stop is latched when it would change the
+// machine, and answered with the plugin's data. The plugin applies its owner's control level.
+func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, received time.Time, nack func(code, msg string)) {
+	if len(c.Value) > protocol.MaxComputerValue {
+		nack(protocol.FaultBadValue, fmt.Sprintf("the value is larger than %d KB", protocol.MaxComputerValue/1024))
+		return
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(c.Value, &obj) != nil || obj == nil {
+		nack(protocol.FaultBadValue, "value must be a JSON object")
+		return
+	}
+	if protocol.ComputerActs(c.Kind, c.Value) {
+		st := n.latch.State()
+		if st.Local {
+			nack(protocol.FaultLocalStop, "stopped on the machine with `openvibe-node stop`: observe only")
+			return
+		}
+		if st.Remote {
+			nack(protocol.FaultEstopped, st.RemoteReason)
+			return
+		}
+	}
+	window := int64(protocol.DefaultComputerMS)
+	if c.DeadlineMS > 0 {
+		window = c.DeadlineMS - n.serverNow(sentMS, received)
+		if window <= 0 {
+			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived", -window))
+			return
+		}
+		window = min(window, int64(protocol.MaxComputerMS))
+	}
+	p := n.mgr.Route(c.Kind, c.Target, "")
+	if p == nil {
+		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind+" (the computer plugin is off)")
+		return
+	}
+	wait := p.Begin(n.ctx, c.ID, c.Kind, c.Value, int(window))
+	go func() {
+		r := wait()
+		var msg protocol.Message
+		switch {
+		case r.OK && len(r.Data) > protocol.MaxAckData:
+			msg = protocol.Nack{ID: c.ID, FaultCode: protocol.FaultBadValue, Message: fmt.Sprintf("the answer is larger than %d KB", protocol.MaxAckData/1024)}
+		case r.OK:
+			msg = protocol.AckData{ID: c.ID, LatencyMS: time.Since(received).Milliseconds(), Data: r.Data}
+		default:
+			msg = protocol.Nack{ID: c.ID, FaultCode: r.FaultCode, Message: r.Message}
+		}
+		n.mu.Lock()
+		delete(n.approvals, c.ID)
+		n.mu.Unlock()
 		n.dedup.Complete(entry, msg)
 		n.send(msg)
 	}()
@@ -566,6 +642,7 @@ func (n *Node) output(o plugins.Output) {
 			fields = nil
 		}
 		n.log.Info("plugin event", "plugin", o.Plugin, "event", name)
+		n.trackApproval(o.Plugin, name, o.Data, o.At)
 		n.mu.Lock()
 		n.events = append(n.events, protocol.Event{Name: name, Driver: o.Plugin, TS: o.At.UnixMilli(), Fields: fields})
 		n.mu.Unlock()
@@ -873,8 +950,68 @@ func (n *Node) sendStatus() {
 	n.send(s)
 }
 
+// trackApproval keeps the list `openvibe-node approvals` shows from the computer plugin's approval events.
+func (n *Node) trackApproval(plugin, name string, data map[string]any, at time.Time) {
+	id, _ := data["id"].(string)
+	if id == "" || (name != "approval" && name != "approval_done") {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if name == "approval_done" {
+		delete(n.approvals, id)
+		return
+	}
+	if len(n.approvals) >= 64 {
+		return
+	}
+	a := Approval{ID: id, Plugin: plugin, At: at.UnixMilli()}
+	a.Kind, _ = data["kind"].(string)
+	a.Summary, _ = data["summary"].(string)
+	if e, ok := data["expires_s"].(float64); ok {
+		a.ExpiresS = int64(e)
+	}
+	n.approvals[id] = a
+}
+
+// Approvals lists the computer commands waiting for an answer on the machine, oldest first.
+func (n *Node) Approvals() []Approval {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]Approval, 0, len(n.approvals))
+	for _, a := range n.approvals {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].At < out[j].At || (out[i].At == out[j].At && out[i].ID < out[j].ID) })
+	return out
+}
+
 func (n *Node) control(r localctl.Request) localctl.Response {
 	switch r.Cmd {
+	case localctl.CmdApprovals:
+		b, err := json.Marshal(n.Approvals())
+		if err != nil {
+			return localctl.Response{Error: err.Error()}
+		}
+		return localctl.Response{OK: true, Data: b}
+	case localctl.CmdApprove, localctl.CmdDeny:
+		n.mu.Lock()
+		a, ok := n.approvals[r.ID]
+		if ok {
+			delete(n.approvals, r.ID)
+		}
+		n.mu.Unlock()
+		if !ok {
+			return localctl.Response{Error: fmt.Sprintf("nothing with the id %q waits for approval", strings.TrimSpace(r.ID))}
+		}
+		p := n.mgr.Get(a.Plugin)
+		if p == nil {
+			return localctl.Response{Error: "the plugin that asked is gone"}
+		}
+		if err := p.Answer(a.ID, r.Cmd == localctl.CmdApprove); err != nil {
+			return localctl.Response{Error: err.Error()}
+		}
+		return localctl.Response{OK: true}
 	case localctl.CmdStop:
 		n.mgr.EstopAll() // at once, then persist
 		if _, err := n.latch.SetLocalWith("openvibe-node stop"); err != nil {

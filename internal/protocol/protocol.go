@@ -155,10 +155,45 @@ const (
 	KindHalt     = "halt"
 	KindButton   = "button"
 	KindPoint    = "point"
+
+	// The machine's own computer (the `computer` plugin, docs/plugins.md): run a program, use a file, capture the
+	// screen. Their ack carries the answer in data; the owner's control level on the machine decides what runs.
+	KindExec   = "exec"
+	KindFS     = "fs"
+	KindScreen = "screen"
 )
 
 // Kinds lists every command kind the Node understands.
-var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint}
+var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen}
+
+// ComputerKinds move nothing: they carry long deadlines (DefaultComputerMS, at most MaxComputerMS) and no clamping.
+var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true}
+
+const (
+	// DefaultComputerMS is a computer command's reply window when the server sends no deadline; MaxComputerMS caps
+	// one (an approval on the machine plus the program's own run).
+	DefaultComputerMS = 60_000
+	MaxComputerMS     = 600_000
+	// MaxComputerValue caps a computer command's value (a file write's content); MaxAckData an ack's data.
+	MaxComputerValue = 384 * 1024
+	MaxAckData       = 512 * 1024
+)
+
+// ComputerActs reports whether a computer command changes the machine (runs a program, writes a file): those are
+// refused while the local stop or an e-stop is latched. Capturing the screen and reading files are not.
+func ComputerActs(kind string, value json.RawMessage) bool {
+	switch kind {
+	case KindExec:
+		return true
+	case KindFS:
+		var v struct {
+			Op string `json:"op"`
+		}
+		_ = json.Unmarshal(value, &v)
+		return v.Op != "list" && v.Op != "stat" && v.Op != "read"
+	}
+	return false
+}
 
 // GuardedKinds move something and are refused while an e-stop or the local kill switch is latched.
 var GuardedKinds = map[string]bool{KindDrive: true, KindActuator: true, KindPTZ: true, KindButton: true, KindPoint: true}
@@ -527,6 +562,14 @@ type Ack struct {
 	LatencyMS int64  `json:"latency_ms,omitempty"`
 }
 
+// AckData is the ack of a computer command: an ack frame that also carries the command's answer (exec output, a file,
+// a screen), at most MaxAckData bytes of JSON.
+type AckData struct {
+	ID        string          `json:"id"`
+	LatencyMS int64           `json:"latency_ms,omitempty"`
+	Data      json.RawMessage `json:"data,omitempty"`
+}
+
 type Nack struct {
 	ID        string `json:"id"`
 	FaultCode string `json:"fault_code"`
@@ -566,6 +609,7 @@ func (Error) MessageType() string        { return TypeError }
 func (Status) MessageType() string       { return TypeStatus }
 func (Telemetry) MessageType() string    { return TypeTelemetry }
 func (Ack) MessageType() string          { return TypeAck }
+func (AckData) MessageType() string      { return TypeAck }
 func (Nack) MessageType() string         { return TypeNack }
 func (Heartbeat) MessageType() string    { return TypeHeartbeat }
 func (Reauth) MessageType() string       { return TypeReauth }
@@ -587,7 +631,7 @@ var registry = map[string]func() Message{
 	TypeError:        func() Message { return &Error{} },
 	TypeStatus:       func() Message { return &Status{} },
 	TypeTelemetry:    func() Message { return &Telemetry{} },
-	TypeAck:          func() Message { return &Ack{} },
+	TypeAck:          func() Message { return &AckData{} }, // an Ack unless it carries data
 	TypeNack:         func() Message { return &Nack{} },
 	TypeHeartbeat:    func() Message { return &Heartbeat{} },
 	TypeReauth:       func() Message { return &Reauth{} },
@@ -653,6 +697,11 @@ func Decode(data []byte) (Frame, error) {
 
 func derefMessage(m Message) Message {
 	switch v := m.(type) {
+	case *AckData:
+		if len(v.Data) == 0 {
+			return Ack{ID: v.ID, LatencyMS: v.LatencyMS}
+		}
+		return *v
 	case *Hello:
 		return *v
 	case *Config:

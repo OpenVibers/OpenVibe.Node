@@ -9,7 +9,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from openvibe_plugin import Fault, Plugin, Runtime  # noqa: E402
+from openvibe_plugin import Deferred, Fault, Plugin, Runtime  # noqa: E402
 
 
 class FakeClock:
@@ -258,6 +258,56 @@ class ProcessTest(unittest.TestCase):
             json.loads(line)
         self.assertIn("library noise on stdout", err)
         self.assertIn("C noise", err)
+
+
+class Later(Plugin):
+    """Answers `ask` later (with data) and `look` at once with data; remembers approvals."""
+    driver = "later"
+    motion_kinds = frozenset()
+
+    def __init__(self):
+        self.held = []
+        self.answers = []
+
+    def handle(self, cmd):
+        if cmd.kind == "look":
+            return {"seen": cmd.value.get("what"), "deadline_ms": cmd.deadline_ms}
+        if cmd.kind == "ask":
+            self.held.append(cmd.id)
+            raise Deferred()
+        raise Fault("unsupported")
+
+    def on_approval(self, cid, approved):
+        self.answers.append((cid, approved))
+        if approved:
+            self.complete(cid, {"done": True})
+        else:
+            self.fail(cid, "not_allowed", "denied")
+
+
+class DeferredTest(unittest.TestCase):
+    def test_data_deferred_and_approval(self):
+        rt, p, out, clock = make(Later())
+        rt.dispatch({"op": "hello", "config": {}})
+        rt.dispatch({"op": "command", "id": "a", "kind": "look", "value": {"what": "screen"}, "deadline_ms": 60000})
+        ack = lines(out)[-1]
+        self.assertEqual(ack, {"op": "ack", "id": "a", "data": {"seen": "screen", "deadline_ms": 60000}},
+                         "a kind that moves nothing keeps its long deadline")
+        rt.dispatch({"op": "command", "id": "b", "kind": "ask", "value": {}})
+        self.assertEqual(p.held, ["b"])
+        self.assertFalse([m for m in lines(out) if m.get("id") == "b"], "no answer until the plugin gives one")
+        rt.dispatch({"op": "approval", "id": "b", "approved": True})
+        self.assertEqual(lines(out)[-1], {"op": "ack", "id": "b", "data": {"done": True}})
+        rt.dispatch({"op": "command", "id": "c", "kind": "ask", "value": {}})
+        rt.dispatch({"op": "approval", "id": "c", "approved": "yes"})
+        self.assertEqual(p.answers[-1], ("c", False), "only a JSON true approves")
+        self.assertEqual(lines(out)[-1], {"op": "nack", "id": "c", "fault_code": "not_allowed", "message": "denied"})
+
+    def test_motion_kinds_keep_the_short_cap(self):
+        rt, p, out, clock = make()
+        rt.dispatch({"op": "hello", "config": {}})
+        rt.dispatch({"op": "command", "id": "d", "kind": "drive", "value": {}, "deadline_ms": 60000})
+        self.assertEqual(rt.motion_deadline, clock() + 5.0)
 
 
 if __name__ == "__main__":

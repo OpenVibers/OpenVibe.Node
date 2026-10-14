@@ -234,23 +234,20 @@ Test it with `openvibe_plugin.Runtime(plugin, infile, outfile, clock)` and a fak
 
 ## Where OpenVibe.Actor attaches (later)
 
-Actor's computer control (terminal, files, screen, keyboard and mouse, browser, the machine's own coding agents) will
-be one more plugin, `computer`, on the same protocol; the core does not change:
+### `computer` — the machine's terminal, files and screen ([computer.md](computer.md))
 
-- **Capabilities** it will describe: `terminal`, `files`, `screen`, `input`, `browser`, `agents`, each with what the
-  machine allows (for example `{"screen": {"displays": 2}, "agents": {"names": ["claude-code"]}}`).
-- **Command kinds** it will add: `exec`, `fs`, `screen`, `input`, `browser`, `agent`. The core routes by capability
-  key, so new kinds need only a line in `protocol.Kinds` and `plugins.capabilityFor`, plus clamping rules in
-  `safety.Limits.Clamp` if they carry magnitudes. None of them are motion kinds, so deadlines do not apply; they are
-  not in `GuardedKinds`, so an e-stop does not block them unless Actor asks for that.
-- **Control levels** (Observe, Ask, Trusted, Full control) are enforced twice: by Bot/Actor when it issues a command
-  (the operator's `role`), and in the plugin, which reads the owner's local level from its `config` and answers
-  `nack not_allowed` for anything above it. `Ask` makes the plugin hold the command and raise an `event` `approval`
-  that the local UI answers; the command's reply waits (the core's reply timeout is max(deadline, 1 s), so Actor
-  commands will carry a long `deadline_ms` and the cap will come from Actor's own profile).
-- **Output larger than a line** (screenshots, file contents, terminal streams) uses the `video` pattern: the plugin
-  writes a file and sends its path in an `event`, and the core uploads it; the upload path is to be designed with Actor.
-- The local kill switch (`openvibe-node stop`) will also make the `computer` plugin drop to Observe.
+Actor's computer control (plan T14/T17), on the same protocol. Capabilities `terminal`, `files` and `screen`, each
+with the owner's control level (`observe`, `ask`, `trusted`, `full`) and folders; command kinds `exec`, `fs` and
+`screen` (not motion kinds: long deadlines, no clamping, not in `GuardedKinds`; the core refuses `exec` and file writes
+while a stop is latched). Its `ack` carries the answer in `data`. The level is enforced in the plugin from its local
+config, never from a command; `ask` holds a command (`Deferred` in the SDK), raises an `approval` event and answers
+once the owner runs `openvibe-node approve|deny <id>`, which the core forwards to the plugin as `{"op": "approval", "id",
+"approved"}`. The local kill switch drops it to `observe`. Keyboard and mouse input, a browser and the machine's own
+coding agents are later kinds on the same plugin.
+
+**SDK additions it uses:** `handle()` may return a dict (the ack's `data`) or raise `Deferred` and answer later with
+`complete(id, data)` / `fail(id, code, message)` from any thread; `on_approval(id, approved)`; kinds that move nothing
+keep their full `deadline_ms` (motion kinds stay capped at 5 s).
 
 ## Community plugins
 

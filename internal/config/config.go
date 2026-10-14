@@ -342,6 +342,7 @@ var Bundled = map[string]string{
 	"cozmo":         "openvibe_cozmo",
 	"relay":         "openvibe_relay",
 	"ros2":          "openvibe_ros2",
+	"computer":      "openvibe_computer",
 }
 
 // Default is the config written by `openvibe-node pair` when none exists: the dry-run plugin and its test pattern.

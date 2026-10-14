@@ -546,6 +546,10 @@ func (c *Conn) Reply(id string, timeout time.Duration) (protocol.Message, error)
 				if m.ID == id {
 					return m, nil
 				}
+			case protocol.AckData:
+				if m.ID == id {
+					return m, nil
+				}
 			case protocol.Nack:
 				if m.ID == id {
 					return m, nil

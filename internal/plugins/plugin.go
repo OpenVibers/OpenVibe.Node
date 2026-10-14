@@ -64,6 +64,7 @@ type Reply struct {
 	OK        bool
 	FaultCode string
 	Message   string
+	Data      json.RawMessage // an ack's data (a computer command's answer), as the plugin sent it
 }
 
 // Output kinds carried by Output.Kind.
@@ -198,6 +199,11 @@ func (p *Plugin) Resume() {
 	p.estopped = false
 	p.mu.Unlock()
 	_ = p.send(map[string]any{"op": "resume"})
+}
+
+// Answer gives the plugin its owner's answer to an approval it asked for (`openvibe-node approve|deny <id>`).
+func (p *Plugin) Answer(id string, approved bool) error {
+	return p.send(map[string]any{"op": "approval", "id": id, "approved": approved})
 }
 
 // Command sends a command and waits for the plugin's ack or nack.
@@ -503,12 +509,16 @@ func (p *Plugin) readStdout(r io.Reader, described chan struct{}) {
 			id, _ := m["id"].(string)
 			code, _ := m["fault_code"].(string)
 			msg, _ := m["message"].(string)
+			var data json.RawMessage
+			if d, ok := m["data"]; ok && op == "ack" && d != nil {
+				data, _ = json.Marshal(d)
+			}
 			p.mu.Lock()
 			ch := p.pending[id]
 			p.mu.Unlock()
 			if ch != nil {
 				select {
-				case ch <- Reply{OK: op == "ack", FaultCode: code, Message: msg}:
+				case ch <- Reply{OK: op == "ack", FaultCode: code, Message: msg, Data: data}:
 				default:
 				}
 			}

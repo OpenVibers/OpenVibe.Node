@@ -173,7 +173,7 @@ applied the Node runs nothing but `halt` (`nack not_ready`), so that latch is in
 |---------------|-----------------------------------------------------------------------------------------------------|
 | `status`      | `firmware` (`openvibe-node-<version>`), `capabilities` {per plugin}, `faults` [{`code`, `driver`, `message`}], `estop_latched`; Node extras: `agent_version`, `device_kind`, `os`, `arch`, `drivers` [{`name`, `driver`, `version`, `state`, `capabilities`}], `local_stop`, `video` |
 | `telemetry`   | `battery` (0..1), `voltage` (V), `rssi`, `sensors` {…}; Node extra: `events` [{`name`, `driver`, `ts`, `fields`}] |
-| `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack)                                               |
+| `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack); `data` on a computer command (its answer, ≤ 512 KB) |
 | `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
 | `heartbeat`   | `t` (send time, Unix ms), `rtt_ms` (the last measured round trip, once there is one; 0 is a real measurement) |
 | `reauth`      | `token`: a fresh node token for the same principal (a Network-paired machine only; refused → `error` `bot.reauth_refused`) |
@@ -198,6 +198,9 @@ at most every 500 ms (≤ 2 Hz, Bot's cap). There is no separate `event` message
 | `button`   | `{"name": "forward"}` press; `{"name": …, "state": "down"\|"up"}` hold (names from the robot's profile)   | guarded |
 | `point`    | `{"x": 0..1, "y": 0..1}` normalised click on the video, for the [`relay`](plugins.md) plugin              | guarded |
 | `halt`     | `{}` — stop every actuator now (not latched); always accepted                                           | —      |
+| `exec`     | `{"argv": ["prog", "arg"…], "cwd"?, "timeout_s"?, "stdin"?}`: run a program on the machine ([computer.md](computer.md)) | computer |
+| `fs`       | `{"op": "list"\|"stat"\|"read"\|"write"\|"mkdir", "path", …}`: a file or folder on the machine                  | computer |
+| `screen`   | `{"max_width"?}`: capture the machine's screen                                                          | computer |
 
 Sign conventions: `throttle`/`x` positive = forward; `steer` positive = turn right; `y` positive = strafe left;
 `rotation` positive = counter-clockwise (left); `pan` positive = right, `tilt` positive = up (plugins can invert a
@@ -230,6 +233,15 @@ What the Node does with a command, in order:
    first listing the name). None → `nack unsupported`.
 8. The plugin's `ack`/`nack` is relayed. No answer within max(deadline, 1 s) → the plugin is told to stop and the
    server gets `nack plugin_timeout`.
+
+**Computer kinds** (`exec`, `fs`, `screen`; [computer.md](computer.md)) move nothing. Their `deadline_ms` is the
+reply window (an owner's approval on the machine plus the program's own run): absent → 60 s, capped at 10 minutes, no
+`max_command_ms`. Their value must be a JSON object of at most 384 KB and is not clamped. Running a program and
+writing a file (`exec`, `fs` other than `list`/`stat`/`read`) are refused while the local kill switch is latched
+(`nack local_stop`) or the remote e-stop is (`nack estopped`); capturing the screen and reading files are not. The
+`computer` plugin applies its owner's control level, and its `ack` carries the answer in `data` (at most 512 KB of JSON,
+else `nack bad_value`). An `ask`-level command waits for `openvibe-node approve|deny <id>` on the machine; the plugin
+raises an `approval` event while it waits and `approval_done` when it is answered or expires.
 
 Commands are never queued while offline and never replayed after a reconnect.
 

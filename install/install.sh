@@ -24,6 +24,9 @@
 #                    as the unprivileged user openvibe-job in the worker's sandbox with public egress (the service
 #                    runs as root, which run_as and the egress need), and the OpenVibe.Codes job runner is added when
 #                    Node.js 20+ is installed system-wide. Linux only. docs/worker.md has the details.
+#   --computer LEVEL this machine's terminal, files and screen for its owner's agents (the computer plugin,
+#                    docs/computer.md), at LEVEL observe, ask, trusted or full. The service then runs as YOUR account
+#                    (the one that ran sudo), never root, and its folders are your home. Linux only; not with --worker.
 #   --no-service     install and pair, but do not install the service.
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
 #                    downloading.
@@ -53,13 +56,15 @@ SERVICE=1
 LOCAL=""
 TAG="latest"
 WORKER=0
+COMPUTER=""
 # The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0).
 CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.3.0}"
 CODES_DIR=/opt/openvibe-codes
 
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
-	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker] [--no-service]"
+	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker]"
+	echo "                  [--computer observe|ask|trusted|full] [--no-service]"
 	echo "                  [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.network --pairing pair_… --code ABCD-1234"
@@ -89,6 +94,8 @@ while [ $# -gt 0 ]; do
 	--pairing) PAIRING="${2:-}"; shift 2 ;;
 	--pairing=*) PAIRING="${1#*=}"; shift ;;
 	--worker) WORKER=1; shift ;;
+	--computer) COMPUTER="${2:-}"; shift 2 ;;
+	--computer=*) COMPUTER="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
 	--local) LOCAL="${2:-}"; shift 2 ;;
 	--version) TAG="${2:-}"; shift 2 ;;
@@ -127,6 +134,26 @@ fi
 # write_worker_config <config.json> <job uid> <job gid> [<node.js> <codes dir>]: turn the job worker on in that config
 # (kept as it is otherwise, created when missing): jobs as the job user, public egress, caps sized for a coding task,
 # and, with a Node.js and a Codes install, the `openvibe-codes@1.0.0` job runner. Keys stay empty for the owner to add.
+# write_computer_config <config.json> <level> <home>: add the computer plugin at that level (replacing an earlier entry),
+# its folder the owner's home; the rest of the config is kept.
+write_computer_config() {
+	${SUDO:-} python3 - "$@" <<'PY'
+import json, os, sys
+path, level, home = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    conf = json.load(f)
+plugins = [p for p in conf.get('plugins') or [] if p.get('name') not in ('computer', 'dryrun')]
+plugins.append({'name': 'computer', 'config': {'level': level, 'roots': [home]}})
+conf['plugins'] = plugins
+old = os.umask(0o077)
+with open(path + '.tmp', 'w') as f:
+    json.dump(conf, f, indent=2)
+    f.write('\n')
+os.umask(old)
+os.replace(path + '.tmp', path)
+PY
+}
+
 write_worker_config() {
 	${SUDO:-} python3 - "$@" <<'PY'
 import json, os, sys
@@ -183,6 +210,13 @@ PY
 if [ -n "${OPENVIBE_INSTALL_WORKER_CONFIG_ONLY:-}" ]; then
 	write_worker_config "$OPENVIBE_INSTALL_WORKER_CONFIG_ONLY" "${OPENVIBE_JOB_UID:?}" "${OPENVIBE_JOB_GID:?}" \
 		${OPENVIBE_NODEJS:+"$OPENVIBE_NODEJS"} ${OPENVIBE_CODES_DIR:+"$OPENVIBE_CODES_DIR"}
+	exit 0
+fi
+# OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY=<config.json> with --computer LEVEL and OPENVIBE_COMPUTER_HOME adds the computer
+# plugin to that config and exits (scripts/test-install-computer-config.sh).
+if [ -n "${OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY:-}" ]; then
+	case "$COMPUTER" in observe|ask|trusted|full) ;; *) die "--computer is observe, ask, trusted or full" ;; esac
+	write_computer_config "$OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY" "$COMPUTER" "${OPENVIBE_COMPUTER_HOME:?}"
 	exit 0
 fi
 
@@ -353,7 +387,17 @@ say "installed $BIN_DIR/openvibe-node ($("$BIN_DIR/openvibe-node" version))"
 # Node's nftables table) need it, and each job still runs as the unprivileged openvibe-job user.
 SVC_USER=""
 if [ "$WORKER" = 1 ] && [ "$OS" != linux ]; then die "--worker is for Linux"; fi
-if [ "$OS" = linux ] && [ "$SERVICE" = 1 ] && [ "$WORKER" = 0 ]; then
+COMPUTER_HOME=""
+if [ -n "$COMPUTER" ]; then
+	case "$COMPUTER" in observe|ask|trusted|full) ;; *) die "--computer is observe, ask, trusted or full" ;; esac
+	[ "$OS" = linux ] || die "--computer is for Linux in this installer (docs/computer.md: run the Node in your own session elsewhere)"
+	[ "$WORKER" = 0 ] || die "--computer and --worker cannot share a machine yet (the worker's service runs as root)"
+	SVC_USER="${SUDO_USER:-$(id -un)}"
+	[ "$SVC_USER" != root ] || die "--computer runs the Node as your own account: run the installer from it (it uses sudo itself), not as root"
+	COMPUTER_HOME=$(getent passwd "$SVC_USER" | cut -d: -f6)
+	if [ -z "$COMPUTER_HOME" ] || [ ! -d "$COMPUTER_HOME" ]; then die "no home folder for $SVC_USER"; fi
+fi
+if [ "$OS" = linux ] && [ "$SERVICE" = 1 ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ]; then
 	SVC_USER=openvibe-node
 	if ! id "$SVC_USER" >/dev/null 2>&1; then
 		$SUDO useradd --system --home-dir "$STATE" --no-create-home --shell /usr/sbin/nologin "$SVC_USER" 2>/dev/null ||
@@ -415,6 +459,11 @@ looi)
 	fi
 	;;
 esac
+if [ -n "$COMPUTER" ]; then
+	# The computer plugin, and Pillow for compact screen captures when pip can get it.
+	$SUDO "$PIP" install --quiet "$STATE/plugins/computer[screen]" 2>/dev/null || $SUDO "$PIP" install --quiet "$STATE/plugins/computer"
+	[ "$DRIVER" = none ] && VIDEO='"source": "off"'
+fi
 if [ ! -f "$CONF/config.json" ]; then
 	$SUDO sh -c "umask 077; cat > '$CONF/config.json'" <<EOF
 {
@@ -427,6 +476,10 @@ EOF
 	say "wrote $CONF/config.json"
 else
 	say "keeping the existing $CONF/config.json"
+fi
+if [ -n "$COMPUTER" ]; then
+	write_computer_config "$CONF/config.json" "$COMPUTER" "$COMPUTER_HOME"
+	say "the computer plugin is on at level $COMPUTER for $SVC_USER (folder $COMPUTER_HOME); change it in $CONF/config.json"
 fi
 
 # ---- the job worker (--worker): the job user, the egress tools, the Codes job runner, the worker config ----
