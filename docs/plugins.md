@@ -251,3 +251,31 @@ be one more plugin, `computer`, on the same protocol; the core does not change:
 - **Output larger than a line** (screenshots, file contents, terminal streams) uses the `video` pattern: the plugin
   writes a file and sends its path in an `event`, and the core uploads it; the upload path is to be designed with Actor.
 - The local kill switch (`openvibe-node stop`) will also make the `computer` plugin drop to Observe.
+
+## Community plugins
+
+A community robot's profile (`community.<name>`, submitted on openvibe.bot and reviewed by an OpenVibe admin) names
+the plugin its robots run in `mapping.plugin`. The Node never downloads a plugin: its owner installs it from the
+source the profile's page links to and lists it in the config's `plugins`, as with any plugin.
+
+Before installing one, check that the profile is the one that was reviewed:
+
+```sh
+openvibe-node profile verify community.ballbot            # Bot from the config, else https://openvibe.bot
+openvibe-node profile verify community.ballbot --key-id a7a0f02462c68119   # accept only this signing key
+```
+
+The Node fetches the profile (`GET /api/v1/profiles/:id`, with the `signature` Bot made on approval) and Bot's key
+(`GET /api/v1/profiles/signing-key`). It checks that the key's id is the first 16 hex digits of the SHA-256 of its SPKI
+DER and that the signature names that key. Then it verifies Ed25519 over the profile's canonical JSON: every object's
+keys sorted by UTF-16 code units, no whitespace, strings and numbers as JavaScript's `JSON.stringify` writes them
+(`internal/profilesig`; its test fixture was signed by Bot's own code). The check fails, with "do not install its
+driver", when:
+
+- the profile has no signature;
+- the signature does not match;
+- the key is not the pinned one.
+
+`pair` runs the same check when the robot uses a community profile. It also checks that the profile Bot sent the Node
+is the signed one in the catalogue. A failure is a warning: pairing goes on, and the plugin stays uninstalled until
+the owner installs it.

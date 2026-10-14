@@ -34,6 +34,7 @@ import (
 	"github.com/OpenVibers/OpenVibe.Node/internal/localctl"
 	"github.com/OpenVibers/OpenVibe.Node/internal/node"
 	"github.com/OpenVibers/OpenVibe.Node/internal/plugins"
+	"github.com/OpenVibers/OpenVibe.Node/internal/profilesig"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 	"github.com/OpenVibers/OpenVibe.Node/internal/safety"
 	"github.com/OpenVibers/OpenVibe.Node/internal/service"
@@ -56,6 +57,8 @@ Usage:
   openvibe-node stop        stop every actuator now and hold them stopped
   openvibe-node resume      release the stop
   openvibe-node plugins [--json]
+  openvibe-node profile verify community.<name> [--server URL] [--key-id ID]
+                    check a community robot profile against the signature Bot made when it was reviewed
   openvibe-node version
 
 Global flags (before or after the command):
@@ -103,6 +106,7 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		asJSON  = fs.Bool("json", false, "print JSON (status, plugins)")
 		svcUser = fs.String("user", "", "run the service as this account (install)")
 		session = fs.Bool("user-session", false, "Windows: start at sign-in in your own session instead of as a service (install, uninstall)")
+		keyID   = fs.String("key-id", "", "accept only this Bot signing key id (profile verify)")
 	)
 	// Accept flags anywhere: split positionals out.
 	var positional []string
@@ -174,6 +178,12 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		err = cmdResume(g, stdout)
 	case "plugins":
 		err = cmdPlugins(g, *asJSON, stdout)
+	case "profile":
+		if len(positional) != 2 || positional[0] != "verify" {
+			fmt.Fprintln(stderr, "usage: openvibe-node profile verify community.<name> [--server URL] [--key-id ID]")
+			return 2
+		}
+		err = cmdProfileVerify(g, positional[1], *server, *keyID, stdout)
 	case "version", "--version":
 		fmt.Fprintf(stdout, "openvibe-node %s %s/%s\n", version, runtime.GOOS, runtime.GOARCH)
 	default:
@@ -337,6 +347,7 @@ func cmdPair(g *globals, a pairArgs, stdout io.Writer) error {
 	chownLikeDir(g.paths.CredentialFile(), g.paths.ConfigDir)
 	fmt.Fprintf(stdout, "Paired as %s (robot %s). Credential saved to %s (mode 600).\n", creds.DeviceID, creds.RobotID, g.paths.CredentialFile())
 	fmt.Fprintln(stdout, "Confirm the device on openvibe.bot, then start it: `openvibe-node run` or `sudo openvibe-node install`.")
+	reportCommunityProfile(ctx, cfg.Server, creds.Profile, stdout)
 	return finishPair(g, a, cfg, noConfig, stdout)
 }
 
@@ -382,6 +393,7 @@ func cmdPairNetwork(g *globals, a pairArgs, stdout io.Writer) error {
 		}
 		if bound.RobotID != "" {
 			fmt.Fprintf(stdout, "Bound as %s (robot %s).\n", bound.DeviceID, bound.RobotID)
+			reportCommunityProfile(ctx, creds.Server, bound.Profile, stdout)
 		} else {
 			fmt.Fprintf(stdout, "Bound as %s (a machine for your jobs, no robot).\n", bound.DeviceID)
 		}
@@ -751,4 +763,43 @@ func cmdPlugins(g *globals, asJSON bool, stdout io.Writer) error {
 		fmt.Fprintln(stdout, "No plugins configured in", g.paths.ConfigFile())
 	}
 	return nil
+}
+
+// cmdProfileVerify checks the community profile id against the signature Bot made when an OpenVibe admin approved it
+// (internal/profilesig), on server or the config's Bot, and says which plugin its robots run. A failed check is an error.
+func cmdProfileVerify(g *globals, id, server, keyID string, stdout io.Writer) error {
+	if server == "" {
+		server = "https://openvibe.bot"
+		if cfg, err := loadConfig(g); err == nil && cfg.Server != "" {
+			server = cfg.Server
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := profilesig.Check(ctx, nil, server, id, nil, keyID)
+	if err != nil {
+		return fmt.Errorf("%s: %w; do not install its driver", id, err)
+	}
+	fmt.Fprintf(stdout, "%s version %s: signed by %s (Bot key %s), as reviewed.\n", res.ID, res.Version, strings.TrimSuffix(server, "/"), res.KeyID)
+	if res.Plugin != "" {
+		fmt.Fprintf(stdout, "Its robots run the Node plugin %q: install it from the source its page links to, then list it in the config's plugins.\n", res.Plugin)
+	}
+	return nil
+}
+
+// reportCommunityProfile says, after pairing, whether a community profile the robot uses is the signed one Bot
+// reviewed. It never fails the pairing: the plugin is installed by hand, and this tells the owner whether to.
+func reportCommunityProfile(ctx context.Context, server string, profile json.RawMessage, stdout io.Writer) {
+	var p struct {
+		ID string `json:"id"`
+	}
+	if len(profile) == 0 || json.Unmarshal(profile, &p) != nil || !profilesig.CommunityRe.MatchString(p.ID) {
+		return
+	}
+	res, err := profilesig.Check(ctx, nil, server, p.ID, profile, "")
+	if err != nil {
+		fmt.Fprintf(stdout, "WARNING: the robot's community profile %s did not check out (%v). Do not install its driver until it does: openvibe-node profile verify %s\n", p.ID, err, p.ID)
+		return
+	}
+	fmt.Fprintf(stdout, "The robot's community profile %s (version %s) is the one Bot reviewed and signed (key %s).\n", res.ID, res.Version, res.KeyID)
 }

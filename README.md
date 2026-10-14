@@ -34,6 +34,12 @@ openvibe-node resume
 - **ESP32 library** ([`esp32/`](esp32/README.md), `OpenVibeNode`): the device side of the protocol for ESP32 boards —
   pairing, the control link, drive/actuator commands, telemetry, heartbeat, deadman and e-stop — but no jobs or video.
 
+**Community robots:** a profile people submit on openvibe.bot (`community.<name>`) is reviewed by an OpenVibe admin
+and signed by Bot (Ed25519 over its canonical JSON). `openvibe-node profile verify community.<name>` checks that
+signature against the key Bot publishes (`--key-id` pins one) and names the plugin the robots run; pairing with a robot
+on a community profile runs the same check and warns when it fails. Install a community plugin only when it passes
+([docs/plugins.md](docs/plugins.md#community-plugins)).
+
 **A machine that runs your jobs:** add it on openvibe.bot/machines, which prints the same installer with `--worker`: the
 job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.Codes job runner lets you start a coding
 task on openvibe.codes/run from any browser and have this machine do it ([docs/worker.md](docs/worker.md)).
