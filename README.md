@@ -34,6 +34,10 @@ openvibe-node resume
 - **ESP32 library** ([`esp32/`](esp32/README.md), `OpenVibeNode`): the device side of the protocol for ESP32 boards —
   pairing, the control link, drive/actuator commands, telemetry, heartbeat, deadman and e-stop — but no jobs or video.
 
+**A machine that runs your jobs:** add it on openvibe.bot/machines, which prints the same installer with `--worker`: the
+job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.Codes job runner lets you start a coding
+task on openvibe.codes/run from any browser and have this machine do it ([docs/worker.md](docs/worker.md)).
+
 Docs: [protocol](docs/protocol.md) (the wire format with OpenVibe.Bot), [plugins](docs/plugins.md) (the driver
 protocol, the bundled drivers, and where Actor's computer-control plugin attaches), [install](docs/install.md).
 Decisions: [ADR-043](docs/ADR-043-bot-devices-and-control.md).
