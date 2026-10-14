@@ -201,6 +201,7 @@ at most every 500 ms (≤ 2 Hz, Bot's cap). There is no separate `event` message
 | `exec`     | `{"argv": ["prog", "arg"…], "cwd"?, "timeout_s"?, "stdin"?}`: run a program on the machine ([computer.md](computer.md)) | computer |
 | `fs`       | `{"op": "list"\|"stat"\|"read"\|"write"\|"mkdir", "path", …}`: a file or folder on the machine                  | computer |
 | `screen`   | `{"max_width"?}`: capture the machine's screen                                                          | computer |
+| `probe`    | `{"target": "http(s)://…" \| "tcp://host:port", "timeout_s"?}`: a read-only check of the machine's own network | computer |
 
 Sign conventions: `throttle`/`x` positive = forward; `steer` positive = turn right; `y` positive = strafe left;
 `rotation` positive = counter-clockwise (left); `pan` positive = right, `tilt` positive = up (plugins can invert a

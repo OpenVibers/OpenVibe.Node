@@ -225,6 +225,61 @@ class ComputerTest(unittest.TestCase):
         r = reply(self.out, self.cmd("fs", {"op": "stat", "path": "/"}))
         self.assertEqual((r["op"], r["data"]["type"]), ("ack", "dir"))
 
+    def test_probe_reaches_the_machines_own_network_only(self):
+        import http.server
+        import socket as socketlib
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/moved":
+                    self.send_response(302)
+                    self.send_header("Location", "http://1.1.1.1/")
+                    self.end_headers()
+                    return
+                body = b'{"up": true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("ETag", '"v1"')
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        self.boot("observe")
+        r = reply(self.out, self.cmd("probe", {"target": "http://127.0.0.1:%d/status" % port}))
+        self.assertEqual(r["op"], "ack", r)
+        self.assertEqual((r["data"]["status"], r["data"]["body"], r["data"]["etag"], r["data"]["content_type"]), (200, '{"up": true}', '"v1"', "application/json"))
+        r = reply(self.out, self.cmd("probe", {"target": "http://127.0.0.1:%d/moved" % port}))
+        self.assertEqual((r["data"]["status"], r["data"]["location"]), (302, "http://1.1.1.1/"), "a redirect is reported, never followed")
+        r = reply(self.out, self.cmd("probe", {"target": "tcp://127.0.0.1:%d" % port}))
+        self.assertTrue(r["data"]["open"])
+        closed = socketlib.socket()
+        closed.bind(("127.0.0.1", 0))
+        free = closed.getsockname()[1]
+        closed.close()
+        r = reply(self.out, self.cmd("probe", {"target": "tcp://127.0.0.1:%d" % free, "timeout_s": 2}))
+        self.assertFalse(r["data"]["open"])
+        for public in ("http://1.1.1.1/", "tcp://8.8.8.8:53", "https://[2606:4700:4700::1111]/"):
+            r = reply(self.out, self.cmd("probe", {"target": public}))
+            self.assertEqual((r["op"], r["fault_code"]), ("nack", "not_allowed"), public)
+        for bad in ("ftp://127.0.0.1/", "http://user:pw@127.0.0.1/", "tcp://127.0.0.1", "nonsense"):
+            r = reply(self.out, self.cmd("probe", {"target": bad}))
+            self.assertEqual(r["fault_code"], "bad_value", bad)
+        self.rt.dispatch({"op": "estop"})
+        r = reply(self.out, self.cmd("probe", {"target": "tcp://127.0.0.1:%d" % port}))
+        self.assertTrue(r["data"]["open"], "a probe is read-only: it runs while stopped")
+
+    def test_probe_can_be_turned_off(self):
+        self.boot("trusted", probe=False)
+        self.assertNotIn("probe", self.out.msgs()[0]["capabilities"])
+        r = reply(self.out, self.cmd("probe", {"target": "tcp://127.0.0.1:1"}))
+        self.assertEqual(r["fault_code"], "unsupported")
+
     def test_screen_tool_detection(self):
         which = lambda name: "/usr/bin/" + name if name in ("grim", "scrot") else None
         self.assertEqual(Computer(which=which, env={"WAYLAND_DISPLAY": "wayland-0"}, platform="linux")._screen_tool()[0], "grim")
