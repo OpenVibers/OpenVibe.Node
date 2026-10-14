@@ -164,13 +164,16 @@ const (
 	// KindProbe is a read-only check of something on the machine's own network (one GET or a TCP connect to a private,
 	// loopback or link-local address): OpenVibe.Watch's node carrier.
 	KindProbe = "probe"
+	// KindInput moves the mouse, clicks, scrolls, types or presses keys on the machine's screen (contracts 0.171.0):
+	// an acting command, so the owner's level decides and a latched stop refuses it.
+	KindInput = "input"
 )
 
 // Kinds lists every command kind the Node understands.
-var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe}
+var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput}
 
 // ComputerKinds move nothing: they carry long deadlines (DefaultComputerMS, at most MaxComputerMS) and no clamping.
-var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true}
+var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true}
 
 const (
 	// DefaultComputerMS is a computer command's reply window when the server sends no deadline; MaxComputerMS caps
@@ -182,11 +185,12 @@ const (
 	MaxAckData       = 512 * 1024
 )
 
-// ComputerActs reports whether a computer command changes the machine (runs a program, writes a file): those are
-// refused while the local stop or an e-stop is latched. Capturing the screen and reading files are not.
+// ComputerActs reports whether a computer command changes the machine (runs a program, writes a file, uses the mouse
+// or keyboard): those are refused while the local stop or an e-stop is latched. Capturing the screen and reading files
+// are not.
 func ComputerActs(kind string, value json.RawMessage) bool {
 	switch kind {
-	case KindExec:
+	case KindExec, KindInput:
 		return true
 	case KindFS:
 		var v struct {

@@ -21,6 +21,7 @@ var capabilityFor = map[string]string{
 	protocol.KindFS:       "files",
 	protocol.KindScreen:   "screen",
 	protocol.KindProbe:    "probe",
+	protocol.KindInput:    "input",
 }
 
 // Manager supervises every configured plugin.

@@ -25,12 +25,12 @@ By hand, or on another system, add it to `plugins` in the Node's `config.json` a
 
 ## Control levels
 
-| level     | screen, list, stat, read (inside the folders) | run programs, write files (inside the folders) | outside the folders |
-|-----------|----------------------------------------------|-----------------------------------------------|---------------------|
-| `observe` | yes                                          | no (`nack not_allowed`)                       | no                  |
-| `ask`     | yes                                          | after you approve each one on the machine     | no                  |
-| `trusted` | yes                                          | yes                                           | no                  |
-| `full`    | yes                                          | yes                                           | yes                 |
+| level     | screen, list, stat, read (inside the folders) | run programs, write files (inside the folders), mouse and keyboard | outside the folders |
+|-----------|----------------------------------------------|--------------------------------------------------------------------|---------------------|
+| `observe` | yes                                          | no (`nack not_allowed`)                                            | no                  |
+| `ask`     | yes                                          | after you approve each one on the machine                          | no                  |
+| `trusted` | yes                                          | yes                                                                | no                  |
+| `full`    | yes                                          | yes                                                                | yes                 |
 
 `observe` is the default. Folders are `roots` (default: the home folder of the account running the Node); a path is
 checked after symlinks are resolved, so a link out of a folder is outside it.
@@ -48,7 +48,7 @@ When the Node runs in your graphical session, a waiting request also shows a des
 that a request is waiting on the machine.
 
 **Kill switch:** `openvibe-node stop` (and an owner's e-stop) drops the plugin to `observe`: what runs is killed, what
-waits is denied, and the core also refuses `exec` and file writes until `openvibe-node resume`. `halt` kills what runs.
+waits is denied, and the core also refuses `exec`, file writes and `input` until `openvibe-node resume`. `halt` kills what runs.
 
 ## What it does
 
@@ -58,11 +58,20 @@ waits is denied, and the core also refuses `exec` and file writes until `openvib
 | `fs`     | `op` `list` / `stat` / `read` (`offset`, `length`) / `write` (`content_b64`, `mode` `create`, `overwrite` or `append`) / `mkdir`, and an absolute `path` | `entries` (≤ 1000), the stat, `content_b64` (≤ `max_read_bytes`), `written`, `created` |
 | `probe`  | `target`: `http(s)://…` (one GET, no redirect followed) or `tcp://host:port`; `timeout_s` | `status`, `content_type`, `etag`, `last_modified`, `body` (≤ 64 KB), `ms`; or `open`, `ms` |
 | `screen` | `max_width` (default 1280)                                                                    | `format` (`jpeg` with Pillow, else `png` ≤ 300 KB), `width`, `height`, `content_b64` |
+| `input`  | `action`: `move`, `click`, `double_click`, `right_click` (`x`, `y`), `scroll` (`dy` clicks, ±20), `type` (`text`, ≤ 2000), `key` (`keys`: one key or chord, `ctrl+s`, `Return`); `width`, `height`: the picture `x`, `y` are measured in | `done`, `action`, and the real `x`, `y` it used |
 
 A program runs in its own process group with the Node account's rights, at most 2 at a time, and is killed at
 `timeout_s` (the owner's `timeout_s` is the cap). A write with `overwrite` replaces the file atomically. Screens come
 from `screencapture` (macOS), `grim` (Wayland) or `import`, `scrot` or `gnome-screenshot` (X11), so the Node must run in
 your graphical session for `screen`; without one the plugin simply does not offer it.
+
+**Mouse and keyboard** (`input`) is an acting command like running a program: refused at `observe`, approved one by one
+at `ask` (the approval says exactly what it would do: "click at 640, 360 of a 1280×720 picture of the screen",
+"type 12 characters: 'hello there'", "press ctrl+s"). Coordinates are in the space of the screen picture the agent last
+saw (`width` × `height`), scaled to your real screen. It uses `xdotool` on an X11 session and `cliclick` on macOS
+(`brew install cliclick`; no scrolling there); Wayland has no general input tool yet, so it is not offered there. Typed
+text and keys are passed to the tool as arguments, never through a shell, and `keys` takes only letters, digits, `+`,
+`-` and `_`.
 
 ## Config
 
@@ -77,8 +86,9 @@ your graphical session for `screen`; without one the plugin simply does not offe
 | `approval_timeout_s` | 120 (≤ 600)    | how long a request waits for you |
 | `notify`             | `true`         | a desktop notification when a request waits (graphical session only) |
 | `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
+| `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
 
-`describe` reports `terminal`, `files` and `screen` with the level and folders, so Bot shows what the machine allows;
+`describe` reports `terminal`, `files`, `screen` and `input` with the level and folders, so Bot shows what the machine allows;
 telemetry carries the sensors `computer_level` (observe while a stop is latched), `computer_waiting` and
 `computer_running`.
 Every request is logged by the Node (`journalctl -u openvibe-node`), with what it would do, approved or denied.

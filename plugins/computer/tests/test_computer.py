@@ -304,5 +304,92 @@ class ComputerTest(unittest.TestCase):
         self.assertEqual(base64.b64decode(d["content_b64"])[:2], b"\xff\xd8")
 
 
+    # ---- input ---------------------------------------------------------------------------------------------------
+    def boot_input(self, level, platform="linux", tool="xdotool", size=(2560, 1440)):
+        self.argvs = []
+
+        class Proc:
+            returncode = 0
+            pid = 1
+
+            def communicate(self_, timeout=None):
+                return b"", b""
+
+        def popen(argv, **kw):
+            self.argvs.append(argv)
+            return Proc()
+
+        self.dir = tempfile.mkdtemp(prefix="ov-computer-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        self.out = Out()
+        env = {"DISPLAY": ":0"} if platform == "linux" else {}
+        self.plugin = Computer(which=lambda n: "/usr/bin/" + n if n == tool else None, popen=popen, env=env,
+                               platform=platform, screen_size=lambda t: size)
+        self.rt = Runtime(self.plugin, infile=io.StringIO(""), outfile=self.out)
+        self.rt.dispatch({"op": "hello", "config": {"level": level, "roots": [self.dir], "notify": False}})
+        self.n = 0
+        return self.out.msgs()
+
+    def test_input_tool_detection(self):
+        xdo = lambda n: "/usr/bin/xdotool" if n == "xdotool" else None
+        self.assertEqual(Computer(which=xdo, env={"DISPLAY": ":0"}, platform="linux")._input_tool(), "xdotool")
+        self.assertIsNone(Computer(which=xdo, env={"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"}, platform="linux")._input_tool(), "not on Wayland")
+        self.assertIsNone(Computer(which=xdo, env={}, platform="linux")._input_tool(), "no session")
+        self.assertEqual(Computer(which=lambda n: "/opt/homebrew/bin/cliclick" if n == "cliclick" else None, env={}, platform="darwin")._input_tool(), "cliclick")
+        caps = self.boot_input("trusted")[0]["capabilities"]
+        self.assertEqual(caps["input"], {"level": "trusted", "tool": "xdotool", "scroll": True})
+
+    def test_input_is_an_acting_command(self):
+        self.boot_input("observe")
+        r = reply(self.out, self.cmd("input", {"action": "click", "x": 10, "y": 10}))
+        self.assertEqual((r["op"], r["fault_code"]), ("nack", "not_allowed"))
+        self.boot_input("ask")
+        cid = self.cmd("input", {"action": "click", "x": 640, "y": 360, "width": 1280, "height": 720})
+        ev = self.out.wait_for(lambda m: m.get("op") == "event" and m.get("name") == "approval")
+        self.assertEqual((ev["kind"], ev["summary"]), ("input", "click at 640, 360 of a 1280\u00d7720 picture of the screen"))
+        self.assertEqual(self.argvs, [], "nothing touches the screen before the owner approves")
+        self.plugin.on_approval(cid, True)
+        self.assertEqual(reply(self.out, cid)["op"], "ack")
+
+    def test_input_scales_the_picture_to_the_screen(self):
+        self.boot_input("trusted")
+        r = reply(self.out, self.cmd("input", {"action": "click", "x": 640, "y": 360, "width": 1280, "height": 720}))
+        self.assertEqual(r["data"], {"done": True, "action": "click", "x": 1280, "y": 720})
+        self.assertEqual(self.argvs[-1], ["xdotool", "mousemove", "--sync", "1280", "720", "click", "1"])
+        reply(self.out, self.cmd("input", {"action": "double_click", "x": 5, "y": 5}))
+        self.assertEqual(self.argvs[-1], ["xdotool", "mousemove", "--sync", "5", "5", "click", "--repeat", "2", "1"], "no picture: screen pixels")
+        reply(self.out, self.cmd("input", {"action": "scroll", "dy": -3}))
+        self.assertEqual(self.argvs[-1], ["xdotool", "click", "--repeat", "3", "4"])
+        reply(self.out, self.cmd("input", {"action": "type", "text": "-hello"}))
+        self.assertEqual(self.argvs[-1], ["xdotool", "type", "--delay", "12", "--", "-hello"], "text is never an option")
+        reply(self.out, self.cmd("input", {"action": "key", "keys": "ctrl+s"}))
+        self.assertEqual(self.argvs[-1], ["xdotool", "key", "--", "ctrl+s"])
+
+    def test_input_refuses_what_it_should_not_send(self):
+        self.boot_input("trusted")
+        before = len(self.argvs)
+        for value, code in [({"action": "key", "keys": "ctrl+s; rm -rf ~"}, "bad_value"),
+                            ({"action": "key", "keys": "--help"}, "bad_value"),
+                            ({"action": "drag"}, "bad_value"),
+                            ({"action": "click"}, "bad_value"),
+                            ({"action": "click", "x": 1, "y": 1, "width": 100}, "bad_value"),
+                            ({"action": "type", "text": "x" * 2001}, "bad_value"),
+                            ({"action": "scroll", "dy": 0}, "bad_value")]:
+            r = reply(self.out, self.cmd("input", value))
+            self.assertEqual((r["op"], r["fault_code"]), ("nack", code), value)
+        self.assertEqual(len(self.argvs), before)
+
+    def test_input_on_macos_uses_cliclick(self):
+        self.boot_input("trusted", platform="darwin", tool="cliclick", size=(1440, 900))
+        reply(self.out, self.cmd("input", {"action": "right_click", "x": 640, "y": 400, "width": 1280, "height": 800}))
+        self.assertEqual(self.argvs[-1], ["cliclick", "rc:720,450"])
+        reply(self.out, self.cmd("input", {"action": "key", "keys": "cmd+shift+s"}))
+        self.assertEqual(self.argvs[-1], ["cliclick", "kd:cmd", "kd:shift", "t:s", "ku:shift", "ku:cmd"])
+        reply(self.out, self.cmd("input", {"action": "key", "keys": "Return"}))
+        self.assertEqual(self.argvs[-1], ["cliclick", "kp:return"])
+        r = reply(self.out, self.cmd("input", {"action": "scroll", "dy": 2}))
+        self.assertEqual((r["op"], r["fault_code"]), ("nack", "unsupported"))
+
+
 if __name__ == "__main__":
     unittest.main()

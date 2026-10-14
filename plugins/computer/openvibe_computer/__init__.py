@@ -1,12 +1,13 @@
-"""OpenVibe Node computer plugin: the machine's terminal, files and screen for its owner's agents (plan T14/T17).
+"""OpenVibe Node computer plugin: the machine's terminal, files, screen and input for its owner's agents (plan T14/T17).
 
 Off unless its owner lists it in the Node's config. The owner sets the **control level** on the machine itself; a cloud
 command can never raise it:
 
 * ``observe`` (the default): capture the screen; list, stat and read files inside the roots.
-* ``ask``: also run programs and write files inside the roots, each only after the owner approves it on the machine
+* ``ask``: also run programs, write files inside the roots and use the mouse and keyboard, each only after the owner
+  approves it on the machine
   (``openvibe-node approvals``, ``approve <id>``, ``deny <id>``); unanswered requests expire.
-* ``trusted``: run programs and write files inside the roots without asking.
+* ``trusted``: run programs, write files inside the roots and use the mouse and keyboard without asking.
 * ``full``: as trusted, anywhere the account running the Node can reach.
 
 The local kill switch (``openvibe-node stop``) and a remote e-stop drop the plugin to observe, kill what is running
@@ -19,6 +20,12 @@ Command kinds and their answers (the ack's ``data``):
 * ``fs`` ``{"op": "list"|"stat"|"read"|"write"|"mkdir", "path", …}``: ``read`` takes ``offset``/``length`` and answers
   ``content_b64``; ``write`` takes ``content_b64`` and ``mode`` (``create``, ``overwrite`` or ``append``).
 * ``screen`` ``{"max_width"?}`` → ``{format, width, height, content_b64}`` (JPEG through Pillow when it is installed).
+* ``input`` ``{"action", "x"?, "y"?, "width"?, "height"?, "dy"?, "text"?, "keys"?}`` → ``{done, action, x?, y?}``: move,
+  click, double_click or right_click at a point, scroll by ``dy`` clicks, type ``text`` into whatever has focus, or press
+  one key or chord (``keys``, for example ``ctrl+s``). ``x``/``y`` are in the space of a screen picture ``width`` ×
+  ``height`` (the ``screen`` answer) and are scaled to the real screen. An acting command: refused at observe, approved
+  one by one at ask. xdotool on X11, cliclick on macOS (no scroll there); none on Wayland yet. Config
+  ``allow_input: false`` turns it off.
 * ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
   etag, last_modified, body, truncated, ms}``; for ``tcp://host:port``: ``{open, ms, error?}``. Read-only, so it runs at
   every level, and only towards the machine's own network: every address the name resolves to must be private,
@@ -57,6 +64,17 @@ MAX_WAITING = 8
 MAX_OUTPUT_CAP = 192 * 1024
 MAX_READ_CAP = 256 * 1024
 SCREEN_MAX_BYTES = 300 * 1024
+INPUT_ACTIONS = frozenset({"move", "click", "double_click", "right_click", "scroll", "type", "key"})
+POINT_ACTIONS = frozenset({"move", "click", "double_click", "right_click"})
+MAX_TYPE = 2000
+KEYS_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+-")
+MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "alt": "alt", "option": "alt", "shift": "shift", "cmd": "cmd",
+             "command": "cmd", "super": "super", "meta": "super", "win": "super"}
+# xdotool key names → cliclick's kp: names (macOS); a single character is typed with t:.
+CLICLICK_KEYS = {"return": "return", "enter": "enter", "escape": "esc", "esc": "esc", "tab": "tab", "backspace": "delete",
+                 "delete": "fwd-delete", "space": "space", "up": "arrow-up", "down": "arrow-down", "left": "arrow-left",
+                 "right": "arrow-right", "home": "home", "end": "end", "page_up": "page-up", "prior": "page-up",
+                 "page_down": "page-down", "next": "page-down"}
 
 
 def _int(v, name, lo, hi, default):
@@ -69,13 +87,14 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.3.0"
+    version = "0.4.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
-    def __init__(self, which=shutil.which, popen=subprocess.Popen, clock=time.monotonic, env=None, platform=None):
+    def __init__(self, which=shutil.which, popen=subprocess.Popen, clock=time.monotonic, env=None, platform=None, screen_size=None):
         self.which = which
         self.popen = popen
+        self.screen_size = screen_size or self._screen_size
         self.clock = clock
         self.env = os.environ if env is None else env
         self.platform = platform or sys.platform
@@ -86,6 +105,7 @@ class Computer(Plugin):
         self.max_read = 256 * 1024
         self.allow_exec = True
         self.allow_probe = True
+        self.allow_input = True
         self.notify = True
         self.approval_timeout_s = 120
         self.pending = {}  # command id -> (run, expires_at, summary)
@@ -111,6 +131,7 @@ class Computer(Plugin):
         self.approval_timeout_s = _int(config.get("approval_timeout_s"), "approval_timeout_s", 10, 600, 120)
         self.allow_exec = config.get("allow_exec", True) is not False
         self.allow_probe = config.get("probe", True) is not False
+        self.allow_input = config.get("allow_input", True) is not False
         self.notify = config.get("notify", True) is not False
 
     def describe(self, config):
@@ -126,6 +147,9 @@ class Computer(Plugin):
             caps["screen"] = {"level": self.level, "tool": tool[0]}
         if self.allow_probe:
             caps["probe"] = {"lan_only": True, "schemes": ["http", "https", "tcp"]}
+        itool = self._input_tool() if self.allow_input else None
+        if itool:
+            caps["input"] = {"level": self.level, "tool": itool, "scroll": itool == "xdotool"}
         return caps
 
     def setup(self, config):
@@ -221,6 +245,14 @@ class Computer(Plugin):
                 raise Fault("unsupported", "this machine does not allow probes")
             target, timeout = self._probe_target(v)
             return self._start(cmd, lambda: self._probe(target, timeout))
+        if cmd.kind == "input":
+            if not self.allow_input:
+                raise Fault("unsupported", "this machine does not allow mouse and keyboard input")
+            tool = self._input_tool()
+            if not tool:
+                raise Fault("unsupported", "no input tool on this machine (xdotool on X11, cliclick on macOS)")
+            run, summary = self._input_op(tool, v)
+            return self._act(cmd, level, run, summary, threaded=True)
         if cmd.kind == "exec":
             if not self.allow_exec:
                 raise Fault("unsupported", "this machine does not allow running programs")
@@ -571,6 +603,138 @@ class Computer(Plugin):
 
         verb = {"create": "create", "overwrite": "overwrite", "append": "append to"}[mode]
         return run, "%s %s (%d bytes)" % (verb, path, len(data))
+
+    # ---- input -----------------------------------------------------------------------------------------------------
+    def _input_tool(self):
+        """xdotool on an X11 session, cliclick on macOS, else None (Wayland has no general input tool yet)."""
+        if self.platform == "darwin" and self.which("cliclick"):
+            return "cliclick"
+        if self.platform.startswith("linux") and self.env.get("DISPLAY") and not self.env.get("WAYLAND_DISPLAY") and self.which("xdotool"):
+            return "xdotool"
+        return None
+
+    def _input_op(self, tool, v):
+        """(run, summary) for one input action; nothing touches the screen until run() (after approval at ask)."""
+        action = v.get("action")
+        if action not in INPUT_ACTIONS:
+            raise Fault("bad_value", "action is one of %s" % ", ".join(sorted(INPUT_ACTIONS)))
+        point = None
+        if action in POINT_ACTIONS or (action == "scroll" and v.get("x") is not None):
+            x = _int(v.get("x"), "x", 0, 16384, None)
+            y = _int(v.get("y"), "y", 0, 16384, None)
+            if x is None or y is None:
+                raise Fault("bad_value", "%s needs x and y" % action)
+            w = _int(v.get("width"), "width", 1, 16384, None)
+            h = _int(v.get("height"), "height", 1, 16384, None)
+            if (w is None) != (h is None):
+                raise Fault("bad_value", "width and height come together")
+            point = (x, y, w, h)
+        if action == "scroll":
+            dy = _int(v.get("dy"), "dy", -20, 20, None)
+            if not dy:
+                raise Fault("bad_value", "scroll needs dy (clicks, -20 to 20, not 0)")
+            if tool != "xdotool":
+                raise Fault("unsupported", "scrolling needs xdotool (Linux X11)")
+        if action == "type":
+            text = v.get("text")
+            if not isinstance(text, str) or not text or len(text) > MAX_TYPE or "\x00" in text:
+                raise Fault("bad_value", "text is 1 to %d characters" % MAX_TYPE)
+        if action == "key":
+            keys = v.get("keys")
+            if not isinstance(keys, str) or not keys or len(keys) > 64 or not set(keys) <= KEYS_OK or keys.startswith("-"):
+                raise Fault("bad_value", "keys is one key or chord, for example Return or ctrl+s")
+
+        def run():
+            at = self._scale(tool, point) if point else None
+            argv = self._input_argv(tool, action, at, v)
+            proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+            try:
+                _, err = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                self._kill(proc)
+                raise Fault("hardware", "%s did not finish in 30 s" % tool)
+            if proc.returncode != 0:
+                raise Fault("hardware", "%s failed: %s" % (tool, (err or b"").decode("utf-8", "replace")[:200]))
+            out = {"done": True, "action": action}
+            if at:
+                out["x"], out["y"] = at
+            return out
+
+        if action == "type":
+            text = v["text"]
+            shown = text if len(text) <= 120 else text[:120] + "…"
+            summary = "type %d characters: %r" % (len(text), shown)
+        elif action == "key":
+            summary = "press %s" % v["keys"]
+        elif action == "scroll":
+            summary = "scroll %s %d" % ("up" if v["dy"] < 0 else "down", abs(v["dy"]))
+        else:
+            x, y, w, h = point
+            summary = "%s at %d, %d%s" % (action.replace("_", " "), x, y, " of a %d×%d picture of the screen" % (w, h) if w else "")
+        return run, summary
+
+    def _screen_size(self, tool):
+        """The screen's size in the units the input tool uses: pixels for xdotool, points for cliclick (a Retina
+        screen's picture is twice as many pixels)."""
+        if tool == "xdotool":
+            out = subprocess.run(["xdotool", "getdisplaygeometry"], capture_output=True, text=True, timeout=10, env=self._tool_env())
+            parts = out.stdout.split()
+        else:
+            out = subprocess.run(["osascript", "-e", "tell application \"Finder\" to get bounds of window of desktop"],
+                                 capture_output=True, text=True, timeout=10)
+            parts = [p.strip() for p in out.stdout.split(",")][2:4]
+        if out.returncode != 0 or len(parts) != 2 or not all(p.isdigit() for p in parts):
+            raise Fault("hardware", "could not read the screen size")
+        return int(parts[0]), int(parts[1])
+
+    def _scale(self, tool, point):
+        x, y, w, h = point
+        if not w:
+            return x, y
+        sw, sh = self.screen_size(tool)
+        return min(sw - 1, round(x * sw / w)), min(sh - 1, round(y * sh / h))
+
+    def _tool_env(self):
+        env = dict(os.environ)
+        env.update({k: v for k, v in self.env.items() if k in ("DISPLAY", "XAUTHORITY")})
+        return env
+
+    @staticmethod
+    def _input_argv(tool, action, at, v):
+        if tool == "xdotool":
+            move = ["mousemove", "--sync", str(at[0]), str(at[1])] if at else []
+            if action == "move":
+                return ["xdotool"] + move
+            if action in ("click", "double_click", "right_click"):
+                button = "3" if action == "right_click" else "1"
+                repeat = ["--repeat", "2"] if action == "double_click" else []
+                return ["xdotool"] + move + ["click"] + repeat + [button]
+            if action == "scroll":
+                return ["xdotool"] + move + ["click", "--repeat", str(abs(v["dy"])), "4" if v["dy"] < 0 else "5"]
+            if action == "type":
+                return ["xdotool", "type", "--delay", "12", "--", v["text"]]
+            return ["xdotool", "key", "--", v["keys"]]
+        # cliclick (macOS): c: click, dc: double, rc: right, m: move, t: type, kd/ku: modifier down/up, kp: a named key.
+        if action in POINT_ACTIONS:
+            verb = {"move": "m", "click": "c", "double_click": "dc", "right_click": "rc"}[action]
+            return ["cliclick", "%s:%d,%d" % (verb, at[0], at[1])]
+        if action == "type":
+            return ["cliclick", "t:" + v["text"]]
+        parts = v["keys"].split("+")
+        mods = [MODIFIERS.get(p.lower()) for p in parts[:-1]]
+        if None in mods:
+            raise Fault("bad_value", "unknown modifier in %s" % v["keys"])
+        key = parts[-1]
+        if len(key) == 1:
+            press = ["t:" + key]
+        elif key.lower() in CLICLICK_KEYS:
+            press = ["kp:" + CLICLICK_KEYS[key.lower()]]
+        elif key.lower().startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 16:
+            press = ["kp:" + key.lower()]
+        else:
+            raise Fault("unsupported", "the key %s is not supported on macOS" % key)
+        mods = ["cmd" if m == "super" else m for m in mods]
+        return ["cliclick"] + ["kd:" + m for m in mods] + press + ["ku:" + m for m in reversed(mods)]
 
     # ---- screen ----------------------------------------------------------------------------------------------------
     def _screen_tool(self):
