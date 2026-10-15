@@ -207,6 +207,93 @@ func TestComputerAskWaitsForTheOwnerOnTheMachine(t *testing.T) {
 	}
 }
 
+// An approval is refused while the agent drives the mouse or keyboard and just after: an approved click must not be
+// able to press another request's Approve button (in the tray or a notification). Deny always goes through.
+func TestComputerApproveWaitsOutTheMouse(t *testing.T) {
+	e, _ := startComputer(t, "ask")
+	b, _ := json.Marshal(map[string]any{"argv": []string{"echo", "later"}})
+	if err := e.conn.Command(protocol.Command{ID: "g1", Kind: protocol.KindExec, Value: b}, 20000); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && len(e.node.Approvals()) == 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	e.node.mu.Lock()
+	e.node.inputEnded = time.Now() // a click just ran
+	e.node.mu.Unlock()
+	r, err := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdApprove, ID: "g1"}, 2*time.Second)
+	if err == nil || r.OK || !strings.Contains(r.Error, "mouse or keyboard") {
+		t.Fatalf("approve right after a click: %+v %v", r, err)
+	}
+	if len(e.node.Approvals()) != 1 {
+		t.Fatal("the refused approval no longer waits")
+	}
+	e.node.mu.Lock()
+	e.node.inputs["i1"] = true // an input command in flight, not waiting for approval: it is running
+	e.node.inputEnded = time.Now().Add(-InputGuard - time.Second)
+	e.node.mu.Unlock()
+	if r, _ := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdApprove, ID: "g1"}, 2*time.Second); r.OK {
+		t.Fatal("approved while an input command runs")
+	}
+	e.node.mu.Lock()
+	delete(e.node.inputs, "i1")
+	e.node.mu.Unlock()
+	if r, err := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdApprove, ID: "g1"}, 2*time.Second); err != nil || !r.OK {
+		t.Fatal(err, r.Error)
+	}
+	if d := dataOf(t, func() protocol.Message {
+		m, err := e.conn.Reply("g1", 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}()); d["stdout"] != "later\n" {
+		t.Fatalf("approved exec: %v", d)
+	}
+	if err := e.conn.Command(protocol.Command{ID: "g2", Kind: protocol.KindExec, Value: b}, 20000); err != nil {
+		t.Fatal(err)
+	}
+	for time.Now().Before(deadline.Add(5*time.Second)) && len(e.node.Approvals()) == 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	e.node.mu.Lock()
+	e.node.inputEnded = time.Now()
+	e.node.mu.Unlock()
+	if r, err := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdDeny, ID: "g2"}, 2*time.Second); err != nil || !r.OK {
+		t.Fatal("deny is never held back:", err, r.Error)
+	}
+}
+
+// The tray says it is there on every poll; the core tells the computer plugin at most every trayRetell, and at once
+// when the tray quits.
+func TestComputerTrayPresenceReachesThePlugin(t *testing.T) {
+	e, _ := startComputer(t, "ask")
+	if r, err := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdTray, On: true}, 2*time.Second); err != nil || !r.OK {
+		t.Fatal(err, r.Error)
+	}
+	e.node.mu.Lock()
+	first := e.node.trayToldAt
+	e.node.mu.Unlock()
+	if first.IsZero() {
+		t.Fatal("the tray's presence was not passed on")
+	}
+	_, _ = localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdTray, On: true}, 2*time.Second)
+	e.node.mu.Lock()
+	again := e.node.trayToldAt
+	e.node.mu.Unlock()
+	if !again.Equal(first) {
+		t.Fatal("told again within trayRetell")
+	}
+	_, _ = localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdTray}, 2*time.Second)
+	e.node.mu.Lock()
+	off := e.node.trayToldAt
+	e.node.mu.Unlock()
+	if !off.IsZero() {
+		t.Fatal("the tray quitting was not passed on")
+	}
+}
+
 func TestComputerLocalStopLeavesObserveOnly(t *testing.T) {
 	e, work := startComputer(t, "trusted")
 	if r, err := localctl.Call(e.paths.SocketPath(), localctl.Request{Cmd: localctl.CmdStop}, 2*time.Second); err != nil || !r.OK {

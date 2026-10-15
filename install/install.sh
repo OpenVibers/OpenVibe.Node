@@ -480,6 +480,16 @@ fi
 if [ -n "$COMPUTER" ]; then
 	write_computer_config "$CONF/config.json" "$COMPUTER" "$COMPUTER_HOME"
 	say "the computer plugin is on at level $COMPUTER for $SVC_USER (folder $COMPUTER_HOME); change it in $CONF/config.json"
+	# The tray starts when they sign in: what waits for approval with Approve and Deny, the stop and resume.
+	had_config=0
+	[ -d "$COMPUTER_HOME/.config" ] && had_config=1
+	if XDG_CONFIG_HOME="$COMPUTER_HOME/.config" "$BIN_DIR/openvibe-node" tray --autostart on >/dev/null 2>&1; then
+		if [ "$(id -u)" = 0 ]; then
+			[ "$had_config" = 1 ] || chown "$SVC_USER": "$COMPUTER_HOME/.config" 2>/dev/null || true
+			chown "$SVC_USER": "$COMPUTER_HOME/.config/autostart" "$COMPUTER_HOME/.config/autostart/openvibe-node-tray.desktop" 2>/dev/null || true
+		fi
+		say "the tray starts when $SVC_USER signs in (openvibe-node tray; openvibe-node tray --autostart off removes it)"
+	fi
 fi
 
 # ---- the job worker (--worker): the job user, the egress tools, the Codes job runner, the worker config ----

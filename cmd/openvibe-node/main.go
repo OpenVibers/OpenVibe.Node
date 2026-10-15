@@ -60,6 +60,9 @@ Usage:
   openvibe-node approvals [--json]   what the computer plugin waits to be approved (control level "ask")
   openvibe-node approve <ID>         let it run
   openvibe-node deny <ID>            refuse it
+  openvibe-node tray [--autostart on|off]
+                    the Node in your notification area (Linux, Windows): what waits with Approve and Deny, stop,
+                    resume; --autostart starts it when you sign in
   openvibe-node profile verify community.<name> [--server URL] [--key-id ID]
                     check a community robot profile against the signature Bot made when it was reviewed
   openvibe-node version
@@ -110,6 +113,7 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		svcUser = fs.String("user", "", "run the service as this account (install)")
 		session = fs.Bool("user-session", false, "Windows: start at sign-in in your own session instead of as a service (install, uninstall)")
 		keyID   = fs.String("key-id", "", "accept only this Bot signing key id (profile verify)")
+		autoArg = fs.String("autostart", "", "on or off: start the tray when you sign in (tray)")
 	)
 	// Accept flags anywhere: split positionals out.
 	var positional []string
@@ -189,6 +193,8 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 			return 2
 		}
 		err = cmdAnswer(g, cmd, positional[0], stdout)
+	case "tray":
+		err = cmdTray(g, *autoArg, stdout)
 	case "profile":
 		if len(positional) != 2 || positional[0] != "verify" {
 			fmt.Fprintln(stderr, "usage: openvibe-node profile verify community.<name> [--server URL] [--key-id ID]")

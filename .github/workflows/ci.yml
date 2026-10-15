@@ -28,6 +28,12 @@ jobs:
       # (and Ubuntu's AppArmor restricts unprivileged user namespaces).
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: go test -race -count=1 ./...
+      # The tray's desktop notifications, against a fake notification server on a private session bus.
+      - name: tray notifications (private D-Bus)
+        run: |
+          command -v dbus-run-session >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq dbus; }
+          dbus-run-session -- go test -race -count=1 -v -run DesktopNotifier ./cmd/openvibe-node | tee /tmp/notify.log
+          grep -q -- '--- PASS: TestDesktopNotifierAsksAndHearsTheButtons' /tmp/notify.log
       # So they run again as root (jobs as nobody), in a systemd scope with its cgroup delegated, where
       # OPENVIBE_WORKER_TESTS=require makes them fail instead of skipping. Each test binary lies alone in a directory
       # nobody can read, as a function's executable must (a job gets a copy of that directory).

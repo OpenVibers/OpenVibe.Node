@@ -1,5 +1,5 @@
 // Package localctl is the running Node's local control socket: `openvibe-node stop`, `resume`, `status`, `plugins`,
-// `approvals`, `approve` and `deny` talk to it. It is a Unix domain socket (Windows 10+ supports them too) in the state directory with mode
+// `approvals`, `approve`, `deny` and `tray` talk to it. It is a Unix domain socket (Windows 10+ supports them too) in the state directory with mode
 // 0600, so only the account running the Node and root can use it. One JSON request per connection, one JSON answer.
 package localctl
 
@@ -23,11 +23,15 @@ const (
 	CmdApprovals = "approvals"
 	CmdApprove   = "approve"
 	CmdDeny      = "deny"
+	// CmdTray: `openvibe-node tray` shows the approvals (On) or has quit; the computer plugin's own desktop prompts
+	// stay quiet while it does.
+	CmdTray = "tray"
 )
 
 type Request struct {
 	Cmd string `json:"cmd"`
 	ID  string `json:"id,omitempty"` // approve and deny: the command id the plugin asked about
+	On  bool   `json:"on,omitempty"` // tray: the tray is running
 }
 
 type Response struct {

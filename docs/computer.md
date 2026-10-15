@@ -44,7 +44,30 @@ openvibe-node approve <ID>       # let it run
 openvibe-node deny <ID>          # refuse it
 ```
 
-When the Node runs in your graphical session, a waiting request also shows a desktop notification (`notify-send` on Linux, `osascript` on macOS; config `notify: false` turns it off). At most 8 requests wait at once. The panel on openvibe.bot sees `approval` and `approval_done` events, so it can say
+**The tray** (Linux and Windows): `openvibe-node tray` puts the Node in your notification area. The installer's
+`--computer` starts it when you sign in (`openvibe-node tray --autostart on|off` does it by hand). It runs in your
+desktop session, not in the service, and talks to the Node over the same local socket as the commands above:
+
+- the icon is blue when all is well, amber while a request waits, red while a stop is latched, grey when the Node does
+  not answer;
+- the menu lists what waits (kind and what it would do), each with **Approve** and **Deny**, then **Stop everything**
+  (the kill switch), **Resume** and your machines page on openvibe.bot;
+- a new request raises a notification with **Approve** and **Deny** buttons (Linux, any desktop with
+  org.freedesktop.Notifications; without buttons it names the command to answer with).
+
+KDE, XFCE, Cinnamon and MATE show tray icons; GNOME needs the AppIndicator extension, and its notifications still ask.
+While the tray runs, the plugin's own prompts below stay quiet.
+
+**Without the tray**, when the Node runs in your graphical session, the plugin asks itself (config `notify: false` turns
+it off): on Linux a notification with Approve and Deny buttons (`notify-send` from libnotify 0.7.10 on; older ones show
+the command to answer with); on macOS a dialog with **Deny** as its default button, which gives up when the request
+expires. A prompt goes away once the request is answered anywhere else, expires or is stopped.
+
+**An approval is not taken while the agent drives the mouse or keyboard**, nor for 2 seconds after: an approved click
+must not be able to press another request's Approve button. `openvibe-node approve` then answers "answer again in a
+moment", and the tray and the plugin ask again. Deny always goes through.
+
+At most 8 requests wait at once. The panel on openvibe.bot sees `approval` and `approval_done` events, so it can say
 that a request is waiting on the machine.
 
 **Kill switch:** `openvibe-node stop` (and an owner's e-stop) drops the plugin to `observe`: what runs is killed, what
@@ -94,7 +117,7 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 | `max_output_bytes`   | 65536 (≤ 192 KB) | stdout and stderr are each cut there |
 | `max_read_bytes`     | 262144 (≤ 256 KB) | the most one read or write moves |
 | `approval_timeout_s` | 120 (≤ 600)    | how long a request waits for you |
-| `notify`             | `true`         | a desktop notification when a request waits (graphical session only) |
+| `notify`             | `true`         | the plugin's own prompt when a request waits and no tray shows it (graphical session only) |
 | `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
 | `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |

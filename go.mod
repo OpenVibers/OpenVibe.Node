@@ -3,6 +3,8 @@ module github.com/OpenVibers/OpenVibe.Node
 go 1.24.7
 
 require (
+	fyne.io/systray v1.12.2
+	github.com/godbus/dbus/v5 v5.1.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/kardianos/service v1.3.0
 	github.com/pion/ice/v4 v4.4.4

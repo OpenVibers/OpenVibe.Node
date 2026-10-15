@@ -284,6 +284,9 @@ class Later(Plugin):
         else:
             self.fail(cid, "not_allowed", "denied")
 
+    def on_tray(self, attached, ttl_s):
+        self.answers.append(("tray", attached, ttl_s))
+
 
 class DeferredTest(unittest.TestCase):
     def test_data_deferred_and_approval(self):
@@ -302,6 +305,16 @@ class DeferredTest(unittest.TestCase):
         rt.dispatch({"op": "approval", "id": "c", "approved": "yes"})
         self.assertEqual(p.answers[-1], ("c", False), "only a JSON true approves")
         self.assertEqual(lines(out)[-1], {"op": "nack", "id": "c", "fault_code": "not_allowed", "message": "denied"})
+
+    def test_the_tray_op_reaches_the_plugin(self):
+        rt, p, out, clock = make(Later())
+        rt.dispatch({"op": "hello", "config": {}})
+        rt.dispatch({"op": "tray", "attached": True, "ttl_s": 15})
+        rt.dispatch({"op": "tray", "attached": "yes"})
+        self.assertEqual(p.answers, [("tray", True, 15), ("tray", False, None)], "only a JSON true attaches")
+        rt2, p2, out2, _ = make()
+        rt2.dispatch({"op": "hello", "config": {}})
+        rt2.dispatch({"op": "tray", "attached": True, "ttl_s": 15})  # a plugin without on_tray: the base no-op
 
     def test_motion_kinds_keep_the_short_cap(self):
         rt, p, out, clock = make()
