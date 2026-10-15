@@ -188,7 +188,9 @@ class RealBrowserTest(unittest.TestCase):
         base = "http://127.0.0.1:%d" % srv.server_address[1]
         profile = __import__("tempfile").mkdtemp(prefix="ov-browser-")
         self.addCleanup(lambda: shutil.rmtree(profile, ignore_errors=True))
-        b = Browser(find_binary(shutil.which, sys.platform), profile)
+        # CI runners (Ubuntu 24.04) refuse the unprivileged user namespaces Chrome's sandbox needs; a person's machine does
+        # not, and the plugin never turns the sandbox off.
+        b = Browser(find_binary(shutil.which, sys.platform), profile, extra_args=["--no-sandbox"] if os.environ.get("CI") else [])
         self.addCleanup(b.close)
         page = b.open(base + "/")
         self.assertEqual((page["title"], [l["text"] for l in page["links"]]), ("Home", ["Second page"]))

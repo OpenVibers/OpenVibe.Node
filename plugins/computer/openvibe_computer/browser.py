@@ -90,8 +90,10 @@ def find_binary(which, platform, configured=None):
 
 
 class Browser:
-    def __init__(self, binary, profile, headless=True, timeout_s=15.0, popen=subprocess.Popen):
+    def __init__(self, binary, profile, headless=True, timeout_s=15.0, popen=subprocess.Popen, extra_args=()):
         self.binary = binary
+        self.extra_args = list(extra_args)
+        self.stderr_tail = []
         self.profile = profile
         self.headless = headless
         self.timeout_s = timeout_s
@@ -121,6 +123,7 @@ class Browser:
                 "--disable-component-update", "--password-store=basic", "--window-size=1280,900", "about:blank"]
         if self.headless:
             argv.insert(1, "--headless=new")
+        argv[1:1] = self.extra_args
 
         def fds():
             # In the child: Chromium reads commands on 3 and writes on 4. Both ends move above 10 first, so placing one
@@ -131,8 +134,9 @@ class Browser:
             os.dup2(r, 3)
             os.dup2(w, 4)
 
-        self.proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        self.proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                pass_fds=(3, 4), preexec_fn=fds, start_new_session=True)
+        threading.Thread(target=self._stderr, args=(self.proc.stderr,), name="computer-browser-err", daemon=True).start()
         os.close(to_chrome_r)
         os.close(from_chrome_w)
         self.out = os.fdopen(to_chrome_w, "wb", buffering=0)
@@ -142,6 +146,11 @@ class Browser:
         self.session = self.call("Target.attachToTarget", {"targetId": target, "flatten": True}, session=False)["sessionId"]
         self.call("Page.enable")
         self.call("Runtime.enable")
+
+    def _stderr(self, stream):
+        """Keep the browser's last lines of stderr: why it closed, when it does."""
+        for line in iter(stream.readline, b""):
+            self.stderr_tail = (self.stderr_tail + [line.decode("utf-8", "replace").strip()])[-5:]
 
     def _reader(self):
         buf = b""
@@ -193,7 +202,8 @@ class Browser:
         if not ok:
             raise BrowserError("expired", "the browser did not answer %s in time" % method)
         if slot[1] is None:
-            raise BrowserError("hardware", "the browser closed")
+            why = " | ".join(x for x in self.stderr_tail if x)[-400:]
+            raise BrowserError("hardware", "the browser closed" + (": %s" % why if why else ""))
         if "error" in slot[1]:
             raise BrowserError("bad_value", "%s: %s" % (method, slot[1]["error"].get("message", "refused")))
         return slot[1].get("result", {})
@@ -317,4 +327,14 @@ class Browser:
                     proc.kill()
             except (OSError, ProcessLookupError):
                 pass
+        if proc is not None:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except OSError:
+                    pass
         return {"done": True, "closed": proc is not None}
