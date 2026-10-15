@@ -20,6 +20,7 @@ import threading
 import time
 
 MAX_TEXT = 20000
+STARTUP_S = 45.0
 MAX_LINKS = 60
 KEY_CODES = {
     "Enter": (13, "\r"), "Tab": (9, "\t"), "Escape": (27, ""), "Backspace": (8, ""), "Delete": (46, ""),
@@ -142,7 +143,8 @@ class Browser:
         self.out = os.fdopen(to_chrome_w, "wb", buffering=0)
         self.inp = os.fdopen(from_chrome_r, "rb", buffering=0)
         threading.Thread(target=self._reader, name="computer-browser", daemon=True).start()
-        target = self.call("Target.createTarget", {"url": "about:blank"}, session=False)["targetId"]
+        # A first start on a fresh profile can take a while on a slow machine: the first command gets a longer window.
+        target = self.call("Target.createTarget", {"url": "about:blank"}, session=False, timeout_s=max(self.timeout_s, STARTUP_S))["targetId"]
         self.session = self.call("Target.attachToTarget", {"targetId": target, "flatten": True}, session=False)["sessionId"]
         self.call("Page.enable")
         self.call("Runtime.enable")
