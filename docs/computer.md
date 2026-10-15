@@ -90,6 +90,24 @@ A program runs in its own process group with the Node account's rights, at most 
 from `screencapture` (macOS), `grim` (Wayland) or `import`, `scrot` or `gnome-screenshot` (X11), so the Node must run in
 your graphical session for `screen`; without one the plugin simply does not offer it.
 
+### The live screen (`screen_stream`, Node v0.12.0)
+
+You can watch your machine's screen live on openvibe.bot (**Your machines** → **Show screen**), for 30 seconds to
+30 minutes at a time:
+
+- **Only you see it.** Bot gives your machine's start command the WHIP address and key of its own private
+  OpenRestream stream (no recording, never on Live). No operator or agent supplies them, and agents cannot start it.
+- **How it works.** The plugin captures a JPEG frame with the same tools as `screen`, 1 to 5 times a second (2 by
+  default), at most 1600 px wide when Pillow is installed. The core encodes the frames (ffmpeg, else its built-in
+  encoder) and publishes them on a WebRTC session of their own, separate from a robot's camera.
+- **You are told.** The desktop says when it starts ("Your screen is live on OpenVibe"), and `openvibe-node status`
+  shows `Screen: live … until …` while it runs.
+- **It ends** when its time is up, when you press Stop, when capturing fails five times in a row, and at once on
+  `openvibe-node stop` or an e-stop. While a stop is latched, a new start is refused.
+- **Levels.** It runs at every level, like a screenshot. To never offer it, set `allow_screen_stream: false`.
+- **Without Pillow** the capture tool must write JPEG itself: `screencapture`, `grim`, `import` and `scrot` do;
+  `gnome-screenshot` does not.
+
 **Mouse and keyboard** (`input`) is an acting command like running a program: refused at `observe`, approved one by one
 at `ask` (the approval says exactly what it would do: "click at 640, 360 of a 1280×720 picture of the screen",
 "type 12 characters: 'hello there'", "press ctrl+s"). Coordinates are in the space of the screen picture the agent last
@@ -121,12 +139,14 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 | `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
 | `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
+| `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |
 | `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |
 | `browser_profile`    | `~/.local/share/openvibe-node/browser` | its profile folder: the agent's own, unless you choose another |
 | `browser_headless`   | `true`         | `false`: show its window |
 | `browser_idle_s`     | 600            | close it after this long without a command |
 
 `describe` reports `terminal`, `files`, `screen`, `input` and `browser` with the level and folders, so Bot shows what the machine allows;
-telemetry carries the sensors `computer_level` (observe while a stop is latched), `computer_waiting` and
-`computer_running`.
+telemetry carries the sensors `computer_level` (observe while a stop is latched), `computer_waiting`,
+`computer_running` and `computer_screen_stream` (`live` or `off`). `screen.stream` says whether the live screen is
+offered.
 Every request is logged by the Node (`journalctl -u openvibe-node`), with what it would do, approved or denied.

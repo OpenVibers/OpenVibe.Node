@@ -170,13 +170,18 @@ const (
 	// KindBrowser drives a Chromium the agent uses, in a profile of its own (contracts 0.174.0): open, click, fill,
 	// press and back act (the owner's level decides, a latched stop refuses them); read, screenshot and close do not.
 	KindBrowser = "browser"
+	// KindScreenStream shows the machine's screen live to its owner (contracts 0.182.0): {"action": "start",
+	// "whip_url", "publish_key", "seconds"?, "fps"?} or {"action": "stop"}. Bot fills in the WHIP URL and key (the
+	// machine's private OpenRestream stream); no operator sends them. The computer plugin captures the frames, the
+	// core publishes them; a latched stop ends it and refuses a start.
+	KindScreenStream = "screen_stream"
 )
 
 // Kinds lists every command kind the Node understands.
-var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput, KindBrowser}
+var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput, KindBrowser, KindScreenStream}
 
 // ComputerKinds move nothing: they carry long deadlines (DefaultComputerMS, at most MaxComputerMS) and no clamping.
-var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true, KindBrowser: true}
+var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true, KindBrowser: true, KindScreenStream: true}
 
 const (
 	// DefaultComputerMS is a computer command's reply window when the server sends no deadline; MaxComputerMS caps

@@ -10,19 +10,20 @@ import (
 
 // capabilityFor maps a command kind to the describe capability key that declares it.
 var capabilityFor = map[string]string{
-	protocol.KindDrive:    "drive",
-	protocol.KindPTZ:      "ptz",
-	protocol.KindActuator: "actuator",
-	protocol.KindSay:      "say",
-	protocol.KindDisplay:  "display",
-	protocol.KindButton:   "button",
-	protocol.KindPoint:    "point",
-	protocol.KindExec:     "terminal",
-	protocol.KindFS:       "files",
-	protocol.KindScreen:   "screen",
-	protocol.KindProbe:    "probe",
-	protocol.KindInput:    "input",
-	protocol.KindBrowser:  "browser",
+	protocol.KindDrive:        "drive",
+	protocol.KindPTZ:          "ptz",
+	protocol.KindActuator:     "actuator",
+	protocol.KindSay:          "say",
+	protocol.KindDisplay:      "display",
+	protocol.KindButton:       "button",
+	protocol.KindPoint:        "point",
+	protocol.KindExec:         "terminal",
+	protocol.KindFS:           "files",
+	protocol.KindScreen:       "screen",
+	protocol.KindScreenStream: "screen",
+	protocol.KindProbe:        "probe",
+	protocol.KindInput:        "input",
+	protocol.KindBrowser:      "browser",
 }
 
 // Manager supervises every configured plugin.

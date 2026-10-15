@@ -21,6 +21,12 @@ Command kinds and their answers (the ack's ``data``):
 * ``fs`` ``{"op": "list"|"stat"|"read"|"write"|"mkdir", "path", …}``: ``read`` takes ``offset``/``length`` and answers
   ``content_b64``; ``write`` takes ``content_b64`` and ``mode`` (``create``, ``overwrite`` or ``append``).
 * ``screen`` ``{"max_width"?}`` → ``{format, width, height, content_b64}`` (JPEG through Pillow when it is installed).
+* ``screen_stream`` ``{"action": "start", "seconds"?, "fps"?}`` → ``{streaming, seconds, fps, tool}``, or ``{"action":
+  "stop"}``: the screen shown live to the machine's owner. The plugin captures a JPEG frame ``fps`` times a second (at
+  most 5) with the same tools as ``screen`` and hands each to the core as video (``stream: "screen"``), which publishes
+  it to the owner's private stream; the core alone holds the WHIP URL and key. It runs at every level, like a
+  screenshot, says so on the desktop when it starts (config ``notify``), and ends when its time is up (30 s to 30 min),
+  on stop, and at once on the local kill switch or an e-stop. Config ``allow_screen_stream: false`` turns it off.
 * ``input`` ``{"action", "x"?, "y"?, "width"?, "height"?, "dy"?, "text"?, "keys"?}`` → ``{done, action, x?, y?}``: move,
   click, double_click or right_click at a point, scroll by ``dy`` clicks, type ``text`` into whatever has focus, or press
   one key or chord (``keys``, for example ``ctrl+s``). ``x``/``y`` are in the space of a screen picture ``width`` ×
@@ -79,6 +85,11 @@ INPUT_GUARD_S = 2.0
 MAX_OUTPUT_CAP = 192 * 1024
 MAX_READ_CAP = 256 * 1024
 SCREEN_MAX_BYTES = 300 * 1024
+# The live screen: frame width (Pillow resizes larger screens) and JPEG quality; the stream ends after this many
+# capture failures in a row.
+STREAM_WIDTH = 1600
+STREAM_QUALITY = 70
+STREAM_MAX_FAILURES = 5
 INPUT_ACTIONS = frozenset({"move", "click", "double_click", "right_click", "scroll", "type", "key"})
 BROWSER_READS = frozenset({"read", "screenshot", "close"})
 BROWSER_ACTS = frozenset({"open", "click", "fill", "press", "back"})
@@ -121,7 +132,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.6.0"
+    version = "0.7.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -158,6 +169,9 @@ class Computer(Plugin):
         self.browser_headless = True
         self.browser_idle_s = 600
         self.browser = None
+        self.allow_screen_stream = True
+        self.stream = None  # the live screen: {"sid", "until", "fps", "tool", "dir", "stop": Event}
+        self.stream_mu = threading.Lock()
         self.browser_mu = threading.Lock()
         self.browser_op_mu = threading.Lock()
         self.browser_factory = browser_factory or (lambda binary, profile, headless: Browser(binary, profile, headless))
@@ -184,6 +198,7 @@ class Computer(Plugin):
         self.allow_input = config.get("allow_input", True) is not False
         self.notify = config.get("notify", True) is not False
         self.allow_browser = config.get("allow_browser", True) is not False
+        self.allow_screen_stream = config.get("allow_screen_stream", True) is not False
         self.browser_path = config.get("browser_path") or None
         self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
         self.browser_headless = config.get("browser_headless", True) is not False
@@ -199,7 +214,8 @@ class Computer(Plugin):
             caps["terminal"] = {"level": self.level, "timeout_s": self.timeout_s, "max_output_bytes": self.max_output}
         tool = self._screen_tool()
         if tool:
-            caps["screen"] = {"level": self.level, "tool": tool[0]}
+            caps["screen"] = {"level": self.level, "tool": tool[0],
+                              "stream": bool(self.allow_screen_stream and self._stream_capable(tool))}
         if self.allow_probe:
             caps["probe"] = {"lan_only": True, "schemes": ["http", "https", "tcp"]}
         itool = self._input_tool() if self.allow_input else None
@@ -231,6 +247,7 @@ class Computer(Plugin):
         for p in procs:
             self._kill(p)
         self._close_browser()
+        self._end_stream("stopped on the machine")
         for cid in waiting:
             self._close_prompt(cid)
             self.emit_event("approval_done", id=cid, approved=False, reason="stopped")
@@ -262,7 +279,9 @@ class Computer(Plugin):
             self.emit_event("approval_done", id=cid, approved=False, reason="expired")
             self.fail(cid, "not_allowed", "nobody answered on the machine in time")
         # Sensors are what the core forwards to Bot: the machines page shows the level and what waits on the machine.
-        return {"sensors": {"computer_level": self.effective_level(), "computer_waiting": waiting, "computer_running": running}}
+        streaming = self.stream is not None
+        return {"sensors": {"computer_level": self.effective_level(), "computer_waiting": waiting, "computer_running": running,
+                            "computer_screen_stream": "live" if streaming else "off"}}
 
     # ---- paths -----------------------------------------------------------------------------------------------------
     def _inside(self, path):
@@ -296,6 +315,8 @@ class Computer(Plugin):
                 raise Fault("unsupported", "no screen capture tool on this machine")
             width = _int(v.get("max_width"), "max_width", 320, 3840, 1280)
             return self._start(cmd, lambda: self._screen(tool, width))
+        if cmd.kind == "screen_stream":
+            return self._screen_stream(v)
         if cmd.kind == "fs":
             op = v.get("op")
             if op in READ_OPS:
@@ -1040,6 +1061,149 @@ class Computer(Plugin):
         finally:
             if os.path.exists(out):
                 os.unlink(out)
+
+    # ---- the live screen --------------------------------------------------------------------------------------------
+    @staticmethod
+    def _have_pillow():
+        try:
+            import PIL.Image  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @staticmethod
+    def _native_jpeg(tool, path):
+        """The capture tool writing JPEG itself (for machines without Pillow), or None when it only writes PNG."""
+        name = tool[0]
+        if name == "screencapture":
+            return ["screencapture", "-x", "-t", "jpg", path]
+        if name == "grim":
+            return ["grim", "-t", "jpeg", "-q", str(STREAM_QUALITY), path]
+        if name == "import":
+            return ["import", "-silent", "-window", "root", "-quality", str(STREAM_QUALITY), path]
+        if name == "scrot":
+            return ["scrot", "-o", "-q", str(STREAM_QUALITY), path]
+        return None
+
+    def _stream_capable(self, tool):
+        return self._have_pillow() or self._native_jpeg(tool, "x.jpg") is not None
+
+    def _screen_stream(self, v):
+        action = v.get("action")
+        if action == "stop":
+            return {"streaming": False, "stopped": self._end_stream("stopped by its owner")}
+        if action != "start":
+            raise Fault("bad_value", "action is start or stop")
+        if not self.allow_screen_stream:
+            raise Fault("unsupported", "this machine does not show its screen live (allow_screen_stream is off)")
+        if self.runtime is not None and self.runtime.estopped:
+            raise Fault("local_stop", "stopped on the machine")
+        tool = self._screen_tool()
+        if not tool:
+            raise Fault("unsupported", "no screen capture tool on this machine")
+        if not self._stream_capable(tool):
+            raise Fault("unsupported", "%s only writes PNG: install Pillow (pip install pillow) to show the screen live" % tool[0])
+        seconds = _int(v.get("seconds"), "seconds", 30, 1800, 600)
+        fps = _int(v.get("fps"), "fps", 1, 5, 2)
+        self._end_stream("replaced")
+        frames = tempfile.mkdtemp(prefix="openvibe-screen-stream-")  # 0700, this account only
+        stream = {"sid": os.urandom(8).hex(), "until": self.clock() + seconds, "fps": fps, "tool": tool, "dir": frames,
+                  "stop": threading.Event()}
+        with self.stream_mu:
+            self.stream = stream
+        threading.Thread(target=self._stream_loop, args=(stream,), name="computer-screen-stream", daemon=True).start()
+        self._notify_stream(seconds)
+        return {"streaming": True, "sid": stream["sid"], "seconds": seconds, "fps": fps, "tool": tool[0]}
+
+    def _end_stream(self, reason):
+        """End the live screen, if one runs → whether one did."""
+        with self.stream_mu:
+            stream, self.stream = self.stream, None
+        if stream is None:
+            return False
+        stream["stop"].set()
+        stream["reason"] = reason
+        return True
+
+    def _stream_loop(self, stream):
+        period = 1.0 / stream["fps"]
+        n, failures, reason = 0, 0, "time is up"
+        try:
+            while not stream["stop"].is_set():
+                started = self.clock()
+                if started >= stream["until"]:
+                    break
+                path = os.path.join(stream["dir"], "frame-%d.jpg" % (n % 3))  # the core reads each one at once
+                try:
+                    self._stream_frame(stream["tool"], path)
+                    n += 1
+                    failures = 0
+                    self.emit_video(path, stream="screen")
+                except Fault as f:
+                    failures += 1
+                    if failures >= STREAM_MAX_FAILURES:
+                        reason = "the screen capture failed: %s" % f.message
+                        break
+                stream["stop"].wait(max(0.0, period - (self.clock() - started)))
+        finally:
+            shutil.rmtree(stream["dir"], ignore_errors=True)
+            with self.stream_mu:
+                if self.stream is stream:
+                    self.stream = None
+            # The core ends the stream with the same id (a newer one that replaced it carries its own).
+            self.emit_event("screen_stream_ended", sid=stream["sid"], reason=stream.get("reason") or reason, frames=n)
+
+    def _stream_frame(self, tool, path):
+        """One JPEG frame of the screen at path, at most STREAM_WIDTH wide when Pillow can resize it."""
+        if self._have_pillow():
+            fd, png = tempfile.mkstemp(prefix="openvibe-screen-", suffix=".png")
+            os.close(fd)
+            try:
+                self._capture(tool[1](png))
+                from PIL import Image
+                with Image.open(png) as im:
+                    im = im.convert("RGB")
+                    if im.width > STREAM_WIDTH:
+                        im = im.resize((STREAM_WIDTH, max(1, round(im.height * STREAM_WIDTH / im.width))))
+                    im.save(path + ".part", "JPEG", quality=STREAM_QUALITY)
+                os.replace(path + ".part", path)
+            finally:
+                if os.path.exists(png):
+                    os.unlink(png)
+            return
+        self._capture(self._native_jpeg(tool, path + ".part.jpg"))
+        os.replace(path + ".part.jpg", path)
+
+    def _capture(self, argv):
+        proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                          start_new_session=True)
+        try:
+            _, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._kill(proc)
+            raise Fault("hardware", "the screen capture did not finish in 10 s")
+        if proc.returncode != 0:
+            raise Fault("hardware", (err or b"").decode("utf-8", "replace")[:200] or "the capture tool failed")
+
+    def _notify_stream(self, seconds):
+        """Say on the desktop that the screen is live, and how to end it (config `notify`). Best effort."""
+        if not self.notify:
+            return
+        title = "Your screen is live on OpenVibe"
+        body = "Shown to your own account for %d min. Run `openvibe-node stop` to end it now." % max(1, seconds // 60)
+        argv = None
+        if self.platform.startswith("linux") and (self.env.get("DISPLAY") or self.env.get("WAYLAND_DISPLAY")) and self.which("notify-send"):
+            argv = ["notify-send", "--app-name=OpenVibe Node", "--", title, body]
+        elif self.platform == "darwin" and self.which("osascript"):
+            quote = lambda s: '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+            argv = ["osascript", "-e", "display notification %s with title %s" % (quote(body), quote(title))]
+        if argv is None:
+            return
+        try:
+            self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       start_new_session=True)
+        except OSError:
+            pass
 
     @staticmethod
     def _encode(path, max_width):

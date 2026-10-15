@@ -45,6 +45,8 @@ on a community profile runs the same check and warns when it fails. Install a co
 **Your computer for your agents:** `--computer observe|ask|trusted|full` adds the `computer` plugin (terminal, files,
 screen, mouse and keyboard, and a browser of its own for OpenVibe.Actor), running as your own account, at the level you set on the machine; `ask` waits for
 your answer in the tray, a notification's Approve button or `openvibe-node approve <id>` ([docs/computer.md](docs/computer.md)).
+With it on, you can also watch the machine's screen live on openvibe.bot. Only you see it, it runs for up to 30
+minutes, and `openvibe-node stop` ends it at once ([the live screen](docs/computer.md#the-live-screen-screen_stream-node-v0120)).
 
 **A machine that runs your jobs:** add it on openvibe.bot/machines, which prints the same installer with `--worker`: the
 job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.Codes job runner lets you start a coding
