@@ -53,6 +53,8 @@ describes itself and waits for EOF without opening any hardware.
 | `stop`      |                                                               | stop every actuator                                    |
 | `estop`     |                                                               | stop every actuator and refuse motion until `resume`   |
 | `resume`    |                                                               | accept motion again                                    |
+| `approval`  | `id`, `approved` bool                                         | the owner's answer to an `approval` event it raised    |
+| `tray`      | `attached` bool, `ttl_s`                                      | (computer plugin only) the tray shows its approvals for `ttl_s` s unless told again: its own desktop prompts may stay quiet |
 
 `value` has already been validated and clamped to the owner's limits by the core ([protocol.md](protocol.md#commands)).
 `deadline_ms` is relative to receipt and already capped.
@@ -242,8 +244,10 @@ with the owner's control level (`observe`, `ask`, `trusted`, `full`) and folders
 while a stop is latched). Its `ack` carries the answer in `data`. The level is enforced in the plugin from its local
 config, never from a command; `ask` holds a command (`Deferred` in the SDK), raises an `approval` event and answers
 once the owner runs `openvibe-node approve|deny <id>`, which the core forwards to the plugin as `{"op": "approval", "id",
-"approved"}`. The local kill switch drops it to `observe`. Keyboard and mouse input, a browser and the machine's own
-coding agents are later kinds on the same plugin.
+"approved"}`. The local kill switch drops it to `observe`. `input` (mouse and keyboard) and `browser` are kinds on the
+same plugin; the machine's own coding agents come later. While `openvibe-node tray` runs, the core sends the plugin
+`{"op": "tray", "attached": true, "ttl_s": 15}` every few seconds (and `attached: false` when it quits), and the plugin
+leaves the desktop prompts to the tray.
 
 **SDK additions it uses:** `handle()` may return a dict (the ack's `data`) or raise `Deferred` and answer later with
 `complete(id, data)` / `fail(id, code, message)` from any thread; `on_approval(id, approved)`; kinds that move nothing

@@ -90,7 +90,22 @@ type Node struct {
 	// approvals waiting on the machine (the computer plugin at level "ask"), by command id: what
 	// `openvibe-node approvals` lists and `approve`/`deny` answer.
 	approvals map[string]Approval
+	// input commands in flight, by id, and when the last one finished: `approve` is refused while the agent drives
+	// the mouse or keyboard and for InputGuard after, so an approved click cannot press another request's Approve.
+	inputs     map[string]bool
+	inputEnded time.Time
+	trayToldAt time.Time // when the computer plugin was last told the tray shows its approvals
 }
+
+// InputGuard is how long after an input command `approve` stays refused.
+const InputGuard = 2 * time.Second
+
+// trayTTL is how long the computer plugin trusts one "the tray shows your approvals"; the tray says it again
+// every poll and the core passes it on at most every trayRetell.
+const (
+	trayTTL    = 15
+	trayRetell = 5 * time.Second
+)
 
 // Approval is one computer command waiting for its owner's answer on the machine.
 type Approval struct {
@@ -115,7 +130,7 @@ func New(opt Options) (*Node, error) {
 		opt.Log.Error("latch", "err", err)
 	}
 	n := &Node{opt: opt, log: opt.Log, latch: latch, dedup: safety.NewDedup(4096, 10*time.Minute),
-		jobs: newJobs(nil), telemetry: map[string]map[string]any{}, telemMS: 500, approvals: map[string]Approval{}}
+		jobs: newJobs(nil), telemetry: map[string]map[string]any{}, telemMS: 500, approvals: map[string]Approval{}, inputs: map[string]bool{}}
 	n.limits = safety.Merge(protocol.Limits{}, opt.Config.Limits.MaxSpeed, opt.Config.Limits.MaxTurn, opt.Config.Limits.MaxCommandMS)
 
 	var specs []plugins.Spec
@@ -506,9 +521,22 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind+" (the computer plugin is off)")
 		return
 	}
+	if c.Kind == protocol.KindInput {
+		n.mu.Lock()
+		n.inputs[c.ID] = true
+		n.mu.Unlock()
+	}
 	wait := p.Begin(n.ctx, c.ID, c.Kind, c.Value, int(window))
 	go func() {
 		r := wait()
+		if c.Kind == protocol.KindInput {
+			n.mu.Lock()
+			delete(n.inputs, c.ID)
+			if r.OK || (r.FaultCode != protocol.FaultNotAllowed && r.FaultCode != protocol.FaultLocalStop) {
+				n.inputEnded = time.Now() // it ran (or may have run part way)
+			}
+			n.mu.Unlock()
+		}
 		var msg protocol.Message
 		switch {
 		case r.OK && len(r.Data) > protocol.MaxAckData:
@@ -986,6 +1014,42 @@ func (n *Node) Approvals() []Approval {
 	return out
 }
 
+// drivingLocked: an input command runs (it is in flight and not waiting for approval) or finished under InputGuard ago.
+func (n *Node) drivingLocked() bool {
+	for id := range n.inputs {
+		if _, waiting := n.approvals[id]; !waiting {
+			return true
+		}
+	}
+	return !n.inputEnded.IsZero() && time.Since(n.inputEnded) < InputGuard
+}
+
+// tellTray passes the tray's presence to the plugins that handle computer kinds: at once when it quits, at most every
+// trayRetell while it runs.
+func (n *Node) tellTray(on bool) {
+	n.mu.Lock()
+	if on && !n.trayToldAt.IsZero() && time.Since(n.trayToldAt) < trayRetell {
+		n.mu.Unlock()
+		return
+	}
+	if on {
+		n.trayToldAt = time.Now()
+	} else {
+		n.trayToldAt = time.Time{}
+	}
+	n.mu.Unlock()
+	if n.mgr == nil {
+		return
+	}
+	seen := map[*plugins.Plugin]bool{}
+	for kind := range protocol.ComputerKinds {
+		if p := n.mgr.Route(kind, "", ""); p != nil && !seen[p] {
+			seen[p] = true
+			_ = p.Tray(on, trayTTL)
+		}
+	}
+}
+
 func (n *Node) control(r localctl.Request) localctl.Response {
 	switch r.Cmd {
 	case localctl.CmdApprovals:
@@ -997,6 +1061,10 @@ func (n *Node) control(r localctl.Request) localctl.Response {
 	case localctl.CmdApprove, localctl.CmdDeny:
 		n.mu.Lock()
 		a, ok := n.approvals[r.ID]
+		if ok && r.Cmd == localctl.CmdApprove && n.drivingLocked() {
+			n.mu.Unlock()
+			return localctl.Response{Error: "the agent is using the mouse or keyboard (or just did): answer again in a moment, so that its click cannot approve this"}
+		}
 		if ok {
 			delete(n.approvals, r.ID)
 		}
@@ -1011,6 +1079,9 @@ func (n *Node) control(r localctl.Request) localctl.Response {
 		if err := p.Answer(a.ID, r.Cmd == localctl.CmdApprove); err != nil {
 			return localctl.Response{Error: err.Error()}
 		}
+		return localctl.Response{OK: true}
+	case localctl.CmdTray:
+		n.tellTray(r.On)
 		return localctl.Response{OK: true}
 	case localctl.CmdStop:
 		n.mgr.EstopAll() // at once, then persist

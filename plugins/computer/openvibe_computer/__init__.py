@@ -6,7 +6,8 @@ command can never raise it:
 * ``observe`` (the default): capture the screen; list, stat and read files inside the roots.
 * ``ask``: also run programs, write files inside the roots and use the mouse and keyboard, each only after the owner
   approves it on the machine
-  (``openvibe-node approvals``, ``approve <id>``, ``deny <id>``); unanswered requests expire.
+  (the tray, a notification's buttons, or ``openvibe-node approvals``, ``approve <id>``, ``deny <id>``); unanswered
+  requests expire.
 * ``trusted``: run programs, write files inside the roots and use the mouse and keyboard without asking.
 * ``full``: as trusted, anywhere the account running the Node can reach.
 
@@ -40,6 +41,7 @@ Command kinds and their answers (the ack's ``data``):
 """
 
 import base64
+import contextlib
 import http.client
 import ipaddress
 import os
@@ -47,6 +49,7 @@ import socket
 import ssl
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -69,6 +72,9 @@ MAX_STDIN = 64 * 1024
 MAX_LIST = 1000
 MAX_RUNNING = 2
 MAX_WAITING = 8
+# An approval from the desktop (the notification's button or the macOS dialog) is not taken while the agent drives the
+# mouse or keyboard, nor this many seconds after: an approved click must not land on another request's Approve button.
+INPUT_GUARD_S = 2.0
 # The core caps an ack's data at 512 KB of JSON; base64 grows by a third.
 MAX_OUTPUT_CAP = 192 * 1024
 MAX_READ_CAP = 256 * 1024
@@ -89,6 +95,21 @@ CLICLICK_KEYS = {"return": "return", "enter": "enter", "escape": "esc", "esc": "
                  "right": "arrow-right", "home": "home", "end": "end", "page_up": "page-up", "prior": "page-up",
                  "page_down": "page-down", "next": "page-down"}
 
+
+
+def _parse_notify_send(out):
+    """notify-send --wait prints the name of the button pressed; nothing when the notification just closed."""
+    lines = (out or "").strip().splitlines()
+    last = lines[-1].strip() if lines else ""
+    return True if last == "approve" else False if last == "deny" else None
+
+
+def _parse_dialog(out):
+    """osascript's display dialog: "button returned:Approve, gave up:false"; giving up answers nothing."""
+    out = out or ""
+    if "gave up:true" in out:
+        return None
+    return True if "button returned:Approve" in out else False if "button returned:Deny" in out else None
 
 def _int(v, name, lo, hi, default):
     if v is None:
@@ -121,6 +142,11 @@ class Computer(Plugin):
         self.allow_probe = True
         self.allow_input = True
         self.notify = True
+        self.notify_actions = None  # whether notify-send shows buttons (libnotify 0.7.10+); found out on first use
+        self.prompts = {}  # command id -> the notification or dialog process asking about it
+        self.tray_until = 0.0  # the Node's tray shows the approvals until then (op "tray")
+        self.input_busy = 0
+        self.input_ended = None
         self.approval_timeout_s = 120
         self.pending = {}  # command id -> (run, expires_at, summary)
         self.procs = set()
@@ -206,6 +232,7 @@ class Computer(Plugin):
             self._kill(p)
         self._close_browser()
         for cid in waiting:
+            self._close_prompt(cid)
             self.emit_event("approval_done", id=cid, approved=False, reason="stopped")
             self.fail(cid, "local_stop", "stopped on the machine before it ran")
 
@@ -231,6 +258,7 @@ class Computer(Plugin):
                     del self.pending[cid]
             waiting, running = len(self.pending), self.running
         for cid in expired:
+            self._close_prompt(cid)
             self.emit_event("approval_done", id=cid, approved=False, reason="expired")
             self.fail(cid, "not_allowed", "nobody answered on the machine in time")
         # Sensors are what the core forwards to Bot: the machines page shows the level and what waits on the machine.
@@ -288,7 +316,7 @@ class Computer(Plugin):
             if not tool:
                 raise Fault("unsupported", "no input tool on this machine (xdotool on X11, cliclick on macOS)")
             run, summary = self._input_op(tool, v)
-            return self._act(cmd, level, run, summary, threaded=True)
+            return self._act(cmd, level, self._driving(run), summary, threaded=True)
         if cmd.kind == "browser":
             run, summary, acting = self._browser_op(v, level)
             if acting:
@@ -320,29 +348,124 @@ class Computer(Plugin):
         return self._start(cmd, run) if threaded else run()
 
     def _notify(self, cid, summary):
-        """A desktop notification that a request waits (config `notify`, on by default), when the Node runs in a
-        graphical session: notify-send on Linux, osascript on macOS. Best effort: it never blocks or fails a command."""
-        if not self.notify:
+        """Tell the desktop that a request waits (config `notify`, on by default) when the Node runs in a graphical
+        session and the Node's tray does not show it already (`openvibe-node tray`). On Linux the notification has
+        Approve and Deny buttons when notify-send can show them (libnotify 0.7.10+); on macOS a dialog asks, with Deny
+        as its default button. Best effort: it never blocks or fails a command."""
+        if not self.notify or self.clock() < self.tray_until:
             return
         title = "OpenVibe: your agent asks"
-        body = "%s\nopenvibe-node approve %s  (or deny %s)" % (summary[:200], cid, cid)
+        hint = "openvibe-node approve %s  (or deny %s)" % (cid, cid)
+        parse = None
         if self.platform.startswith("linux") and (self.env.get("DISPLAY") or self.env.get("WAYLAND_DISPLAY")) and self.which("notify-send"):
-            argv = ["notify-send", "--app-name=OpenVibe Node", title, body]
+            if self._notify_can_act():
+                argv = ["notify-send", "--app-name=OpenVibe Node", "--urgency=critical", "--wait",
+                        "--expire-time=%d" % (self.approval_timeout_s * 1000), "--action=approve=Approve",
+                        "--action=deny=Deny", "--", title, summary[:200]]
+                parse = _parse_notify_send
+            else:
+                argv = ["notify-send", "--app-name=OpenVibe Node", title, "%s\n%s" % (summary[:200], hint)]
         elif self.platform == "darwin" and self.which("osascript"):
             quote = lambda s: '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
-            argv = ["osascript", "-e", "display notification %s with title %s" % (quote(body), quote(title))]
+            argv = ["osascript", "-e", 'display dialog %s with title %s buttons {"Deny", "Approve"} default button "Deny" '
+                    "giving up after %d with icon caution" % (quote(summary[:400]), quote(title), self.approval_timeout_s)]
+            parse = _parse_dialog
         else:
             return
         try:
-            self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            if parse is None:
+                self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                return
+            proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              start_new_session=True, text=True)
         except OSError:
+            return
+        with self.mu:
+            old = self.prompts.pop(cid, None)
+            self.prompts[cid] = proc
+        if old is not None:
+            self._end_prompt(old)
+        threading.Thread(target=self._await_prompt, args=(cid, proc, parse), name="computer-ask-%s" % cid, daemon=True).start()
+
+    def _notify_can_act(self):
+        """Whether this notify-send has --action and --wait (libnotify 0.7.10+), asked once."""
+        if self.notify_actions is None:
+            try:
+                p = self.popen(["notify-send", "--help"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+                out = p.communicate(timeout=3)[0] or ""
+                self.notify_actions = "--action" in out and "--wait" in out
+            except (OSError, subprocess.SubprocessError, AttributeError):
+                self.notify_actions = False
+        return self.notify_actions
+
+    def _await_prompt(self, cid, proc, parse):
+        try:
+            out = proc.communicate()[0] or ""
+        except (OSError, ValueError, AttributeError):
+            out = ""
+        with self.mu:
+            if self.prompts.get(cid) is proc:
+                del self.prompts[cid]
+        answer = parse(out)
+        if answer is not None:
+            self._desktop_answer(cid, answer)
+
+    def _desktop_answer(self, cid, approved):
+        """The owner pressed Approve or Deny on the desktop. An approval that arrives while the agent drives the mouse or
+        keyboard (or just after) may be the agent's own click: it is not taken, and the request is shown again."""
+        with self.mu:
+            item = self.pending.get(cid)
+            driving = self.input_busy > 0 or (self.input_ended is not None and self.clock() - self.input_ended < INPUT_GUARD_S)
+        if item is None:
+            return
+        if approved and driving:
+            self.log("an approval of %s came from the desktop while the agent drove the mouse or keyboard: asking again", cid)
+            self._notify(cid, item[2])
+            return
+        with (self.runtime.lock if self.runtime is not None else contextlib.nullcontext()):
+            self.on_approval(cid, approved)
+
+    def _close_prompt(self, cid):
+        """Take down the notification or dialog of a request answered elsewhere, expired or stopped."""
+        with self.mu:
+            proc = self.prompts.pop(cid, None)
+        if proc is not None:
+            self._end_prompt(proc)
+
+    def _end_prompt(self, proc):
+        try:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)  # notify-send --wait closes its notification on SIGINT
+        except (OSError, AttributeError):
             pass
+
+    def _driving(self, run):
+        """An input command, counted while it runs so desktop approvals wait it out (INPUT_GUARD_S)."""
+        def go():
+            with self.mu:
+                self.input_busy += 1
+            try:
+                return run()
+            finally:
+                with self.mu:
+                    self.input_busy -= 1
+                    self.input_ended = self.clock()
+        return go
+
+    def on_tray(self, attached, ttl_s):
+        try:
+            ttl = max(1.0, min(float(ttl_s or 15), 60.0))
+        except (TypeError, ValueError):
+            ttl = 15.0
+        self.tray_until = self.clock() + ttl if attached else 0.0
 
     def on_approval(self, cid, approved):
         with self.mu:
             item = self.pending.pop(cid, None)
         if item is None:
             return
+        self._close_prompt(cid)
         (run, threaded), _, summary = item
         self.emit_event("approval_done", id=cid, approved=bool(approved))
         if not approved:

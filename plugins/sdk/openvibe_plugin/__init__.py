@@ -130,6 +130,11 @@ class Plugin:
         """The owner answered, on the machine (`openvibe-node approve|deny <id>`), an approval this plugin asked for
         with emit_event("approval", id=…). Runs on the runtime's main thread."""
 
+    def on_tray(self, attached, ttl_s):
+        """The Node's tray (`openvibe-node tray`, in the owner's graphical session) is showing this plugin's approvals,
+        for the next ttl_s seconds unless told again. A plugin that notifies the desktop itself can stay quiet then.
+        Sent only to the plugin that handles computer kinds."""
+
     # Helpers for drivers.
     def complete(self, cid, data=None):
         """Answer a deferred command with ack (and its data). Safe from any thread."""
@@ -276,6 +281,11 @@ class Runtime:
                     self.plugin.on_approval(msg.get("id"), msg.get("approved") is True)
             except Exception as e:
                 self.plugin.log("approval handler failed: %r", e)
+        elif op == "tray":
+            try:
+                self.plugin.on_tray(msg.get("attached") is True, msg.get("ttl_s"))
+            except Exception as e:
+                self.plugin.log("tray handler failed: %r", e)
         elif op == "resume":
             if self.local_stop_pending:
                 self.plugin.log("resume ignored: the local stop has not reached the core yet")

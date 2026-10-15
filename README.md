@@ -18,6 +18,7 @@ openvibe-node status     # link, plugins, video, battery, stop latch
 openvibe-node stop       # kill switch: stop every motor now and keep it stopped
 openvibe-node resume
 openvibe-node approvals  # the computer plugin at level ask: what waits; approve <id> / deny <id>
+openvibe-node tray       # the same in your notification area, with Approve/Deny notifications (Linux, Windows)
 ```
 
 ## What is in here
@@ -43,7 +44,7 @@ on a community profile runs the same check and warns when it fails. Install a co
 
 **Your computer for your agents:** `--computer observe|ask|trusted|full` adds the `computer` plugin (terminal, files,
 screen, mouse and keyboard, and a browser of its own for OpenVibe.Actor), running as your own account, at the level you set on the machine; `ask` waits for
-`openvibe-node approve <id>` ([docs/computer.md](docs/computer.md)).
+your answer in the tray, a notification's Approve button or `openvibe-node approve <id>` ([docs/computer.md](docs/computer.md)).
 
 **A machine that runs your jobs:** add it on openvibe.bot/machines, which prints the same installer with `--worker`: the
 job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.Codes job runner lets you start a coding

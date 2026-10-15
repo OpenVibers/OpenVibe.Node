@@ -206,6 +206,11 @@ func (p *Plugin) Answer(id string, approved bool) error {
 	return p.send(map[string]any{"op": "approval", "id": id, "approved": approved})
 }
 
+// Tray tells the plugin whether the Node's tray shows its approvals, for the next ttlS seconds unless told again.
+func (p *Plugin) Tray(on bool, ttlS int) error {
+	return p.send(map[string]any{"op": "tray", "attached": on, "ttl_s": ttlS})
+}
+
 // Command sends a command and waits for the plugin's ack or nack.
 func (p *Plugin) Command(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int) Reply {
 	return p.Begin(ctx, id, kind, value, deadlineMS)()

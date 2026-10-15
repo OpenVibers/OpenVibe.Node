@@ -46,6 +46,31 @@ class Out(io.StringIO):
                 self.cond.wait(left)
 
 
+class FakePrompt:
+    """A notify-send --wait or osascript dialog process: answer() is the owner pressing a button."""
+
+    def __init__(self, argv):
+        self.argv = argv
+        self.out = ""
+        self.done = threading.Event()
+        self.closed = threading.Event()
+
+    def answer(self, out):
+        self.out = out
+        self.done.set()
+
+    def communicate(self, timeout=None):
+        self.done.wait(10)
+        return (self.out, None)
+
+    def poll(self):
+        return 0 if self.done.is_set() else None
+
+    def send_signal(self, sig):
+        self.closed.set()
+        self.done.set()
+
+
 def reply(out, cid):
     return out.wait_for(lambda m: m.get("id") == cid and m.get("op") in ("ack", "nack"))
 
@@ -173,6 +198,7 @@ class ComputerTest(unittest.TestCase):
         self.plugin.popen = lambda argv, **kw: calls.append(argv) if argv[0] in ("notify-send", "osascript") else real(argv, **kw)
         self.plugin.which = lambda name: "/usr/bin/" + name
         self.plugin.env = {"DISPLAY": ":0"}
+        self.plugin.notify_actions = False  # an older notify-send: no buttons, the command to answer with
         cid = self.cmd("exec", {"argv": ["echo", "hi"]})
         self.out.wait_for(lambda m: m.get("name") == "approval")
         self.assertEqual(calls[0][:3], ["notify-send", "--app-name=OpenVibe Node", "OpenVibe: your agent asks"])
@@ -184,6 +210,94 @@ class ComputerTest(unittest.TestCase):
         self.plugin.env = {"DISPLAY": ":0"}
         self.cmd("exec", {"argv": ["echo", "quiet"]})
         self.assertEqual(len(calls), 1, "notify off")
+
+    def desktop(self, platform="linux"):
+        """A graphical session whose notification or dialog the test answers: returns the prompts shown."""
+        prompts = []
+        real = self.plugin.popen
+
+        def popen(argv, **kw):
+            if argv[0] in ("notify-send", "osascript"):
+                p = FakePrompt(argv)
+                prompts.append(p)
+                return p
+            return real(argv, **kw)
+        self.plugin.popen = popen
+        self.plugin.which = lambda name: "/usr/bin/" + name
+        self.plugin.platform = platform
+        self.plugin.env = {"DISPLAY": ":0"}
+        self.plugin.notify_actions = True
+        return prompts
+
+    def test_the_notification_approves_and_denies(self):
+        self.boot("ask")
+        prompts = self.desktop()
+        cid = self.cmd("exec", {"argv": ["echo", "from the desktop"]})
+        self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
+        argv = prompts[0].argv
+        self.assertIn("--action=approve=Approve", argv)
+        self.assertIn("--wait", argv)
+        self.assertEqual(argv[-3:-1], ["--", "OpenVibe: your agent asks"])
+        prompts[0].answer("approve\n")
+        self.assertEqual(reply(self.out, cid)["data"]["stdout"], "from the desktop\n")
+        cid = self.cmd("fs", {"op": "write", "path": os.path.join(self.dir, "no.txt"), "content_b64": "eA=="})
+        self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
+        prompts[1].answer("deny\n")
+        self.assertEqual(reply(self.out, cid)["fault_code"], "not_allowed")
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "no.txt")))
+
+    def test_an_answer_elsewhere_takes_the_notification_down(self):
+        self.boot("ask")
+        prompts = self.desktop()
+        cid = self.cmd("exec", {"argv": ["echo", "cli"]})
+        self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
+        self.rt.dispatch({"op": "approval", "id": cid, "approved": True})
+        reply(self.out, cid)
+        self.assertTrue(prompts[0].closed.wait(5), "the notification is closed once the CLI answered")
+
+    def test_a_desktop_approval_while_the_agent_drives_the_mouse_is_not_taken(self):
+        self.boot("ask")
+        prompts = self.desktop()
+        cid = self.cmd("exec", {"argv": ["echo", "maybe"]})
+        self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
+        t = [time.monotonic()]  # the real clock's value: the command's own deadline counts on it
+        self.plugin.clock = lambda: t[0]
+        self.plugin.input_ended = t[0] - 0.5  # a click ran half a second ago
+        prompts[0].answer("approve\n")
+        deadline = time.monotonic() + 5
+        while len(prompts) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(prompts), 2, "asked again")
+        self.assertIn(cid, self.plugin.pending, "still waiting")
+        t[0] += 3
+        prompts[1].answer("approve\n")
+        self.assertEqual(reply(self.out, cid)["data"]["stdout"], "maybe\n")
+
+    def test_the_tray_shows_approvals_instead(self):
+        self.boot("ask")
+        prompts = self.desktop()
+        self.rt.dispatch({"op": "tray", "attached": True, "ttl_s": 15})
+        cid = self.cmd("exec", {"argv": ["echo", "tray"]})
+        self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
+        self.assertEqual(prompts, [], "the tray notifies; the plugin stays quiet")
+        self.rt.dispatch({"op": "tray", "attached": False})
+        self.cmd("exec", {"argv": ["echo", "no tray"]})
+        self.assertEqual(len(prompts), 1)
+
+    def test_macos_asks_with_a_dialog(self):
+        self.boot("ask")
+        prompts = self.desktop("darwin")
+        cid = self.cmd("exec", {"argv": ["echo", "mac"]})
+        self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
+        script = prompts[0].argv[2]
+        self.assertIn('buttons {"Deny", "Approve"} default button "Deny"', script)
+        prompts[0].answer("button returned:Approve, gave up:false\n")
+        self.assertEqual(reply(self.out, cid)["data"]["stdout"], "mac\n")
+        cid = self.cmd("exec", {"argv": ["echo", "ignored"]})
+        self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
+        prompts[1].answer("button returned:, gave up:true\n")
+        time.sleep(0.05)
+        self.assertIn(cid, self.plugin.pending, "giving up answers nothing: the request waits until it expires")
 
     def test_unanswered_requests_expire(self):
         self.boot("ask", approval_timeout_s=10)
