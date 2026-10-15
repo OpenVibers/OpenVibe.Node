@@ -426,8 +426,8 @@ class ComputerTest(unittest.TestCase):
         with open(src, "wb") as f:
             f.write(b"\xff\xd8\xff\xe0" + b"\x00" * 64 + b"\xff\xd9")
         self.plugin._screen_tool = lambda: ("scrot", lambda out: [sys.executable, "-c", "import shutil,sys; shutil.copy(sys.argv[1], sys.argv[2])", src, out])
-        self.plugin._have_pillow = staticmethod(lambda: False)
-        self.plugin._native_jpeg = staticmethod(lambda tool, path: [sys.executable, "-c", "import shutil,sys; shutil.copy(sys.argv[1], sys.argv[2])", src, path])
+        self.plugin._have_pillow = lambda: False
+        self.plugin._native_jpeg = lambda tool, path: [sys.executable, "-c", "import shutil,sys; shutil.copy(sys.argv[1], sys.argv[2])", src, path]
 
     def test_screen_stream_emits_frames_at_every_level_and_stops(self):
         self.boot_stream("observe")
@@ -477,7 +477,7 @@ class ComputerTest(unittest.TestCase):
         r = reply(self.out, self.cmd("screen_stream", {"action": "start"}))
         self.assertEqual((r["fault_code"], r["message"]), ("unsupported", "no screen capture tool on this machine"))
         self.plugin._screen_tool = lambda: ("gnome-screenshot", lambda out: ["true"])
-        self.plugin._have_pillow = staticmethod(lambda: False)
+        self.plugin._have_pillow = lambda: False
         r = reply(self.out, self.cmd("screen_stream", {"action": "start"}))
         self.assertIn("install Pillow", r["message"])
         r = reply(self.out, self.cmd("screen_stream", {"action": "watch"}))
