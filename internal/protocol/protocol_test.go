@@ -395,3 +395,15 @@ func TestJobUndecodableBody(t *testing.T) {
 		t.Fatalf("numeric id: %q", reason)
 	}
 }
+
+func TestComputerActsBrowser(t *testing.T) {
+	want := map[string]bool{"open": true, "click": true, "fill": true, "press": true, "back": true, "read": false, "screenshot": false, "close": false}
+	for action, acts := range want {
+		if got := ComputerActs(KindBrowser, json.RawMessage(`{"action":"`+action+`"}`)); got != acts {
+			t.Errorf("browser %s: acts=%v, want %v", action, got, acts)
+		}
+	}
+	if !ComputerKinds[KindBrowser] {
+		t.Error("browser is a computer kind")
+	}
+}

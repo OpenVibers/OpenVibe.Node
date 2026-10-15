@@ -26,6 +26,13 @@ Command kinds and their answers (the ack's ``data``):
   ``height`` (the ``screen`` answer) and are scaled to the real screen. An acting command: refused at observe, approved
   one by one at ask. xdotool on X11, cliclick on macOS (no scroll there); none on Wayland yet. Config
   ``allow_input: false`` turns it off.
+* ``browser`` ``{"action", "url"?, "selector"?, "text"?, "key"?, "max_width"?}``: a Chromium the agent drives, in a profile
+  of its own (``browser_profile``), over a pipe (no port is opened). ``open`` a ``http(s)`` URL, ``click`` a CSS
+  ``selector`` or the button or link whose ``text`` it shows, ``fill`` a field (``selector`` and ``text``), ``press`` a
+  ``key`` (Enter, Tab, Escape, arrows …), ``back`` → ``{url, title, text, truncated, links}``; ``read`` the page the same
+  way; ``screenshot`` → ``{format, width, height, content_b64}``; ``close``. Reading, screenshots and closing run at every
+  level; the rest are acting commands. Below level full, ``open`` refuses an address on the machine's own network.
+  Config ``allow_browser: false`` turns it off; ``browser_path``, ``browser_headless`` (default true).
 * ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
   etag, last_modified, body, truncated, ms}``; for ``tcp://host:port``: ``{open, ms, error?}``. Read-only, so it runs at
   every level, and only towards the machine's own network: every address the name resolves to must be private,
@@ -50,6 +57,8 @@ import urllib.parse
 
 from openvibe_plugin import Deferred, Fault, Plugin
 
+from .browser import KEY_CODES, Browser, BrowserError, find_binary
+
 LEVELS = ("observe", "ask", "trusted", "full")
 RANK = {name: i for i, name in enumerate(LEVELS)}
 READ_OPS = frozenset({"list", "stat", "read"})
@@ -65,6 +74,10 @@ MAX_OUTPUT_CAP = 192 * 1024
 MAX_READ_CAP = 256 * 1024
 SCREEN_MAX_BYTES = 300 * 1024
 INPUT_ACTIONS = frozenset({"move", "click", "double_click", "right_click", "scroll", "type", "key"})
+BROWSER_READS = frozenset({"read", "screenshot", "close"})
+BROWSER_ACTS = frozenset({"open", "click", "fill", "press", "back"})
+MAX_URL = 2048
+MAX_SELECTOR = 500
 POINT_ACTIONS = frozenset({"move", "click", "double_click", "right_click"})
 MAX_TYPE = 2000
 KEYS_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+-")
@@ -87,11 +100,12 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.4.0"
+    version = "0.5.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
-    def __init__(self, which=shutil.which, popen=subprocess.Popen, clock=time.monotonic, env=None, platform=None, screen_size=None):
+    def __init__(self, which=shutil.which, popen=subprocess.Popen, clock=time.monotonic, env=None, platform=None, screen_size=None,
+                 browser_factory=None, resolve=None):
         self.which = which
         self.popen = popen
         self.screen_size = screen_size or self._screen_size
@@ -112,6 +126,16 @@ class Computer(Plugin):
         self.procs = set()
         self.running = 0
         self.mu = threading.Lock()
+        self.allow_browser = True
+        self.browser_path = None
+        self.browser_profile = None
+        self.browser_headless = True
+        self.browser_idle_s = 600
+        self.browser = None
+        self.browser_mu = threading.Lock()
+        self.browser_op_mu = threading.Lock()
+        self.browser_factory = browser_factory or (lambda binary, profile, headless: Browser(binary, profile, headless))
+        self.resolve = resolve or (lambda host: [ai[4][0] for ai in socket.getaddrinfo(host, None)])
 
     # ---- configuration -------------------------------------------------------------------------------------------
     def _configure(self, config):
@@ -133,6 +157,11 @@ class Computer(Plugin):
         self.allow_probe = config.get("probe", True) is not False
         self.allow_input = config.get("allow_input", True) is not False
         self.notify = config.get("notify", True) is not False
+        self.allow_browser = config.get("allow_browser", True) is not False
+        self.browser_path = config.get("browser_path") or None
+        self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
+        self.browser_headless = config.get("browser_headless", True) is not False
+        self.browser_idle_s = _int(config.get("browser_idle_s"), "browser_idle_s", 60, 86400, 600)
 
     def describe(self, config):
         try:
@@ -150,6 +179,9 @@ class Computer(Plugin):
         itool = self._input_tool() if self.allow_input else None
         if itool:
             caps["input"] = {"level": self.level, "tool": itool, "scroll": itool == "xdotool"}
+        binary = self._browser_binary()
+        if binary:
+            caps["browser"] = {"level": self.level, "browser": os.path.basename(binary), "headless": self.browser_headless}
         return caps
 
     def setup(self, config):
@@ -172,6 +204,7 @@ class Computer(Plugin):
             self.pending.clear()
         for p in procs:
             self._kill(p)
+        self._close_browser()
         for cid in waiting:
             self.emit_event("approval_done", id=cid, approved=False, reason="stopped")
             self.fail(cid, "local_stop", "stopped on the machine before it ran")
@@ -187,6 +220,9 @@ class Computer(Plugin):
 
     def poll(self):
         now = self.clock()
+        b = self.browser
+        if b is not None and b.alive() and b.used_at and time.monotonic() - b.used_at > self.browser_idle_s:
+            self._close_browser()
         expired = []
         with self.mu:
             for cid, (_, at, _) in list(self.pending.items()):
@@ -253,6 +289,11 @@ class Computer(Plugin):
                 raise Fault("unsupported", "no input tool on this machine (xdotool on X11, cliclick on macOS)")
             run, summary = self._input_op(tool, v)
             return self._act(cmd, level, run, summary, threaded=True)
+        if cmd.kind == "browser":
+            run, summary, acting = self._browser_op(v, level)
+            if acting:
+                return self._act(cmd, level, run, summary, threaded=True)
+            return self._start(cmd, run)
         if cmd.kind == "exec":
             if not self.allow_exec:
                 raise Fault("unsupported", "this machine does not allow running programs")
@@ -605,6 +646,112 @@ class Computer(Plugin):
         return run, "%s %s (%d bytes)" % (verb, path, len(data))
 
     # ---- input -----------------------------------------------------------------------------------------------------
+    # ---- browser ---------------------------------------------------------------------------------------------------
+    def _browser_binary(self):
+        if not self.allow_browser or self.platform.startswith("win"):
+            return None
+        return find_binary(self.which, self.platform, self.browser_path)
+
+    def _close_browser(self):
+        # Never waits for an action in flight: closing kills the process, and the action fails at once.
+        b, self.browser = self.browser, None
+        if b is not None:
+            b.close()
+
+    def _local_host(self, host):
+        """Does `host` name (or resolve to) an address on the machine's own network?"""
+        try:
+            addrs = [host] if self._is_ip(host) else self.resolve(host)
+        except (OSError, UnicodeError):
+            raise Fault("bad_value", "%s does not resolve" % host)
+        return any(self._lan(a) for a in addrs) or not addrs
+
+    @staticmethod
+    def _is_ip(host):
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            return False
+
+    def _browser_url(self, raw, level):
+        if not isinstance(raw, str) or not raw or len(raw) > MAX_URL or any(c in raw for c in "\x00\r\n"):
+            raise Fault("bad_value", "url is an http or https address")
+        u = urllib.parse.urlsplit(raw)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            raise Fault("bad_value", "url is an http or https address")
+        if level != "full" and self._local_host(u.hostname.strip("[]")):
+            raise Fault("not_allowed", "%s is on this machine's own network: only at level full" % u.hostname)
+        return raw
+
+    def _browser_op(self, v, level):
+        """(run, summary, acting) for one browser action; nothing is opened or clicked before run()."""
+        binary = self._browser_binary()
+        if not binary:
+            raise Fault("unsupported", "no browser on this machine (Chromium, Chrome, Edge or Brave), or this machine does not allow it")
+        action = v.get("action")
+        if action not in BROWSER_READS and action not in BROWSER_ACTS:
+            raise Fault("bad_value", "action is one of %s" % ", ".join(sorted(BROWSER_READS | BROWSER_ACTS)))
+        selector, text, key, url = v.get("selector"), v.get("text"), v.get("key"), None
+        if action == "open":
+            url = self._browser_url(v.get("url"), level)
+        if action in ("click", "fill") and selector is not None and (not isinstance(selector, str) or not selector or len(selector) > MAX_SELECTOR):
+            raise Fault("bad_value", "selector is a CSS selector of at most %d characters" % MAX_SELECTOR)
+        if action == "click" and selector is None and (not isinstance(text, str) or not text.strip() or len(text) > 200):
+            raise Fault("bad_value", "click takes a selector, or the text of a button or link (at most 200 characters)")
+        if action == "fill":
+            if selector is None:
+                raise Fault("bad_value", "fill takes the selector of the field")
+            if not isinstance(text, str) or len(text) > MAX_TYPE or "\x00" in text:
+                raise Fault("bad_value", "text is at most %d characters" % MAX_TYPE)
+        if action == "press" and key not in KEY_CODES:
+            raise Fault("bad_value", "key is one of %s" % ", ".join(sorted(KEY_CODES)))
+        width = _int(v.get("max_width"), "max_width", 320, 2560, 1280)
+
+        def browser():
+            with self.browser_mu:
+                if self.browser is None or not self.browser.alive():
+                    self.browser = self.browser_factory(binary, self.browser_profile, self.browser_headless)
+                return self.browser
+
+        def run():
+            if action == "close":
+                self._close_browser()
+                return {"done": True}
+            b = browser()
+            try:
+                with self.browser_op_mu:   # one action at a time in the one browser
+                    if action == "open":
+                        return b.open(url)
+                    if action == "read":
+                        return b.read()
+                    if action == "screenshot":
+                        return b.screenshot(width)
+                    if action == "click":
+                        return b.click(selector=selector, text=None if selector else text)
+                    if action == "fill":
+                        return b.fill(selector, text)
+                    if action == "press":
+                        return b.press(key)
+                    return b.back()
+            except BrowserError as e:
+                raise Fault(e.code, e.message)
+
+        if action == "open":
+            summary = "open %s in the browser" % url[:300]
+        elif action == "click":
+            summary = "click %s in the browser" % (selector if selector else "the %r button or link" % text[:120])
+        elif action == "fill":
+            shown = text if len(text) <= 120 else text[:120] + "…"
+            summary = "type %d characters into %s in the browser: %r" % (len(text), selector[:200], shown)
+        elif action == "press":
+            summary = "press %s in the browser" % key
+        elif action == "back":
+            summary = "go back in the browser"
+        else:
+            summary = "%s the browser" % action
+        return run, summary, action in BROWSER_ACTS
+
     def _input_tool(self):
         """xdotool on an X11 session, cliclick on macOS, else None (Wayland has no general input tool yet)."""
         if self.platform == "darwin" and self.which("cliclick"):
