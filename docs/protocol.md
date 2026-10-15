@@ -201,6 +201,7 @@ at most every 500 ms (≤ 2 Hz, Bot's cap). There is no separate `event` message
 | `exec`     | `{"argv": ["prog", "arg"…], "cwd"?, "timeout_s"?, "stdin"?}`: run a program on the machine ([computer.md](computer.md)) | computer |
 | `fs`       | `{"op": "list"\|"stat"\|"read"\|"write"\|"mkdir", "path", …}`: a file or folder on the machine                  | computer |
 | `screen`   | `{"max_width"?}`: capture the machine's screen                                                          | computer |
+| `screen_stream` | `{"action": "start", "whip_url", "publish_key", "seconds"?, "fps"?}` or `{"action": "stop"}`: show the screen live on the machine's private stream (Bot fills in the URL and key) | computer |
 | `probe`    | `{"target": "http(s)://…" \| "tcp://host:port", "timeout_s"?}`: a read-only check of the machine's own network | computer |
 
 Sign conventions: `throttle`/`x` positive = forward; `steer` positive = turn right; `y` positive = strafe left;

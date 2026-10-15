@@ -699,6 +699,14 @@ func cmdStatus(g *globals, asJSON bool, stdout io.Writer) error {
 		fmt.Fprintf(stdout, " (%s)", s.Video.LastError)
 	}
 	fmt.Fprintln(stdout)
+	if s.Screen.State != "" && s.Screen.State != "off" {
+		// Shown only while it runs: the owner sees at a glance that their screen is live.
+		fmt.Fprintf(stdout, "Screen:   %s to your OpenVibe account until %s, %d frames", s.Screen.State, s.Screen.Until, s.Screen.Frames)
+		if s.Screen.LastError != "" && s.Screen.State != "live" {
+			fmt.Fprintf(stdout, " (%s)", s.Screen.LastError)
+		}
+		fmt.Fprintln(stdout, "; `openvibe-node stop` ends it")
+	}
 	fmt.Fprintln(stdout, "Plugins:")
 	for _, p := range s.Plugins {
 		fmt.Fprintf(stdout, "  %-15s %-9s %s %s", p.Name, p.State, p.Driver, p.Version)

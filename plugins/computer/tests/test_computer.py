@@ -418,6 +418,81 @@ class ComputerTest(unittest.TestCase):
         self.assertEqual(base64.b64decode(d["content_b64"])[:2], b"\xff\xd8")
 
 
+    # ---- the live screen -----------------------------------------------------------------------------------------
+    def boot_stream(self, level="observe", **config):
+        """A plugin whose screen tool copies one JPEG, so frames come without a display."""
+        self.boot(level, notify=False, **config)
+        src = os.path.join(self.dir, "screen.jpg")
+        with open(src, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0" + b"\x00" * 64 + b"\xff\xd9")
+        self.plugin._screen_tool = lambda: ("scrot", lambda out: [sys.executable, "-c", "import shutil,sys; shutil.copy(sys.argv[1], sys.argv[2])", src, out])
+        self.plugin._have_pillow = staticmethod(lambda: False)
+        self.plugin._native_jpeg = staticmethod(lambda tool, path: [sys.executable, "-c", "import shutil,sys; shutil.copy(sys.argv[1], sys.argv[2])", src, path])
+
+    def test_screen_stream_emits_frames_at_every_level_and_stops(self):
+        self.boot_stream("observe")
+        r = reply(self.out, self.cmd("screen_stream", {"action": "start", "seconds": 60, "fps": 5}))
+        self.assertEqual(r["op"], "ack")
+        d = r["data"]
+        self.assertEqual((d["streaming"], d["seconds"], d["fps"], d["tool"]), (True, 60, 5, "scrot"))
+        frame = self.out.wait_for(lambda m: m.get("op") == "video" and m.get("stream") == "screen")
+        self.assertEqual(frame["format"], "jpeg")
+        self.assertTrue(frame["path"].startswith(tempfile.gettempdir()))
+        self.out.wait_for(lambda m: m.get("op") == "video" and m.get("path", "").endswith("frame-1.jpg"))
+        self.assertEqual(self.plugin.poll()["sensors"]["computer_screen_stream"], "live")
+        stop = reply(self.out, self.cmd("screen_stream", {"action": "stop"}))
+        self.assertEqual(stop["data"], {"streaming": False, "stopped": True})
+        ended = self.out.wait_for(lambda m: m.get("op") == "event" and m.get("name") == "screen_stream_ended")
+        self.assertEqual((ended["sid"], ended["reason"]), (d["sid"], "stopped by its owner"))
+        self.assertFalse(os.path.exists(os.path.dirname(frame["path"])), "the frames' folder is removed")
+        self.assertEqual(self.plugin.poll()["sensors"]["computer_screen_stream"], "off")
+
+    def test_screen_stream_ends_on_the_kill_switch_and_is_refused_while_latched(self):
+        self.boot_stream("trusted")
+        first = reply(self.out, self.cmd("screen_stream", {"action": "start", "seconds": 60}))["data"]
+        self.rt.dispatch({"op": "estop"})
+        ended = self.out.wait_for(lambda m: m.get("op") == "event" and m.get("name") == "screen_stream_ended")
+        self.assertEqual((ended["sid"], ended["reason"]), (first["sid"], "stopped on the machine"))
+        r = reply(self.out, self.cmd("screen_stream", {"action": "start"}))
+        self.assertEqual((r["op"], r["fault_code"]), ("nack", "local_stop"))
+
+    def test_screen_stream_replaces_and_ends_on_its_own(self):
+        self.boot_stream()
+        a = reply(self.out, self.cmd("screen_stream", {"action": "start", "seconds": 60}))["data"]
+        b = reply(self.out, self.cmd("screen_stream", {"action": "start", "seconds": 30}))["data"]
+        self.assertNotEqual(a["sid"], b["sid"])
+        ended = self.out.wait_for(lambda m: m.get("op") == "event" and m.get("name") == "screen_stream_ended")
+        self.assertEqual((ended["sid"], ended["reason"]), (a["sid"], "replaced"))
+        # Time up: a clock moved past the end stops the frames.
+        self.plugin.stream["until"] = 0
+        late = self.out.wait_for(lambda m: m.get("op") == "event" and m.get("name") == "screen_stream_ended" and m.get("sid") == b["sid"])
+        self.assertEqual(late["reason"], "time is up")
+
+    def test_screen_stream_refusals(self):
+        self.boot("observe", allow_screen_stream=False)
+        self.plugin._screen_tool = lambda: ("scrot", lambda out: ["true"])
+        r = reply(self.out, self.cmd("screen_stream", {"action": "start"}))
+        self.assertEqual(r["fault_code"], "unsupported")
+        self.boot("observe")
+        r = reply(self.out, self.cmd("screen_stream", {"action": "start"}))
+        self.assertEqual((r["fault_code"], r["message"]), ("unsupported", "no screen capture tool on this machine"))
+        self.plugin._screen_tool = lambda: ("gnome-screenshot", lambda out: ["true"])
+        self.plugin._have_pillow = staticmethod(lambda: False)
+        r = reply(self.out, self.cmd("screen_stream", {"action": "start"}))
+        self.assertIn("install Pillow", r["message"])
+        r = reply(self.out, self.cmd("screen_stream", {"action": "watch"}))
+        self.assertEqual(r["fault_code"], "bad_value")
+
+    def test_screen_stream_capability_and_native_jpeg_tools(self):
+        c = Computer(env={}, platform="linux")
+        self.assertEqual(c._native_jpeg(("grim", None), "/t/f.jpg"), ["grim", "-t", "jpeg", "-q", "70", "/t/f.jpg"])
+        self.assertEqual(c._native_jpeg(("screencapture", None), "/t/f.jpg"), ["screencapture", "-x", "-t", "jpg", "/t/f.jpg"])
+        self.assertIsNone(c._native_jpeg(("gnome-screenshot", None), "/t/f.jpg"))
+        which = lambda name: "/usr/bin/" + name if name == "grim" else None
+        w = Computer(which=which, env={"WAYLAND_DISPLAY": "wayland-0"}, platform="linux")
+        self.assertTrue(w.describe({"level": "observe"})["screen"]["stream"])
+        self.assertFalse(w.describe({"level": "observe", "allow_screen_stream": False})["screen"]["stream"])
+
     # ---- input ---------------------------------------------------------------------------------------------------
     def boot_input(self, level, platform="linux", tool="xdotool", size=(2560, 1440)):
         self.argvs = []

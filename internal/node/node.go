@@ -66,6 +66,8 @@ type Node struct {
 	mgr    *plugins.Manager
 	link   *link.Link
 	pub    *video.Publisher
+	// screen is the owner's live view of the machine's screen (screen.go), apart from a robot's camera.
+	screen screenState
 
 	ctx context.Context
 
@@ -496,6 +498,10 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 		nack(protocol.FaultBadValue, "value must be a JSON object")
 		return
 	}
+	if c.Kind == protocol.KindScreenStream {
+		n.screenCommand(c, entry, received, nack)
+		return
+	}
 	if protocol.ComputerActs(c.Kind, c.Value) {
 		st := n.latch.State()
 		if st.Local {
@@ -670,12 +676,20 @@ func (n *Node) output(o plugins.Output) {
 			fields = nil
 		}
 		n.log.Info("plugin event", "plugin", o.Plugin, "event", name)
+		if name == "screen_stream_ended" {
+			sid, _ := o.Data["sid"].(string)
+			n.screenEnded(o.Plugin, sid)
+		}
 		n.trackApproval(o.Plugin, name, o.Data, o.At)
 		n.mu.Lock()
 		n.events = append(n.events, protocol.Event{Name: name, Driver: o.Plugin, TS: o.At.UnixMilli(), Fields: fields})
 		n.mu.Unlock()
 		n.flushTelemetry(true)
 	case plugins.OutVideo:
+		if stream, _ := o.Data["stream"].(string); stream == "screen" {
+			n.screenFrame(o)
+			return
+		}
 		n.mu.Lock()
 		j, from := n.jpeg, n.jpegFrom
 		n.mu.Unlock()
@@ -875,6 +889,7 @@ type Status struct {
 	Limits    safety.Limits      `json:"limits"`
 	Plugins   []PluginStatus     `json:"plugins"`
 	Video     VideoStatus        `json:"video"`
+	Screen    ScreenStatus       `json:"screen"`
 	ConfigDir string             `json:"config_dir"`
 	StateDir  string             `json:"state_dir"`
 	Telemetry protocol.Telemetry `json:"telemetry"`
@@ -933,6 +948,7 @@ func (n *Node) Status() Status {
 	if n.worker != nil {
 		s.Jobs = n.worker.Jobs()
 	}
+	s.Screen = n.screenStatus()
 	s.Video.State = video.StateOff
 	if n.pub != nil {
 		s.Video.State, s.Video.Frames, s.Video.LastError = n.pub.State(), n.pub.Frames(), n.pub.LastError()

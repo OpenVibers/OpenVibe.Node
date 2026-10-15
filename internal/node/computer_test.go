@@ -27,6 +27,12 @@ import (
 // folder it returns, against the fake Bot.
 func startComputer(t *testing.T, level string) (*env, string) {
 	t.Helper()
+	return startComputerWith(t, level, nil)
+}
+
+// startComputerWith is startComputer with tweak applied to the plugin's config and the Node's options before it starts.
+func startComputerWith(t *testing.T, level string, tweak func(*config.PluginConfig, *Options)) (*env, string) {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("end-to-end tests run on unix")
 	}
@@ -66,8 +72,12 @@ func startComputer(t *testing.T, level string) (*env, string) {
 	cfg.Plugins = []config.PluginConfig{{Name: "computer", Config: map[string]any{"level": level, "roots": []string{work}, "timeout_s": 20},
 		Env: map[string]string{"PYTHONPATH": filepath.Join(root, "plugins/sdk") + string(os.PathListSeparator) + filepath.Join(root, "plugins/computer")}}}
 	cfg.Video = config.VideoConfig{Source: "off"}
-	n, err := New(Options{Config: cfg, Paths: paths, Creds: creds, Version: "test", HeartbeatInterval: 100 * time.Millisecond,
-		LinkBackoffMin: 50 * time.Millisecond, LatchPoll: 50 * time.Millisecond, Log: testLog()})
+	opt := Options{Config: cfg, Paths: paths, Creds: creds, Version: "test", HeartbeatInterval: 100 * time.Millisecond,
+		LinkBackoffMin: 50 * time.Millisecond, LatchPoll: 50 * time.Millisecond, Log: testLog()}
+	if tweak != nil {
+		tweak(&opt.Config.Plugins[0], &opt)
+	}
+	n, err := New(opt)
 	if err != nil {
 		t.Fatal(err)
 	}
