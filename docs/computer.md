@@ -48,7 +48,8 @@ When the Node runs in your graphical session, a waiting request also shows a des
 that a request is waiting on the machine.
 
 **Kill switch:** `openvibe-node stop` (and an owner's e-stop) drops the plugin to `observe`: what runs is killed, what
-waits is denied, and the core also refuses `exec`, file writes and `input` until `openvibe-node resume`. `halt` kills what runs.
+waits is denied, the agent's browser is closed, and the core also refuses `exec`, file writes, `input` and the browser's
+acting actions until `openvibe-node resume`. `halt` kills what runs.
 
 ## What it does
 
@@ -59,6 +60,7 @@ waits is denied, and the core also refuses `exec`, file writes and `input` until
 | `probe`  | `target`: `http(s)://…` (one GET, no redirect followed) or `tcp://host:port`; `timeout_s` | `status`, `content_type`, `etag`, `last_modified`, `body` (≤ 64 KB), `ms`; or `open`, `ms` |
 | `screen` | `max_width` (default 1280)                                                                    | `format` (`jpeg` with Pillow, else `png` ≤ 300 KB), `width`, `height`, `content_b64` |
 | `input`  | `action`: `move`, `click`, `double_click`, `right_click` (`x`, `y`), `scroll` (`dy` clicks, ±20), `type` (`text`, ≤ 2000), `key` (`keys`: one key or chord, `ctrl+s`, `Return`); `width`, `height`: the picture `x`, `y` are measured in | `done`, `action`, and the real `x`, `y` it used |
+| `browser` | `action`: `open` (`url`, http or https), `click` (`selector`, or the `text` a button or link shows), `fill` (`selector`, `text` ≤ 2000), `press` (`key`: Enter, Tab, Escape, Backspace, Delete, arrows, PageUp, PageDown, Home, End, Space), `back`, `read`, `screenshot` (`max_width`), `close` | a page: `url`, `title`, `text` (its visible text, ≤ 20,000 characters), `truncated`, `links` (the first 60); `screenshot`: `format`, `width`, `height`, `content_b64`; `fill`: `done`, `chars` |
 
 A program runs in its own process group with the Node account's rights, at most 2 at a time, and is killed at
 `timeout_s` (the owner's `timeout_s` is the cap). A write with `overwrite` replaces the file atomically. Screens come
@@ -72,6 +74,14 @@ saw (`width` × `height`), scaled to your real screen. It uses `xdotool` on an X
 (`brew install cliclick`; no scrolling there); Wayland has no general input tool yet, so it is not offered there. Typed
 text and keys are passed to the tool as arguments, never through a shell, and `keys` takes only letters, digits, `+`,
 `-` and `_`.
+
+**The browser** (`browser`) is a Chromium-family browser (Chromium, Chrome, Edge or Brave) the agent drives:
+- **Its own profile.** It runs in a folder of its own (`browser_profile`, by default `~/.local/share/openvibe-node/browser`), so the agent never sees the sessions of your own browser unless you point it at one. Sign it in to a site yourself (`browser_headless: false` shows its window) if you want the agent to work there as you.
+- **No port.** The Node starts it on the first command with `--remote-debugging-pipe`: it speaks the DevTools protocol over two file descriptors, so nothing else on the machine can drive it.
+- **Levels.** `read`, `screenshot` and `close` run at every level. `open`, `click`, `fill`, `press` and `back` are acting commands: refused at `observe`, approved one by one at `ask`. The approval says exactly what would happen: "open https://… in the browser", "type 5 characters into #q in the browser: 'hello'".
+- **Your own network.** Below level `full`, `open` refuses an address on the machine's own network (private, loopback or link-local, checked for every address the name resolves to).
+- **Closing.** It closes after `browser_idle_s` without a command and at the kill switch.
+- **Platforms.** Linux and macOS; not offered on Windows yet.
 
 ## Config
 
@@ -87,8 +97,13 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 | `notify`             | `true`         | a desktop notification when a request waits (graphical session only) |
 | `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
 | `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
+| `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
+| `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |
+| `browser_profile`    | `~/.local/share/openvibe-node/browser` | its profile folder: the agent's own, unless you choose another |
+| `browser_headless`   | `true`         | `false`: show its window |
+| `browser_idle_s`     | 600            | close it after this long without a command |
 
-`describe` reports `terminal`, `files`, `screen` and `input` with the level and folders, so Bot shows what the machine allows;
+`describe` reports `terminal`, `files`, `screen`, `input` and `browser` with the level and folders, so Bot shows what the machine allows;
 telemetry carries the sensors `computer_level` (observe while a stop is latched), `computer_waiting` and
 `computer_running`.
 Every request is logged by the Node (`journalctl -u openvibe-node`), with what it would do, approved or denied.

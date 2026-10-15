@@ -167,13 +167,16 @@ const (
 	// KindInput moves the mouse, clicks, scrolls, types or presses keys on the machine's screen (contracts 0.171.0):
 	// an acting command, so the owner's level decides and a latched stop refuses it.
 	KindInput = "input"
+	// KindBrowser drives a Chromium the agent uses, in a profile of its own (contracts 0.174.0): open, click, fill,
+	// press and back act (the owner's level decides, a latched stop refuses them); read, screenshot and close do not.
+	KindBrowser = "browser"
 )
 
 // Kinds lists every command kind the Node understands.
-var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput}
+var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput, KindBrowser}
 
 // ComputerKinds move nothing: they carry long deadlines (DefaultComputerMS, at most MaxComputerMS) and no clamping.
-var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true}
+var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true, KindBrowser: true}
 
 const (
 	// DefaultComputerMS is a computer command's reply window when the server sends no deadline; MaxComputerMS caps
@@ -186,8 +189,8 @@ const (
 )
 
 // ComputerActs reports whether a computer command changes the machine (runs a program, writes a file, uses the mouse
-// or keyboard): those are refused while the local stop or an e-stop is latched. Capturing the screen and reading files
-// are not.
+// or keyboard, drives the browser): those are refused while the local stop or an e-stop is latched. Capturing the
+// screen, reading files and reading or closing the browser are not.
 func ComputerActs(kind string, value json.RawMessage) bool {
 	switch kind {
 	case KindExec, KindInput:
@@ -198,6 +201,12 @@ func ComputerActs(kind string, value json.RawMessage) bool {
 		}
 		_ = json.Unmarshal(value, &v)
 		return v.Op != "list" && v.Op != "stat" && v.Op != "read"
+	case KindBrowser:
+		var v struct {
+			Action string `json:"action"`
+		}
+		_ = json.Unmarshal(value, &v)
+		return v.Action != "read" && v.Action != "screenshot" && v.Action != "close"
 	}
 	return false
 }

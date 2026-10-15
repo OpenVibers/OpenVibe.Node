@@ -41,8 +41,8 @@ signature against the key Bot publishes (`--key-id` pins one) and names the plug
 on a community profile runs the same check and warns when it fails. Install a community plugin only when it passes
 ([docs/plugins.md](docs/plugins.md#community-plugins)).
 
-**Your computer for your agents:** `--computer observe|ask|trusted|full` adds the `computer` plugin (terminal, files
-and screen for OpenVibe.Actor), running as your own account, at the level you set on the machine; `ask` waits for
+**Your computer for your agents:** `--computer observe|ask|trusted|full` adds the `computer` plugin (terminal, files,
+screen, mouse and keyboard, and a browser of its own for OpenVibe.Actor), running as your own account, at the level you set on the machine; `ask` waits for
 `openvibe-node approve <id>` ([docs/computer.md](docs/computer.md)).
 
 **A machine that runs your jobs:** add it on openvibe.bot/machines, which prints the same installer with `--worker`: the
