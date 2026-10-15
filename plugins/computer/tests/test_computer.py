@@ -260,9 +260,9 @@ class ComputerTest(unittest.TestCase):
         prompts = self.desktop()
         cid = self.cmd("exec", {"argv": ["echo", "maybe"]})
         self.out.wait_for(lambda m: m.get("name") == "approval" and m.get("id") == cid)
-        t = [500.0]
+        t = [time.monotonic()]  # the real clock's value: the command's own deadline counts on it
         self.plugin.clock = lambda: t[0]
-        self.plugin.input_ended = 499.5  # a click ran half a second ago
+        self.plugin.input_ended = t[0] - 0.5  # a click ran half a second ago
         prompts[0].answer("approve\n")
         deadline = time.monotonic() + 5
         while len(prompts) < 2 and time.monotonic() < deadline:
