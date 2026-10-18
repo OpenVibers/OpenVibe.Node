@@ -1,6 +1,7 @@
 #!/bin/sh
 # OpenVibe Node installer.
 #
+#   curl -fsSL https://openvibe.bot/install | sh
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none]
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> [--driver …]
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> --worker
@@ -9,6 +10,12 @@
 # a Python virtual environment for the plugins, disables the Adeept kit's stock control server if it finds it,
 # installs the system service and pairs the device with <CODE>. Run it again to upgrade; the credential is kept.
 # openvibe.bot shows one of these lines with the robot id (or the Network pairing) and a fresh code filled in.
+#
+# With no robot and no code (the first line) it is the one command on the robot's computer: on a Raspberry Pi it turns
+# on I2C and SPI, installs the camera tools and what the drivers need, looks at the I2C bus for a kit it knows (an
+# Adeept ADR036 4WD at 0x5f) and at the camera, installs, then shows a code and a QR code. Its owner enters the code at
+# openvibe.bot/link (signed in), sees what was found and approves it; the robot is made, this machine pairs with it,
+# and the installer checks the driver and the camera are running and prints the robot's panel.
 #
 # Options:
 #   --robot ROBOT    the rob_… id of the robot to pair with (from openvibe.bot). A driver kind here (adeept, …) is the
@@ -28,6 +35,7 @@
 #                    docs/computer.md), at LEVEL observe, ask, trusted or full. The service then runs as YOUR account
 #                    (the one that ran sudo), never root, and its folders are your home. Linux only; not with --worker.
 #   --no-service     install and pair, but do not install the service.
+#   --no-claim       with no robot and no code: install without pairing (no code is asked for on openvibe.bot).
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
 #                    downloading.
 #   --version TAG    release to download (default: latest).
@@ -57,6 +65,8 @@ LOCAL=""
 TAG="latest"
 WORKER=0
 COMPUTER=""
+CLAIM_OK=1
+DRIVER_GIVEN=0
 # The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0).
 CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.3.1}"
 CODES_DIR=/opt/openvibe-codes
@@ -64,8 +74,9 @@ CODES_DIR=/opt/openvibe-codes
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
 	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker]"
-	echo "                  [--computer observe|ask|trusted|full] [--no-service]"
+	echo "                  [--computer observe|ask|trusted|full] [--no-service] [--no-claim]"
 	echo "                  [--local DIR] [--version TAG]"
+	echo "  curl -fsSL https://openvibe.bot/install | sh      (finds the kit, then shows a code to approve on openvibe.bot/link)"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --network https://openvibe.network --pairing pair_… --code ABCD-1234"
 }
@@ -83,8 +94,8 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--robot) robot_arg "${2:-}"; shift 2 ;;
 	--robot=*) robot_arg "${1#*=}"; shift ;;
-	--driver) DRIVER="${2:-}"; shift 2 ;;
-	--driver=*) DRIVER="${1#*=}"; shift ;;
+	--driver) DRIVER="${2:-}"; DRIVER_GIVEN=1; shift 2 ;;
+	--driver=*) DRIVER="${1#*=}"; DRIVER_GIVEN=1; shift ;;
 	--code) CODE="${2:-}"; shift 2 ;;
 	--code=*) CODE="${1#*=}"; shift ;;
 	--name) NAME="${2:-}"; shift 2 ;;
@@ -97,6 +108,7 @@ while [ $# -gt 0 ]; do
 	--computer) COMPUTER="${2:-}"; shift 2 ;;
 	--computer=*) COMPUTER="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
+	--no-claim) CLAIM_OK=0; shift ;;
 	--local) LOCAL="${2:-}"; shift 2 ;;
 	--version) TAG="${2:-}"; shift 2 ;;
 	-h|--help) usage; exit 0 ;;
@@ -112,6 +124,9 @@ case "$PAIRING" in ""|pair_*) ;; *) [ -z "$CODE" ] || die "--pairing must be a p
 if [ -n "$PAIRING" ] && [ -z "$NETWORK" ]; then die "--pairing needs --network, the OpenVibe.Network URL"; fi
 if [ -n "$NETWORK" ] && [ -z "$CODE" ]; then die "--network needs the pairing code (--code)"; fi
 case "$NETWORK" in ""|https://*|http://localhost*|http://127.0.0.1*) ;; *) die "--network must be an https:// URL" ;; esac
+# No robot, no code, no Network pairing, not a worker or a computer: the one command (openvibe.bot/link, see the top).
+CLAIM=0
+if [ "$CLAIM_OK" = 1 ] && [ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ]; then CLAIM=1; fi
 
 # Run "$@" pair … with the pairing the flags gave: through Network with --network, else Bot's legacy code.
 pair_with() {
@@ -128,6 +143,119 @@ pair_with() {
 
 if [ "${OPENVIBE_INSTALL_PAIR_ARGS_ONLY:-0}" = 1 ]; then
 	pair_with printf '%s\n'
+	exit 0
+fi
+
+# set_driver_config <config.json>: $PLUGINS, $KIND and $VIDEO (driver_setup's) in that config, the rest kept (a computer
+# plugin too). The one command writes the driver the bus suggested, then the one its owner chose, if that differs.
+set_driver_config() {
+	${SUDO:-} env OV_PLUGINS="$PLUGINS" OV_KIND="$KIND" OV_VIDEO="{$VIDEO}" python3 - "$1" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        conf = json.load(f)
+except (OSError, ValueError):
+    conf = {}
+keep = [p for p in conf.get('plugins') or [] if p.get('name') == 'computer']
+conf['plugins'] = json.loads(os.environ['OV_PLUGINS']) + keep
+conf['device_kind'] = os.environ['OV_KIND']
+conf['video'] = {**(conf.get('video') or {}), **json.loads(os.environ['OV_VIDEO'])}
+os.umask(0o077)
+with open(path + '.tmp', 'w') as f:
+    json.dump(conf, f, indent=2)
+    f.write('\n')
+os.replace(path + '.tmp', path)
+PY
+}
+
+# claim_robot: ask openvibe.bot for a code, show it (and a QR), and wait up to 16 minutes for its owner to approve it
+# on openvibe.bot/link. Approved, it sets ROBOT_ID, CODE (or NETWORK and PAIRING), CLAIM_DRIVER, ROBOT_NAME, PANEL_URL
+# and LIVE from the answer, each checked before the shell reads it. Denied or late, it fails.
+claim_robot() {
+	_answer="$TMP/claim.env"
+	# shellcheck disable=SC1091 # the OS's own file, read for its name only
+	OV_HW_MODEL="$({ tr -d '\0' < /proc/device-tree/model; } 2>/dev/null || true)" \
+	OV_HW_OS="$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}") || true)" \
+	OV_HW_ARCH="$(uname -m)" OV_HW_KIT="${KIT:-}" OV_HW_KIT_NAME="${KIT_NAME:-}" OV_HW_FOUND="${FOUND:-}" OV_HW_CAMERA="${CAMERA:-}" \
+	python3 - "${OPENVIBE_SERVER:-https://openvibe.bot}" "$_answer" "${NAME:-$(hostname)}" <<'PY' || return 1
+import json, os, re, subprocess, sys, time, urllib.error, urllib.request
+server, out, host = sys.argv[1].rstrip('/'), sys.argv[2], sys.argv[3]
+hw = {k: os.environ.get('OV_HW_' + k.upper(), '').strip() for k in ('model', 'os', 'arch', 'kit', 'kit_name', 'camera')}
+hw = {k: v for k, v in hw.items() if v}
+found = [x for x in os.environ.get('OV_HW_FOUND', '').split('|') if x]
+if found:
+    hw['found'] = found
+def call(method, path, body=None, headers=None):
+    req = urllib.request.Request(server + path, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={'Content-Type': 'application/json', 'User-Agent': 'openvibe-node-installer', **(headers or {})})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+def die(msg):
+    print(f'\nopenvibe-node: error: {msg}', file=sys.stderr)
+    sys.exit(1)
+try:
+    c = call('POST', '/api/v1/claims', {'hostname': host, 'hardware': hw})
+except Exception as e:  # noqa: BLE001 - say what happened and stop
+    die(f'could not ask {server} for a code: {e}')
+print(f"\n  Approve this robot on openvibe.bot (signed in as you):\n    open  {c['verification_url']}\n    code  {c['user_code']}\n")
+try:
+    subprocess.run(['qrencode', '-t', 'ANSIUTF8', '-m', '2', c['verification_url_complete']], check=True, timeout=10)
+    print('  (or scan this with your phone)\n')
+except Exception:  # noqa: BLE001 - no QR, the link is enough
+    print(f"  or open {c['verification_url_complete']}\n")
+interval, deadline = max(2, int(c.get('interval') or 3)), time.time() + 16 * 60
+sys.stdout.write('  waiting for you to approve it')
+sys.stdout.flush()
+while time.time() < deadline:
+    time.sleep(interval)
+    try:
+        s = call('GET', '/api/v1/claims/' + c['id'], headers={'X-OV-Claim-Secret': c['secret']})
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            die('openvibe.bot no longer knows this code: run the installer again for a new one')
+        interval = min(30, interval * 2) if e.code == 429 else interval
+        continue
+    except Exception:  # noqa: BLE001 - the network blinked: keep waiting
+        continue
+    state = s.get('state')
+    if state == 'pending':
+        sys.stdout.write('.')
+        sys.stdout.flush()
+        continue
+    if state == 'denied':
+        die('the code was denied on openvibe.bot, so nothing was added')
+    if state != 'approved':
+        die(f'the code is {state}: run the installer again for a new one')
+    p = s.get('pairing') or {}
+    network = bool(p.get('pairing_id'))
+    vals = {'ROBOT_ID': '' if network else p.get('robot') or '', 'CODE': p.get('code') or '',
+            'NETWORK': p.get('network') or '' if network else '', 'PAIRING': p.get('pairing_id') or '',
+            'CLAIM_DRIVER': s.get('driver') or 'none', 'ROBOT_NAME': s.get('name') or '', 'PANEL_URL': s.get('panel_url') or '',
+            'LIVE': '1' if s.get('live') else '0'}
+    shape = {'ROBOT_ID': r'(rob_[0-9A-Za-z]+)?', 'CODE': r'[0-9A-Za-z-]{4,20}', 'NETWORK': r'(https://[A-Za-z0-9.:/-]+)?',
+             'PAIRING': r'(pair_[0-9A-Za-z]+)?', 'CLAIM_DRIVER': r'adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none',
+             'ROBOT_NAME': r"[^'\n\\]{0,80}", 'PANEL_URL': r'((https://|http://(localhost|127\.0\.0\.1)[:/])[A-Za-z0-9.:/_-]*)?', 'LIVE': r'[01]'}
+    for k, v in vals.items():
+        if not re.fullmatch(shape[k], v):
+            die(f'openvibe.bot answered an unexpected {k}')
+    with open(out, 'w') as f:
+        f.write(''.join(f"{k}='{v}'\n" for k, v in vals.items()))
+    print(' approved')
+    sys.exit(0)
+die('nobody approved the code in 16 minutes: run the installer again for a new one')
+PY
+	# shellcheck source=/dev/null # written just above, every value checked against its shape
+	. "$_answer"
+}
+
+# Test hook: ask OPENVIBE_SERVER for a code, wait for the answer, print what pairing would use, and stop.
+if [ "${OPENVIBE_INSTALL_CLAIM_ONLY:-0}" = 1 ]; then
+	TMP="$(mktemp -d)"
+	trap 'rm -rf "$TMP"' EXIT
+	claim_robot || exit 1
+	printf 'ROBOT_ID=%s\nCODE=%s\nNETWORK=%s\nPAIRING=%s\nCLAIM_DRIVER=%s\nROBOT_NAME=%s\nPANEL_URL=%s\nLIVE=%s\n' \
+		"$ROBOT_ID" "$CODE" "$NETWORK" "$PAIRING" "$CLAIM_DRIVER" "$ROBOT_NAME" "$PANEL_URL" "$LIVE"
 	exit 0
 fi
 
@@ -350,6 +478,90 @@ IS_PI=0
 if [ -r /proc/device-tree/model ] && grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then IS_PI=1; fi
 say "platform $OS/$ARCH$( [ $IS_PI = 1 ] && printf ' (Raspberry Pi)')"
 
+# ---- the robot's computer: its buses, its camera tools, and what is on them (the one command, or an Adeept driver) ----
+# I2C carries the Adeept kit's motor and servo board and its battery ADC, SPI its lights: both on now and after a reboot
+# (raspi-config applies them at once). Only missing packages are installed: i2c-tools to look at the bus, the camera
+# tools the video uses, venv and lgpio for the plugins, qrencode for the code's QR.
+pi_prepare() {
+	[ "$OS" = linux ] && [ "$IS_PI" = 1 ] || return 0
+	if command -v raspi-config >/dev/null 2>&1; then
+		[ "$($SUDO raspi-config nonint get_i2c 2>/dev/null)" = 0 ] ||
+			{ say "turning on I2C (the kit's motor board is on it)"; $SUDO raspi-config nonint do_i2c 0 || say "warning: raspi-config could not turn on I2C"; }
+		[ "$($SUDO raspi-config nonint get_spi 2>/dev/null)" = 0 ] ||
+			{ say "turning on SPI (the kit's lights)"; $SUDO raspi-config nonint do_spi 0 || say "warning: raspi-config could not turn on SPI"; }
+	else
+		boot_config=/boot/firmware/config.txt
+		[ -f "$boot_config" ] || boot_config=/boot/config.txt
+		for p in i2c_arm spi; do
+			if [ -f "$boot_config" ] && ! grep -Eq "^dtparam=$p=on" "$boot_config"; then
+				say "turning on ${p%_arm} in $boot_config"
+				printf 'dtparam=%s=on\n' "$p" | $SUDO tee -a "$boot_config" >/dev/null
+			fi
+			if command -v dtparam >/dev/null 2>&1; then $SUDO dtparam "$p=on" 2>/dev/null || true; fi
+		done
+	fi
+	$SUDO modprobe i2c-dev 2>/dev/null || true
+	command -v apt-get >/dev/null 2>&1 || return 0
+	need=""
+	command -v i2cdetect >/dev/null 2>&1 || need="$need i2c-tools"
+	command -v rpicam-vid >/dev/null 2>&1 || command -v libcamera-vid >/dev/null 2>&1 || need="$need rpicam-apps"
+	python3 -c 'import ensurepip' >/dev/null 2>&1 || need="$need python3-venv"
+	python3 -c 'import lgpio' >/dev/null 2>&1 || need="$need python3-lgpio"
+	[ "$CLAIM" = 0 ] || command -v qrencode >/dev/null 2>&1 || need="$need qrencode"
+	[ -n "$need" ] || return 0
+	say "installing:$need"
+	$SUDO apt-get update -qq >/dev/null 2>&1 || true
+	# shellcheck disable=SC2086 # one word per package
+	if ! $SUDO apt-get install -y -qq $need >/dev/null 2>&1; then
+		need=$(printf '%s' "$need" | sed 's/rpicam-apps/libcamera-apps/')   # Bullseye's name for the camera tools
+		$SUDO apt-get install -y -qq $need >/dev/null 2>&1 || say "warning: apt-get could not install$need"
+	fi
+}
+
+# What is on the I2C bus and which camera there is, and the kit that makes it: KIT (a profile id on openvibe.bot),
+# KIT_NAME and FOUND (the evidence, |-separated) for the approval page; DRIVER unless --driver chose one.
+KIT="" KIT_NAME="" FOUND="" CAMERA=""
+detect_kit() {
+	[ "$OS" = linux ] || return 0
+	addrs=""
+	if [ -n "${OPENVIBE_I2C_ADDRS+x}" ]; then
+		addrs=" $OPENVIBE_I2C_ADDRS "   # test-only: the bus's addresses, as i2cdetect would print them
+	elif [ -e /dev/i2c-1 ] && command -v i2cdetect >/dev/null 2>&1; then
+		addrs=" $($SUDO i2cdetect -y 1 2>/dev/null | awk 'NR > 1 { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9a-f][0-9a-f]$/) printf "%s ", $i }')"
+	fi
+	case "$addrs" in *" 5f "*) FOUND="$FOUND|PCA9685 at 0x5f" ;; esac
+	case "$addrs" in *" 40 "*) FOUND="$FOUND|PCA9685 at 0x40" ;; esac
+	case "$addrs" in *" 48 "*) FOUND="$FOUND|ADS7830 at 0x48" ;; esac
+	case "$addrs" in *" 14 "*) FOUND="$FOUND|Robot HAT at 0x14" ;; esac
+	case "$addrs" in *" 3c "*) FOUND="$FOUND|OLED at 0x3c" ;; esac
+	case "$addrs" in
+	*" 5f "*) KIT=adeept.adr036; KIT_NAME="Adeept ADR036 4WD"; [ "$DRIVER_GIVEN" = 1 ] || DRIVER=adeept ;;
+	*)
+		if { ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null; } | grep -q '[:.]9090 '; then
+			KIT=ros2.diffdrive; KIT_NAME="ROS 2 robot (rosbridge)"; FOUND="$FOUND|rosbridge on port 9090"
+			[ "$DRIVER_GIVEN" = 1 ] || DRIVER=ros2
+		fi ;;
+	esac
+	for lister in ${OPENVIBE_CAMERA+none} rpicam-hello libcamera-hello; do
+		[ "$lister" != none ] || { CAMERA="$OPENVIBE_CAMERA"; break; }   # test-only: the camera's name
+		command -v "$lister" >/dev/null 2>&1 || continue
+		CAMERA=$(timeout 15 "$lister" --list-cameras 2>/dev/null | sed -n 's/^ *0 : \([A-Za-z0-9_]*\).*/\1/p' | head -n 1)
+		break
+	done
+	if [ -z "$CAMERA" ] && [ -d /dev/v4l/by-id ]; then CAMERA=$(find /dev/v4l/by-id -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | head -n 1 | cut -c1-60); fi
+	FOUND="${FOUND#|}"
+	say "found: ${KIT_NAME:-no kit it knows}$( [ -n "$FOUND" ] && printf ' (%s)' "$(printf '%s' "$FOUND" | sed 's/|/, /g')"); camera: ${CAMERA:-none}"
+}
+# Test hook: only the detection (OPENVIBE_I2C_ADDRS and OPENVIBE_CAMERA stand in for the bus and the camera).
+if [ "${OPENVIBE_INSTALL_DETECT_ONLY:-0}" = 1 ]; then
+	OS=linux
+	detect_kit >/dev/null
+	printf 'KIT=%s\nDRIVER=%s\nFOUND=%s\nCAMERA=%s\n' "$KIT" "$DRIVER" "$FOUND" "$CAMERA"
+	exit 0
+fi
+if [ "$CLAIM" = 1 ] || [ "$DRIVER" = adeept ] || [ "$DRIVER" = adeept-mecanum ]; then pi_prepare; fi
+[ "$CLAIM" = 0 ] || detect_kit
+
 # ---- download ----
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -423,6 +635,9 @@ fi
 PIP="$STATE/venv/bin/pip"
 $SUDO "$PIP" install --quiet --upgrade pip >/dev/null 2>&1 || true
 $SUDO "$PIP" install --quiet "$STATE/plugins/sdk" "$STATE/plugins/dryrun" "$STATE/plugins/relay"
+# driver_setup: the plugin of $DRIVER into the venv, and its PLUGINS, KIND and VIDEO for the config. Run again when the
+# owner chose another model on openvibe.bot/link than the one the bus suggested.
+driver_setup() {
 PLUGINS='[{"name": "dryrun"}]'
 KIND=onboard
 VIDEO='"source": "auto"'
@@ -459,6 +674,8 @@ looi)
 	fi
 	;;
 esac
+}
+driver_setup
 if [ -n "$COMPUTER" ]; then
 	# The computer plugin, and Pillow for compact screen captures when pip can get it.
 	$SUDO "$PIP" install --quiet "$STATE/plugins/computer[screen]" 2>/dev/null || $SUDO "$PIP" install --quiet "$STATE/plugins/computer"
@@ -476,6 +693,8 @@ EOF
 	say "wrote $CONF/config.json"
 else
 	say "keeping the existing $CONF/config.json"
+	# The one command sets up the robot it found: the driver's plugins, kind and video replace the old ones.
+	[ "$CLAIM" = 0 ] || set_driver_config "$CONF/config.json"
 fi
 if [ -n "$COMPUTER" ]; then
 	write_computer_config "$CONF/config.json" "$COMPUTER" "$COMPUTER_HOME"
@@ -554,6 +773,22 @@ if [ "$SERVICE" = 1 ]; then
 	say "service installed and started"
 fi
 
+# ---- the one command: the owner approves the code on openvibe.bot/link, then this machine pairs at once ----
+if [ "$CLAIM" = 1 ]; then
+	if $SUDO "$BIN_DIR/openvibe-node" status --json 2>/dev/null | grep -q '"paired":true'; then
+		say "already paired; keeping it (to make it a new robot: sudo openvibe-node pair --force <CODE> with a code from openvibe.bot)"
+		CLAIM=0
+	else
+		claim_robot || die "not paired: nothing was added on openvibe.bot"
+		if [ "$CLAIM_DRIVER" != "$DRIVER" ]; then
+			say "setting up the driver for the model you chose: $CLAIM_DRIVER"
+			DRIVER="$CLAIM_DRIVER"
+			driver_setup
+			set_driver_config "$CONF/config.json"
+		fi
+	fi
+fi
+
 # ---- pair ----
 if [ -n "$CODE" ]; then
 	if $SUDO "$BIN_DIR/openvibe-node" status --json 2>/dev/null | grep -q '"paired":true'; then
@@ -563,6 +798,34 @@ if [ -n "$CODE" ]; then
 	fi
 else
 	say "not paired yet: get a code on openvibe.bot and run: sudo openvibe-node pair <CODE>"
+fi
+
+# ---- the one command: is it driving and streaming? ----
+if [ "$CLAIM" = 1 ] && [ "$SERVICE" = 1 ]; then
+	say "checking the link, the driver and the camera (up to a minute)"
+	_status="" _i=0
+	while [ "$_i" -lt 30 ]; do
+		_status="$($SUDO "$BIN_DIR/openvibe-node" status --json 2>/dev/null || true)"
+		if printf '%s' "$_status" | grep -q '"connected":true' && printf '%s' "$_status" | grep -q '"state":"live"'; then break; fi
+		_i=$((_i + 1))
+		sleep 2
+	done
+	printf '%s' "$_status" | python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin)
+except ValueError:
+    sys.exit("openvibe-node: the service did not answer: sudo journalctl -u openvibe-node -n 50")
+link = s.get("link") or {}
+print("  link     " + ("connected" if link.get("connected") else "not connected" + (": " + link["last_error"] if link.get("last_error") else "")))
+for p in s.get("plugins") or []:
+    fault = p.get("fault") or {}
+    print("  driver   %s: %s" % (p.get("name"), p.get("state") + (" (" + (fault.get("message") or fault.get("code") or "") + ")" if fault else "")))
+v = s.get("video") or {}
+print("  camera   %s%s" % (v.get("state") or "off", (" (" + v["last_error"] + ")") if v.get("last_error") else (" from " + v["source"] if v.get("source") else "")))
+' || true
+	say "drive it: ${PANEL_URL:-https://openvibe.bot/robots}"
+	[ "${LIVE:-0}" = 0 ] || say "its camera is on your OpenVibe.Live channel while it streams"
 fi
 
 say "done. Check it with: sudo openvibe-node status   Stop everything with: sudo openvibe-node stop"

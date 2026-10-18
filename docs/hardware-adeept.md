@@ -4,9 +4,19 @@ The device side is the OpenVibe Node (`openvibe-node`) with the `adeept_adr036` 
 installer; the panel is `openvibe.bot/panel/<rob_…>`. Nothing here runs the kit's stock control server — the Node
 replaces it, and the installer disables the kit's own autostart (`docs/install.md`).
 
+## 0. The one command
+
+```sh
+curl -fsSL https://openvibe.bot/install | sh
+```
+
+On the Pi, with the kit's board on it: it turns on I2C and SPI, installs the camera tools and the plugin's packages,
+finds the kit (PCA9685 at `0x5f`, ADS7830 at `0x48`), shows a code for openvibe.bot/link, and pairs once you approve it
+there (pick **Adeept ADR036 mecanum** on that page for the mecanum chassis). Sections 1 and 2 are the same steps by hand.
+
 ## 1. On the Pi (Raspberry Pi OS Bookworm, 64-bit)
 
-- `sudo raspi-config` → Interface Options: enable **I2C** and **SPI**. Reboot. (Or set `dtparam=i2c_arm=on` and
+- `sudo raspi-config` → Interface Options: enable **I2C** and **SPI** (the one command does this). Reboot. (Or set `dtparam=i2c_arm=on` and
   `dtparam=spi=on` in `/boot/firmware/config.txt`.)
 - Confirm the kit's stock control server is not running: `systemctl is-enabled Adeept_Robot.service` must report
   `disabled` (or the unit absent), and ports 8888/5000 must be free. `install/install.sh` stops and disables

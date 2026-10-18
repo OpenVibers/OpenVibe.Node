@@ -3,7 +3,42 @@
 The Node is one program, `openvibe-node`, plus Python plugins for robots. It connects **out** to OpenVibe (no open
 ports, works behind any home router), and a local kill switch stops everything it drives.
 
-## Quick start (Linux, Raspberry Pi, macOS)
+## The one command (Raspberry Pi and other Linux robots)
+
+On the robot's computer, with nothing set up on openvibe.bot first:
+
+```sh
+curl -fsSL https://openvibe.bot/install | sh
+```
+
+On a Raspberry Pi it turns on I2C and SPI (now and after a reboot, through `raspi-config`), installs what is missing of
+`i2c-tools`, the camera tools (`rpicam-apps`), `python3-venv`, `python3-lgpio` and `qrencode`, and looks at the I2C bus:
+a PCA9685 at `0x5f` is the Adeept ADR036 4WD (driver `adeept`), a rosbridge on port 9090 a ROS 2 robot (`ros2`). It
+installs that driver, then prints a code and a QR code:
+
+```
+  Approve this robot on openvibe.bot (signed in as you):
+    open  https://openvibe.bot/link
+    code  KQ7M-2XRD
+```
+
+Open the link (or scan the QR with your phone), sign in, and approve it: openvibe.bot shows what the machine found and
+lets you set its name, its model (the Adeept mecanum chassis looks the same on the bus: pick it there), who may drive,
+and whether its camera goes on your OpenVibe.Live channel. The installer then pairs, sets up the driver for the model
+you chose if it differs, and checks the link, the driver and the camera:
+
+```
+  link     connected
+  driver   adeept_adr036: running
+  camera   live from rpicam
+openvibe-node: drive it: https://openvibe.bot/panel/rob_…
+```
+
+The code lasts 15 minutes; a denied or expired one adds nothing, and running the command again gives a new one. An
+already-paired machine keeps its pairing. `--driver` still overrides what was found, and `--no-claim` installs without
+asking for a code. To drive the robot from your Live chat, use **Use it in my OpenVibe.Live chat** on the approval page.
+
+## Quick start with a code from openvibe.bot (Linux, Raspberry Pi, macOS)
 
 1. On openvibe.bot, add a robot. You get a code like `ABCD-1234` (valid 10 minutes) and the installer command with
    the robot's id filled in.

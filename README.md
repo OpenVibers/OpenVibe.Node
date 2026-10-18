@@ -4,6 +4,18 @@ One service for your computers, servers, Raspberry Pis, phones and robots: pair 
 like **OpenVibe.Bot** (robots: drive, cameras, sensors, with safety) and **OpenVibe.Actor** (computer control for AI
 agents, at the level you set on the machine) can use the device. It connects out, needs no open ports, and keeps a local kill switch.
 
+On a robot's Raspberry Pi (or other Linux computer), the one command:
+
+```sh
+curl -fsSL https://openvibe.bot/install | sh
+```
+
+It turns on I2C and SPI, installs the camera tools, finds the kit (an Adeept ADR036 4WD, a ROS 2 robot), shows a code
+to approve at openvibe.bot/link, and pairs: the robot is made, drivable on its panel and, if you chose it, live on your
+OpenVibe.Live channel ([docs/install.md](docs/install.md#the-one-command-raspberry-pi-and-other-linux-robots)).
+
+With a robot already added on openvibe.bot:
+
 ```sh
 curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept
 ```
