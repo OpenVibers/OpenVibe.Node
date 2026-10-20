@@ -106,11 +106,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck -s sh install/install.sh scripts/dist.sh scripts/test-install-stock-server.sh scripts/test-install-pair-args.sh scripts/test-install-worker-config.sh scripts/test-install-computer-config.sh
+      - run: shellcheck -s sh install/install.sh scripts/dist.sh scripts/test-install-stock-server.sh scripts/test-install-pair-args.sh scripts/test-install-worker-config.sh scripts/test-install-computer-config.sh scripts/test-install-claim.sh
       - run: sh scripts/test-install-stock-server.sh
       - run: sh scripts/test-install-pair-args.sh
       - run: sh scripts/test-install-worker-config.sh
       - run: sh scripts/test-install-computer-config.sh
+      - run: sh scripts/test-install-claim.sh
 
   esp32-conformance:
     name: esp32 protocol conformance (desktop)
