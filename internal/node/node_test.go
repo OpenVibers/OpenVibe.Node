@@ -454,7 +454,9 @@ func TestShutdownStops(t *testing.T) {
 }
 
 func TestVideoAndTelemetry(t *testing.T) {
-	e := start(t)
+	// Video and telemetry, not the link's timing: Bot's real 1 s heartbeat. With the 100 ms one a slow runner (macOS,
+	// -race on one CPU) hears nothing for 200 ms, the link reconnects, and the test is left reading a closed connection.
+	e := startWith(t, func(s *fakebot.Server) { s.Config.HeartbeatMS = 1000 }, true)
 	deadline := time.Now().Add(20 * time.Second)
 	for e.whip.Packets.Load() < 10 {
 		if time.Now().After(deadline) {
