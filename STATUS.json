@@ -1,0 +1,33 @@
+{
+  "repository": "OpenVibers/OpenVibe.Node",
+  "stage": "alpha",
+  "code": true,
+  "wave": "T15",
+  "plan": "Plan track T15 (Bot complete) and ADR-043 (Bot: devices, pairing, control and safety); the computer plugin and the job worker serve OpenVibe.Actor and the Codes job runner (tracks T14/T17)",
+  "kind": "client",
+  "version": "0.13.0",
+  "release": "v0.13.0, published 2026-10-20 as a GitHub release: binaries for linux amd64/arm64/armv7, darwin amd64/arm64 and windows amd64, the plugins tarball, install.sh and SHA256SUMS",
+  "runtime": "go 1.24 (one static binary per platform); plugins in Python 3; an ESP32 Arduino library",
+  "database": "none",
+  "deployed": false,
+  "deployment": "none of its own: people install it on their machines and robots (curl -fsSL https://openvibe.bot/install | sh, or a release binary); it connects out to OpenVibe.Bot (wss://openvibe.bot/device) and pairs through OpenVibe.Bot or OpenVibe.Network. On 2026-10-22 production held 1 platform node with 4 pairings and 5 node principals on Network, and 3 robots with 5 devices on Bot.",
+  "features": [
+    "pairing with a code approved on openvibe.bot (or through Network), one outbound WebSocket, no open ports",
+    "safety: deadlines, owner limits clamped before any driver, heartbeats and a deadman, a persisted e-stop and the local kill switch (openvibe-node stop)",
+    "plugins as separate processes (JSON lines): dryrun, adeept_adr036, cozmo, relay and ros2 (rclpy or rosbridge); the community LOOI driver's contract; signed community profiles (openvibe-node profile verify)",
+    "WHIP video publishing (pion)",
+    "the computer plugin for OpenVibe.Actor: terminal, files, screen, input and its own browser, at the level the owner sets on the machine (observe, ask, trusted, full); approvals in the tray (Linux, Windows), a notification or openvibe-node approve",
+    "the live screen: the machine's screen on openvibe.bot for its owner only, up to 30 minutes",
+    "the job worker (--worker): sandboxed function, code and linux jobs, and the OpenVibe.Codes job runner",
+    "one-command install on a Raspberry Pi or other Linux robot (I2C, SPI, camera tools, kit detection)",
+    "system service on systemd, launchd and Windows (or a Windows sign-in start)",
+    "ESP32 library (OpenVibeNode): pairing, control link, drive and actuator commands, telemetry, heartbeat, deadman and e-stop"
+  ],
+  "notYet": [
+    "code signing and notarization for Windows and macOS (the release has SHA256SUMS only)",
+    "an auto-update channel",
+    "a tray on macOS (approvals there are a dialog with Deny as its default)",
+    "the computer plugin's browser on Windows"
+  ],
+  "updated": "2026-10-22"
+}
