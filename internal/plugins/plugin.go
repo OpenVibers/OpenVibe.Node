@@ -220,6 +220,12 @@ func (p *Plugin) Command(ctx context.Context, id, kind string, value json.RawMes
 // waits for its ack or nack. A plugin that does not answer in max(deadline, MinReplyTimeout) is told to stop and the
 // command fails with plugin_timeout.
 func (p *Plugin) Begin(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int) func() Reply {
+	return p.BeginAs(ctx, id, kind, value, deadlineMS, nil)
+}
+
+// BeginAs is Begin with who sent the command, as Bot's gate saw them: the plugin gets it as `operator`
+// {subject, role} (subject null for Bot's own commands, role "system"), and nothing when op is nil.
+func (p *Plugin) BeginAs(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator) func() Reply {
 	now := func(r Reply) func() Reply { return func() Reply { return r } }
 	p.mu.Lock()
 	if p.state != StateReady && kind != protocol.KindHalt {
@@ -244,6 +250,13 @@ func (p *Plugin) Begin(ctx context.Context, id, kind string, value json.RawMessa
 	msg := map[string]any{"op": "command", "id": id, "kind": kind, "deadline_ms": deadlineMS}
 	if len(value) > 0 {
 		msg["value"] = value
+	}
+	if op != nil {
+		var subject any
+		if op.Subject != "" {
+			subject = op.Subject
+		}
+		msg["operator"] = map[string]any{"subject": subject, "role": op.Role}
 	}
 	if err := p.send(msg); err != nil {
 		done()
