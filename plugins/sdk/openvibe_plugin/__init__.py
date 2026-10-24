@@ -59,10 +59,13 @@ def _ack(cid, data=None):
 
 class Command:
     """operator is who sent it, as Bot's gate saw them: {"subject": "usr_…" or None, "role": "owner" | "operator" |
-    "queue" | …}, or None when the core passed none."""
-    __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target", "operator")
+    "queue" | …}, or None when the core passed none. turn_epoch is the robot's control epoch Bot decided it under (an
+    int, or None from older Bots): it rises when a queue turn ends, is left or is paused for an owner takeover, and the
+    core already refuses a command older than the newest halt's, so a driver may also keep the newest it saw and refuse
+    anything older (defence in depth)."""
+    __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target", "operator", "turn_epoch")
 
-    def __init__(self, id, kind, value, deadline_ms, now, target=None, operator=None):
+    def __init__(self, id, kind, value, deadline_ms, now, target=None, operator=None, turn_epoch=None):
         self.id = id
         self.kind = kind
         self.value = value if value is not None else {}
@@ -70,6 +73,7 @@ class Command:
         self.deadline = now + deadline_ms / 1000.0
         self.target = target
         self.operator = operator if isinstance(operator, dict) else None
+        self.turn_epoch = turn_epoch if isinstance(turn_epoch, int) and not isinstance(turn_epoch, bool) and turn_epoch > 0 else None
 
     def __repr__(self):
         return "Command(id=%r, kind=%r, value=%r, deadline_ms=%r)" % (self.id, self.kind, self.value, self.deadline_ms)
@@ -342,7 +346,7 @@ class Runtime:
             dl = DEFAULT_DEADLINE_MS
         moves = kind in GUARDED_KINDS or kind in self.plugin.motion_kinds
         dl = max(1, min(dl, MAX_DEADLINE_MS if moves else MAX_LONG_DEADLINE_MS))
-        cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"), msg.get("operator"))
+        cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"), msg.get("operator"), msg.get("turn_epoch"))
         if kind == "halt":
             self.safe_stop("halt")
             self.send({"op": "ack", "id": cid})

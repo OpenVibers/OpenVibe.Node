@@ -306,8 +306,12 @@ type Command struct {
 	// DeadlineMS is an absolute instant in epoch milliseconds on the server's clock, present on motion kinds only.
 	DeadlineMS int64     `json:"deadline_ms,omitempty"`
 	Operator   *Operator `json:"operator,omitempty"`
-	RobotID    string    `json:"robot_id,omitempty"`
-	Target     string    `json:"target,omitempty"` // Node only: a driver name; default: the first driver with the capability
+	// TurnEpoch is the robot's control epoch when Bot decided the command (contracts 0.213.0, Bot#155): it rises when a
+	// queue turn ends, is left or is paused for an owner takeover, and Bot's halt for that change carries the new value.
+	// Zero when Bot sends none (older Bots, robots without a queue).
+	TurnEpoch int64  `json:"turn_epoch,omitempty"`
+	RobotID   string `json:"robot_id,omitempty"`
+	Target    string `json:"target,omitempty"` // Node only: a driver name; default: the first driver with the capability
 }
 
 // Estop is sent when the e-stop latches (Latched true) or the owner clears it (Latched false).

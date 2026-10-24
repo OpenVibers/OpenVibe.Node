@@ -109,6 +109,22 @@ class RuntimeTest(unittest.TestCase):
                                  "operator": "nobody"}))
         self.assertEqual(seen, [{"subject": "usr_1", "role": "queue"}, None, None])
 
+    def test_turn_epoch_reaches_handle(self):
+        seen = []
+
+        class Epoch(Recorder):
+            def handle(self, cmd):
+                seen.append(cmd.turn_epoch)
+
+        rt, p, out, clock = make(Epoch())
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "command", "id": "c1", "kind": "drive", "value": {}, "deadline_ms": 300,
+                                 "turn_epoch": 1792900000123}))
+        rt.feed_line(json.dumps({"op": "command", "id": "c2", "kind": "drive", "value": {}, "deadline_ms": 300}))
+        rt.feed_line(json.dumps({"op": "command", "id": "c3", "kind": "drive", "value": {}, "deadline_ms": 300,
+                                 "turn_epoch": "soon"}))
+        self.assertEqual(seen, [1792900000123, None, None])
+
     def test_newer_command_extends_deadline(self):
         rt, p, out, clock = make()
         self.hello(rt)
