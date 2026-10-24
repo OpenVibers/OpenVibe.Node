@@ -226,6 +226,12 @@ func (p *Plugin) Begin(ctx context.Context, id, kind string, value json.RawMessa
 // BeginAs is Begin with who sent the command, as Bot's gate saw them: the plugin gets it as `operator`
 // {subject, role} (subject null for Bot's own commands, role "system"), and nothing when op is nil.
 func (p *Plugin) BeginAs(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator) func() Reply {
+	return p.BeginTurn(ctx, id, kind, value, deadlineMS, op, 0)
+}
+
+// BeginTurn is BeginAs with the robot's control epoch the command was decided under (protocol.Command.TurnEpoch), sent
+// to the plugin as turn_epoch when it is set, so a driver can refuse a command older than the newest turn halt itself.
+func (p *Plugin) BeginTurn(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator, turnEpoch int64) func() Reply {
 	now := func(r Reply) func() Reply { return func() Reply { return r } }
 	p.mu.Lock()
 	if p.state != StateReady && kind != protocol.KindHalt {
@@ -257,6 +263,9 @@ func (p *Plugin) BeginAs(ctx context.Context, id, kind string, value json.RawMes
 			subject = op.Subject
 		}
 		msg["operator"] = map[string]any{"subject": subject, "role": op.Role}
+	}
+	if turnEpoch > 0 {
+		msg["turn_epoch"] = turnEpoch
 	}
 	if err := p.send(msg); err != nil {
 		done()

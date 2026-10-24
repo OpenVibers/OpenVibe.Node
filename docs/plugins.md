@@ -48,7 +48,7 @@ describes itself and waits for EOF without opening any hardware.
 | op          | fields                                                        | the plugin must                                        |
 |-------------|---------------------------------------------------------------|--------------------------------------------------------|
 | `hello`     | `config` {…}, `probe` bool                                    | answer `describe`; then set up (unless probe)          |
-| `command`   | `id`, `kind`, `value`, `deadline_ms`, `operator`?             | act, answer `ack` or `nack` with the same `id`         |
+| `command`   | `id`, `kind`, `value`, `deadline_ms`, `operator`?, `turn_epoch`? | act, answer `ack` or `nack` with the same `id`      |
 | `heartbeat` | `t` (core clock, ms)                                          | note the time                                          |
 | `stop`      |                                                               | stop every actuator                                    |
 | `estop`     |                                                               | stop every actuator and refuse motion until `resume`   |
@@ -65,6 +65,13 @@ decided the command may run, so a driver uses it to log or to apply a rule of it
 reach a plugin in the order Bot sent them, and when a public robot's turn ends or its holder leaves Bot halts the robot
 before the next person's first command, which a plugin gets as `stop`: nothing from the last driver comes after it.
 Python: `cmd.operator` (a dict, or `None`).
+
+`turn_epoch` is the robot's control epoch Bot decided the command under (milliseconds on Bot's clock; Bot#155,
+contracts 0.213.0). It rises when a queue turn ends, its holder leaves, or the owner takes the turn over, and Bot's halt
+for that change carries the new value. The core keeps the newest epoch a halt carried per robot and nacks (`expired`) a
+command older than it, so it never reaches a plugin; a driver may keep the newest it saw and refuse older ones too, as
+defence in depth (a desk robot's own controller, for one). Absent from older Bots and on robots without a queue.
+Python: `cmd.turn_epoch` (an int, or `None`).
 
 ### Plugin → core
 

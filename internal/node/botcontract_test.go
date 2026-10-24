@@ -341,3 +341,40 @@ func TestLocalLatchSurvivesRemoteClear(t *testing.T) {
 		t.Fatal("the device's latched:false cleared Bot's latch")
 	}
 }
+
+// turn_epoch (contracts 0.213.0, Bot#155): once a halt carried a robot's new control epoch, a command decided under an
+// older one is nacked expired and never reaches the plugin; the current epoch runs, and a command without one (an older
+// Bot) runs as before.
+func TestStaleTurnNeverReachesPlugin(t *testing.T) {
+	e := start(t)
+	send := func(c protocol.Command) protocol.Message {
+		t.Helper()
+		if err := e.conn.Command(c, 300); err != nil {
+			t.Fatal(err)
+		}
+		r, err := e.conn.Reply(c.ID, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	drive := json.RawMessage(`{"throttle":0.3}`)
+	if r := send(protocol.Command{ID: "before", Kind: protocol.KindDrive, Value: drive, TurnEpoch: 100}); !isAck(r) {
+		t.Fatalf("a command before any halt: %+v", r)
+	}
+	if r := send(protocol.Command{ID: "halt-200", Kind: protocol.KindHalt, TurnEpoch: 200, Operator: &protocol.Operator{Role: "system"}}); !isAck(r) {
+		t.Fatalf("the turn's halt: %+v", r)
+	}
+	if r := send(protocol.Command{ID: "stale", Kind: protocol.KindDrive, Value: drive, TurnEpoch: 100}); nackCode(r) != protocol.FaultExpired {
+		t.Fatalf("a command from the ended turn: %+v", r)
+	}
+	if r := send(protocol.Command{ID: "current", Kind: protocol.KindDrive, Value: drive, TurnEpoch: 200}); !isAck(r) {
+		t.Fatalf("a command of the current turn: %+v", r)
+	}
+	if r := send(protocol.Command{ID: "no-epoch", Kind: protocol.KindDrive, Value: drive}); !isAck(r) {
+		t.Fatalf("a command without an epoch (an older Bot): %+v", r)
+	}
+	if len(e.commandRecords("stale")) != 0 || len(e.commandRecords("current")) != 1 {
+		t.Fatalf("records: %+v", e.records())
+	}
+}

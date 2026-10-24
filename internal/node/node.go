@@ -71,17 +71,19 @@ type Node struct {
 
 	ctx context.Context
 
-	mu        sync.Mutex
-	limits    safety.Limits
-	allowed   map[string]bool
-	telemetry map[string]map[string]any // per plugin, latest
-	events    []protocol.Event
-	telemMS   int
-	jpeg      *video.JPEGSource
-	jpegFrom  string
-	videoSrc  string
-	lastTelem time.Time
-	started   time.Time
+	mu     sync.Mutex
+	limits safety.Limits
+	// haltEpochs: per robot, the newest turn_epoch a halt carried (noteHaltEpoch); older commands are refused.
+	haltEpochs map[string]int64
+	allowed    map[string]bool
+	telemetry  map[string]map[string]any // per plugin, latest
+	events     []protocol.Event
+	telemMS    int
+	jpeg       *video.JPEGSource
+	jpegFrom   string
+	videoSrc   string
+	lastTelem  time.Time
+	started    time.Time
 
 	// configured is set by the first config on a connection; until then only halt runs, so a latch the owner set
 	// while the link was down is applied before any motion.
@@ -410,6 +412,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 	limits, allowed, configured := n.limits, n.allowed, n.configured
 	n.mu.Unlock()
 	if c.Kind == protocol.KindHalt {
+		n.noteHaltEpoch(c.RobotID, c.TurnEpoch)
 		n.mgr.StopAll()
 		r := protocol.Ack{ID: c.ID, LatencyMS: time.Since(received).Milliseconds()}
 		n.dedup.Complete(entry, r)
@@ -418,6 +421,12 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 	}
 	if !configured {
 		nack(protocol.FaultNotReady, "the server's config has not arrived on this connection yet")
+		return
+	}
+	// A command decided under a turn that has since ended (its epoch is older than the newest halt's for this robot) never
+	// reaches a driver. Bot already guarantees it is not sent after that halt; this holds even if frames were delayed.
+	if last := n.haltEpoch(c.RobotID); c.TurnEpoch > 0 && c.TurnEpoch < last {
+		nack(protocol.FaultExpired, fmt.Sprintf("from a turn that ended: epoch %d is older than the newest halt's %d", c.TurnEpoch, last))
 		return
 	}
 	if allowed != nil && !allowed[c.Kind] {
@@ -471,7 +480,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind)
 		return
 	}
-	wait := p.BeginAs(n.ctx, c.ID, c.Kind, value, deadline, c.Operator)
+	wait := p.BeginTurn(n.ctx, c.ID, c.Kind, value, deadline, c.Operator, c.TurnEpoch)
 	go func() {
 		r := wait()
 		var msg protocol.Message
@@ -562,6 +571,27 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 
 // serverNow is the server's clock when a frame stamped sentMS was received: the link's estimate, else the frame's
 // own ts.
+// noteHaltEpoch records a halt's turn_epoch for its robot (the newest wins); haltEpoch reads it (0: none seen).
+func (n *Node) noteHaltEpoch(robotID string, epoch int64) {
+	if epoch <= 0 {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.haltEpochs == nil {
+		n.haltEpochs = map[string]int64{}
+	}
+	if epoch > n.haltEpochs[robotID] {
+		n.haltEpochs[robotID] = epoch
+	}
+}
+
+func (n *Node) haltEpoch(robotID string) int64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.haltEpochs[robotID]
+}
+
 func (n *Node) serverNow(sentMS int64, received time.Time) int64 {
 	if n.link != nil {
 		if ms, ok := n.link.ServerNow(received); ok {

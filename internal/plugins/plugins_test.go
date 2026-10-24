@@ -192,6 +192,10 @@ func TestHelloDescribeCommand(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 	fx.waitLog(`"operator":{"role":"system","subject":null}`)
+	if r := p.BeginTurn(context.Background(), "c1d", "drive", nil, 300, &protocol.Operator{Subject: "usr_1", Role: "queue"}, 1792900000123)(); !r.OK {
+		t.Fatalf("%+v", r)
+	}
+	fx.waitLog(`"turn_epoch":1792900000123`)
 	if r := p.Command(context.Background(), "c2", "display", nil, 300); r.OK || r.FaultCode != "unsupported" {
 		t.Fatalf("%+v", r)
 	}
