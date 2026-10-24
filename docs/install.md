@@ -38,6 +38,21 @@ The code lasts 15 minutes; a denied or expired one adds nothing, and running the
 already-paired machine keeps its pairing. `--driver` still overrides what was found, and `--no-claim` installs without
 asking for a code. To drive the robot from your Live chat, use **Use it in my OpenVibe.Live chat** on the approval page.
 
+## From a blank microSD card (no screen, no keyboard)
+
+[openvibe.bot/setup/sd-card](https://openvibe.bot/setup/sd-card) makes a Raspberry Pi card's first-boot files: you
+write Raspberry Pi OS Lite (64-bit) with Raspberry Pi Imager, copy the page's `user-data` and `network-config` onto the
+card's `bootfs` drive, and switch the robot on. On first boot the Pi joins your Wi-Fi, turns on SSH, and runs
+
+```sh
+curl -fsSL https://openvibe.bot/install | sh -s -- --setup osk_…
+```
+
+with the card's setup key (`OPENVIBE_SETUP_KEY` works too). openvibe.bot approves that claim at once for the person who
+made the files, with the name, model, who may drive and Live they chose there, so no code is shown and nobody needs to
+be at the robot. A key adds one robot and lasts 7 days; a retry before the robot has paired pairs the same robot again.
+Its output is in `journalctl -u openvibe-setup` on the Pi.
+
 ## Quick start with a code from openvibe.bot (Linux, Raspberry Pi, macOS)
 
 1. On openvibe.bot, add a robot. You get a code like `ABCD-1234` (valid 10 minutes) and the installer command with

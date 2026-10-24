@@ -56,12 +56,14 @@ class H(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get('Content-Length') or 0))
         open(f'{work}/claim-body.json', 'wb').write(body)
         if self.path != '/api/v1/claims': return self.send(404, {})
-        self.send(201, {'id': 'clm_01JZTEST', 'user_code': 'KQ7M-2XRD', 'secret': 's3cret', 'interval': 1, 'expires_at': '2099-01-01T00:00:00Z',
+        if mode == 'spent':
+            return self.send(403, {'code': 'bot.setup_key_invalid', 'detail': "this card's setup key was used, revoked or is more than 7 days old"})
+        self.send(201, {**({'approved': True} if mode == 'setup' else {}), 'id': 'clm_01JZTEST', 'user_code': 'KQ7M-2XRD', 'secret': 's3cret', 'interval': 1, 'expires_at': '2099-01-01T00:00:00Z',
                         'verification_url': 'https://openvibe.bot/link', 'verification_url_complete': 'https://openvibe.bot/link?code=KQ7M-2XRD'})
     def do_GET(self):
         if self.path != '/api/v1/claims/clm_01JZTEST' or self.headers.get('X-OV-Claim-Secret') != 's3cret': return self.send(404, {})
         polls.append(1)
-        self.send(200, {'state': 'pending'} if len(polls) == 1 else answers[mode])
+        self.send(200, {'state': 'pending'} if len(polls) == 1 and mode != 'setup' else answers['approved' if mode == 'setup' else mode])
 srv = HTTPServer(('127.0.0.1', 0), H)
 open(f'{work}/port', 'w').write(str(srv.server_port))
 srv.serve_forever()
@@ -106,4 +108,27 @@ if claim >/dev/null; then fail "a name that could break out of the shell's quote
 grep -q "unexpected ROBOT_NAME" "$work/err" || fail "an odd answer says which value: $(cat "$work/err")"
 stop
 
-echo "install.sh one command (detection, claim): ok"
+# A card's setup key (openvibe.bot/setup/sd-card): sent with the claim, approved at once, no code shown.
+key="osk_$(printf 'k%.0s' $(seq 1 43))"
+serve setup
+out="$(OPENVIBE_INSTALL_CLAIM_ONLY=1 OPENVIBE_SERVER="http://127.0.0.1:$(cat "$work/port")" sh "$installer" --name mecanum --setup "$key" 2>"$work/err")" ||
+	fail "the setup-key claim failed: $(cat "$work/err")"
+stop
+has "$out" "ROBOT_ID=rob_01JZTEST"
+has "$out" "CODE=ABCD-1234"
+printf '%s\n' "$out" | grep -q "setup key (no code needed)" || fail "it says the key added it"
+if printf '%s\n' "$out" | grep -q "code  KQ7M-2XRD"; then fail "no code is shown with a setup key"; fi
+python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); assert b["setup_key"] == sys.argv[2] and b["hostname"] == "mecanum", b' "$work/claim-body.json" "$key" ||
+	fail "the claim carries the setup key"
+
+serve spent
+if OPENVIBE_INSTALL_CLAIM_ONLY=1 OPENVIBE_SERVER="http://127.0.0.1:$(cat "$work/port")" sh "$installer" --setup "$key" >/dev/null 2>"$work/err"; then fail "a spent key was taken"; fi
+grep -q "used, revoked or is more than 7 days old" "$work/err" || fail "a refused key says why: $(cat "$work/err")"
+stop
+
+if OPENVIBE_INSTALL_CLAIM_ONLY=1 sh "$installer" --setup osk_short >/dev/null 2>"$work/err"; then fail "a malformed key was taken"; fi
+grep -q "takes the osk_" "$work/err" || fail "a malformed key says so: $(cat "$work/err")"
+if OPENVIBE_INSTALL_CLAIM_ONLY=1 sh "$installer" --setup "$key" --code ABCD-1234 >/dev/null 2>"$work/err"; then fail "--setup with a code was taken"; fi
+grep -q "on its own" "$work/err" || fail "--setup with a code says so: $(cat "$work/err")"
+
+echo "install.sh one command (detection, claim, setup key): ok"
