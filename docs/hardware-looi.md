@@ -17,7 +17,10 @@ them per robot.
 
 Who may drive is Bot's job, not the driver's: the owner, invited operators, an optional public queue with timed
 turns, cooldowns and per-role allowed commands, all enforced by Bot's command gate before a command reaches the Node.
-The e-stop is latched in Bot and only the owner clears it.
+The e-stop is latched in Bot and only the owner clears it. Each command tells the driver who sent it (`cmd.operator`,
+`{"subject", "role"}`), and when a queue turn ends or its holder leaves Bot halts the robot before the next person
+drives (the driver gets `stop`), so commands from the last driver never come after it
+([plugins.md](plugins.md#core--plugin)).
 
 To show the panel under a Live stream, bind the robot to the channel on the Live dashboard (the robot card). The
 channel page then shows the robot's panel beside the phone's stream.

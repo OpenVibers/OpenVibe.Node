@@ -184,6 +184,14 @@ func TestHelloDescribeCommand(t *testing.T) {
 	}
 	fx.waitLog(`"deadline_ms":300`)
 	fx.waitLog(`"value":{"throttle":0.5}`)
+	if r := p.BeginAs(context.Background(), "c1b", "drive", nil, 300, &protocol.Operator{Subject: "usr_1", Role: "queue"})(); !r.OK {
+		t.Fatalf("%+v", r)
+	}
+	fx.waitLog(`"operator":{"role":"queue","subject":"usr_1"}`)
+	if r := p.BeginAs(context.Background(), "c1c", "drive", nil, 300, &protocol.Operator{Role: "system"})(); !r.OK {
+		t.Fatalf("%+v", r)
+	}
+	fx.waitLog(`"operator":{"role":"system","subject":null}`)
 	if r := p.Command(context.Background(), "c2", "display", nil, 300); r.OK || r.FaultCode != "unsupported" {
 		t.Fatalf("%+v", r)
 	}

@@ -48,7 +48,7 @@ describes itself and waits for EOF without opening any hardware.
 | op          | fields                                                        | the plugin must                                        |
 |-------------|---------------------------------------------------------------|--------------------------------------------------------|
 | `hello`     | `config` {…}, `probe` bool                                    | answer `describe`; then set up (unless probe)          |
-| `command`   | `id`, `kind`, `value`, `deadline_ms`                          | act, answer `ack` or `nack` with the same `id`         |
+| `command`   | `id`, `kind`, `value`, `deadline_ms`, `operator`?             | act, answer `ack` or `nack` with the same `id`         |
 | `heartbeat` | `t` (core clock, ms)                                          | note the time                                          |
 | `stop`      |                                                               | stop every actuator                                    |
 | `estop`     |                                                               | stop every actuator and refuse motion until `resume`   |
@@ -58,6 +58,13 @@ describes itself and waits for EOF without opening any hardware.
 
 `value` has already been validated and clamped to the owner's limits by the core ([protocol.md](protocol.md#commands)).
 `deadline_ms` is relative to receipt and already capped.
+
+`operator` is who sent the command, as Bot's gate saw them: `{"subject": "usr_…", "role": "owner" | "operator" |
+"queue"}` (`queue` is the holder of a public robot's turn); it is absent when the core got none. Bot has already
+decided the command may run, so a driver uses it to log or to apply a rule of its own, never to grant more. Commands
+reach a plugin in the order Bot sent them, and when a public robot's turn ends or its holder leaves Bot halts the robot
+before the next person's first command, which a plugin gets as `stop`: nothing from the last driver comes after it.
+Python: `cmd.operator` (a dict, or `None`).
 
 ### Plugin → core
 

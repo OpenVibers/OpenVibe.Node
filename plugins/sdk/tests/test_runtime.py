@@ -93,6 +93,22 @@ class RuntimeTest(unittest.TestCase):
         self.assertFalse(p.moving)
         self.assertIn("deadline", rt.stop_reasons)
 
+    def test_operator_reaches_handle(self):
+        seen = []
+
+        class Who(Recorder):
+            def handle(self, cmd):
+                seen.append(cmd.operator)
+
+        rt, p, out, clock = make(Who())
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "command", "id": "c1", "kind": "drive", "value": {}, "deadline_ms": 300,
+                                 "operator": {"subject": "usr_1", "role": "queue"}}))
+        rt.feed_line(json.dumps({"op": "command", "id": "c2", "kind": "drive", "value": {}, "deadline_ms": 300}))
+        rt.feed_line(json.dumps({"op": "command", "id": "c3", "kind": "drive", "value": {}, "deadline_ms": 300,
+                                 "operator": "nobody"}))
+        self.assertEqual(seen, [{"subject": "usr_1", "role": "queue"}, None, None])
+
     def test_newer_command_extends_deadline(self):
         rt, p, out, clock = make()
         self.hello(rt)

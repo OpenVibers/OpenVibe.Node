@@ -58,15 +58,18 @@ def _ack(cid, data=None):
 
 
 class Command:
-    __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target")
+    """operator is who sent it, as Bot's gate saw them: {"subject": "usr_…" or None, "role": "owner" | "operator" |
+    "queue" | …}, or None when the core passed none."""
+    __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target", "operator")
 
-    def __init__(self, id, kind, value, deadline_ms, now, target=None):
+    def __init__(self, id, kind, value, deadline_ms, now, target=None, operator=None):
         self.id = id
         self.kind = kind
         self.value = value if value is not None else {}
         self.deadline_ms = deadline_ms
         self.deadline = now + deadline_ms / 1000.0
         self.target = target
+        self.operator = operator if isinstance(operator, dict) else None
 
     def __repr__(self):
         return "Command(id=%r, kind=%r, value=%r, deadline_ms=%r)" % (self.id, self.kind, self.value, self.deadline_ms)
@@ -339,7 +342,7 @@ class Runtime:
             dl = DEFAULT_DEADLINE_MS
         moves = kind in GUARDED_KINDS or kind in self.plugin.motion_kinds
         dl = max(1, min(dl, MAX_DEADLINE_MS if moves else MAX_LONG_DEADLINE_MS))
-        cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"))
+        cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"), msg.get("operator"))
         if kind == "halt":
             self.safe_stop("halt")
             self.send({"op": "ack", "id": cid})

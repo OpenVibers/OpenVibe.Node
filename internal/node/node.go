@@ -471,7 +471,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind)
 		return
 	}
-	wait := p.Begin(n.ctx, c.ID, c.Kind, value, deadline)
+	wait := p.BeginAs(n.ctx, c.ID, c.Kind, value, deadline, c.Operator)
 	go func() {
 		r := wait()
 		var msg protocol.Message
@@ -532,7 +532,7 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 		n.inputs[c.ID] = true
 		n.mu.Unlock()
 	}
-	wait := p.Begin(n.ctx, c.ID, c.Kind, c.Value, int(window))
+	wait := p.BeginAs(n.ctx, c.ID, c.Kind, c.Value, int(window), c.Operator)
 	go func() {
 		r := wait()
 		if c.Kind == protocol.KindInput {
