@@ -5,6 +5,7 @@
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --robot <rob_…> --code <CODE> [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none]
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> [--driver …]
 #   curl -fsSL https://openvibe.bot/install | sh -s -- --network <URL> --pairing <pair_…> --code <CODE> --worker
+#   curl -fsSL https://openvibe.bot/install | sh -s -- --setup <osk_…>
 #
 # Detects the OS and CPU, downloads the openvibe-node binary and the plugin bundle (checking their SHA-256), creates
 # a Python virtual environment for the plugins, disables the Adeept kit's stock control server if it finds it,
@@ -16,6 +17,10 @@
 # Adeept ADR036 4WD at 0x5f) and at the camera, installs, then shows a code and a QR code. Its owner enters the code at
 # openvibe.bot/link (signed in), sees what was found and approves it; the robot is made, this machine pairs with it,
 # and the installer checks the driver and the camera are running and prints the robot's panel.
+#
+# With --setup (the last line) it is that same command with the setup key of a card made on openvibe.bot/setup/sd-card:
+# the card's first boot runs it with nobody at a screen, so openvibe.bot approves the claim at once for the key's
+# owner, with the robot's name, model and the rest chosen when the card files were made. No code is shown or needed.
 #
 # Options:
 #   --robot ROBOT    the rob_… id of the robot to pair with (from openvibe.bot). A driver kind here (adeept, …) is the
@@ -36,6 +41,8 @@
 #                    (the one that ran sudo), never root, and its folders are your home. Linux only; not with --worker.
 #   --no-service     install and pair, but do not install the service.
 #   --no-claim       with no robot and no code: install without pairing (no code is asked for on openvibe.bot).
+#   --setup KEY      the osk_… setup key from card files made on openvibe.bot/setup/sd-card (or OPENVIBE_SETUP_KEY):
+#                    the claim is approved by the key, with no code to enter. Used on its own.
 #   --local DIR      install from DIR (openvibe-node-<os>-<arch> and openvibe-node-plugins.tar.gz) instead of
 #                    downloading.
 #   --version TAG    release to download (default: latest).
@@ -67,6 +74,7 @@ WORKER=0
 COMPUTER=""
 CLAIM_OK=1
 DRIVER_GIVEN=0
+SETUP="${OPENVIBE_SETUP_KEY:-}"
 # The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0).
 CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.3.1}"
 CODES_DIR=/opt/openvibe-codes
@@ -74,7 +82,7 @@ CODES_DIR=/opt/openvibe-codes
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
 	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker]"
-	echo "                  [--computer observe|ask|trusted|full] [--no-service] [--no-claim]"
+	echo "                  [--computer observe|ask|trusted|full] [--no-service] [--no-claim] [--setup osk_…]"
 	echo "                  [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh      (finds the kit, then shows a code to approve on openvibe.bot/link)"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
@@ -109,6 +117,8 @@ while [ $# -gt 0 ]; do
 	--computer=*) COMPUTER="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
 	--no-claim) CLAIM_OK=0; shift ;;
+	--setup) SETUP="${2:-}"; shift 2 ;;
+	--setup=*) SETUP="${1#*=}"; shift ;;
 	--local) LOCAL="${2:-}"; shift 2 ;;
 	--version) TAG="${2:-}"; shift 2 ;;
 	-h|--help) usage; exit 0 ;;
@@ -124,6 +134,12 @@ case "$PAIRING" in ""|pair_*) ;; *) [ -z "$CODE" ] || die "--pairing must be a p
 if [ -n "$PAIRING" ] && [ -z "$NETWORK" ]; then die "--pairing needs --network, the OpenVibe.Network URL"; fi
 if [ -n "$NETWORK" ] && [ -z "$CODE" ]; then die "--network needs the pairing code (--code)"; fi
 case "$NETWORK" in ""|https://*|http://localhost*|http://127.0.0.1*) ;; *) die "--network must be an https:// URL" ;; esac
+# A card's setup key: the one command below, approved by the key (openvibe.bot/setup/sd-card), so it stands alone.
+if [ -n "$SETUP" ]; then
+	printf '%s' "$SETUP" | grep -Eq '^osk_[A-Za-z0-9_-]{43}$' || die "--setup takes the osk_… key from your card files (openvibe.bot/setup/sd-card)"
+	[ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] || die "--setup is used on its own (no --robot, --code, --network or --pairing)"
+	if [ "$CLAIM_OK" = 0 ] || [ "$WORKER" = 1 ] || [ -n "$COMPUTER" ]; then die "--setup cannot be used with --no-claim, --worker or --computer"; fi
+fi
 # No robot, no code, no Network pairing, not a worker or a computer: the one command (openvibe.bot/link, see the top).
 CLAIM=0
 if [ "$CLAIM_OK" = 1 ] && [ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ]; then CLAIM=1; fi
@@ -178,6 +194,7 @@ claim_robot() {
 	OV_HW_MODEL="$({ tr -d '\0' < /proc/device-tree/model; } 2>/dev/null || true)" \
 	OV_HW_OS="$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}") || true)" \
 	OV_HW_ARCH="$(uname -m)" OV_HW_KIT="${KIT:-}" OV_HW_KIT_NAME="${KIT_NAME:-}" OV_HW_FOUND="${FOUND:-}" OV_HW_CAMERA="${CAMERA:-}" \
+	OV_SETUP_KEY="${SETUP:-}" \
 	python3 - "${OPENVIBE_SERVER:-https://openvibe.bot}" "$_answer" "${NAME:-$(hostname)}" <<'PY' || return 1
 import json, os, re, subprocess, sys, time, urllib.error, urllib.request
 server, out, host = sys.argv[1].rstrip('/'), sys.argv[2], sys.argv[3]
@@ -194,16 +211,32 @@ def call(method, path, body=None, headers=None):
 def die(msg):
     print(f'\nopenvibe-node: error: {msg}', file=sys.stderr)
     sys.exit(1)
+setup_key = os.environ.get('OV_SETUP_KEY', '')
+body = {'hostname': host, 'hardware': hw}
+if setup_key:
+    body['setup_key'] = setup_key
 try:
-    c = call('POST', '/api/v1/claims', {'hostname': host, 'hardware': hw})
+    c = call('POST', '/api/v1/claims', body)
+except urllib.error.HTTPError as e:
+    # openvibe.bot says why (a used or old setup key, too many tries): show that, not just the status.
+    detail = ''
+    try:
+        j = json.load(e)
+        detail = j.get('detail') or j.get('error') or ''
+    except Exception:  # noqa: BLE001 - no JSON body: the status is all there is
+        pass
+    die(f'{server} refused: {detail}' if detail else f'could not ask {server} for a code: {e}')
 except Exception as e:  # noqa: BLE001 - say what happened and stop
     die(f'could not ask {server} for a code: {e}')
-print(f"\n  Approve this robot on openvibe.bot (signed in as you):\n    open  {c['verification_url']}\n    code  {c['user_code']}\n")
-try:
-    subprocess.run(['qrencode', '-t', 'ANSIUTF8', '-m', '2', c['verification_url_complete']], check=True, timeout=10)
-    print('  (or scan this with your phone)\n')
-except Exception:  # noqa: BLE001 - no QR, the link is enough
-    print(f"  or open {c['verification_url_complete']}\n")
+if c.get('approved'):
+    print("\n  Adding this robot to openvibe.bot with your card's setup key (no code needed).\n")
+else:
+    print(f"\n  Approve this robot on openvibe.bot (signed in as you):\n    open  {c['verification_url']}\n    code  {c['user_code']}\n")
+    try:
+        subprocess.run(['qrencode', '-t', 'ANSIUTF8', '-m', '2', c['verification_url_complete']], check=True, timeout=10)
+        print('  (or scan this with your phone)\n')
+    except Exception:  # noqa: BLE001 - no QR, the link is enough
+        print(f"  or open {c['verification_url_complete']}\n")
 interval, deadline = max(2, int(c.get('interval') or 3)), time.time() + 16 * 60
 sys.stdout.write('  waiting for you to approve it')
 sys.stdout.flush()
