@@ -98,8 +98,9 @@ jobs:
       - run: python -m pytest -q plugins/relay/tests
       - run: python -m pytest -q plugins/ros2/tests
       - run: python -m pytest -q plugins/computer/tests
+      - run: python -m pytest -q plugins/voice/tests
       - name: packages install
-        run: pip install ./plugins/sdk ./plugins/dryrun ./plugins/adeept_adr036 ./plugins/cozmo ./plugins/relay ./plugins/ros2 ./plugins/computer
+        run: pip install ./plugins/sdk ./plugins/dryrun ./plugins/adeept_adr036 ./plugins/cozmo ./plugins/relay ./plugins/ros2 ./plugins/computer ./plugins/voice
 
   shell:
     name: shellcheck

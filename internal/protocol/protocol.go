@@ -39,6 +39,8 @@ const (
 	TypeEstop        = "estop" // latched true sets the e-stop, false is the owner clearing it
 	TypeHeartbeatAck = "heartbeat_ack"
 	TypeError        = "error"
+	// TypeVoiceAnswer is Vibe's answer to a voice_ask (contracts 0.214.0): working, answered or refused, to speak.
+	TypeVoiceAnswer = "voice_answer"
 )
 
 // Close codes the server ends the device socket with.
@@ -63,6 +65,8 @@ const (
 	TypeHeartbeat  = "heartbeat"
 	TypeReauth     = "reauth" // a Network-paired machine's fresh node token, before the last one expires
 	TypeEstopState = "estop_state"
+	// TypeVoiceAsk is what the owner said after the machine's call word, transcribed on the machine (contracts 0.214.0).
+	TypeVoiceAsk = "voice_ask"
 )
 
 // Job frames (OpenVibe.Contracts platform.job-frame@1). Server → device: job, job_cancel, job_exit_ack. Device →
@@ -299,6 +303,26 @@ type Config struct {
 	// empty list allows only halt.
 	AllowedCommands []string `json:"allowed_commands"`
 	EstopLatched    bool     `json:"estop_latched"`
+	// Voice says the owner lets Vibe answer their voice on this machine (contracts 0.214.0): a voice plugin listens for
+	// CallWord only while it is true.
+	Voice    bool   `json:"voice,omitempty"`
+	CallWord string `json:"call_word,omitempty"`
+}
+
+// VoiceAsk is the owner's question after the machine's call word (device → server).
+type VoiceAsk struct {
+	ID      string `json:"id"`
+	Text    string `json:"text"`
+	Lang    string `json:"lang,omitempty"`
+	RobotID string `json:"robot_id,omitempty"`
+}
+
+// VoiceAnswer is Vibe's answer to a VoiceAsk with the same ID (server → device): State is working, answered or refused.
+type VoiceAnswer struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+	Text  string `json:"text,omitempty"`
+	URL   string `json:"url,omitempty"`
 }
 
 // Operator is who sent a command, as the server's gate saw them.
@@ -649,6 +673,8 @@ func (Nack) MessageType() string         { return TypeNack }
 func (Heartbeat) MessageType() string    { return TypeHeartbeat }
 func (Reauth) MessageType() string       { return TypeReauth }
 func (EstopState) MessageType() string   { return TypeEstopState }
+func (VoiceAsk) MessageType() string     { return TypeVoiceAsk }
+func (VoiceAnswer) MessageType() string  { return TypeVoiceAnswer }
 func (JobRequest) MessageType() string   { return TypeJob }
 func (JobCancel) MessageType() string    { return TypeJobCancel }
 func (JobExitAck) MessageType() string   { return TypeJobExitAck }
@@ -678,6 +704,8 @@ var registry = map[string]func() Message{
 	TypeJobStdout:    func() Message { return &JobStdout{} },
 	TypeJobUsage:     func() Message { return &JobUsage{} },
 	TypeJobExit:      func() Message { return &JobExit{} },
+	TypeVoiceAsk:     func() Message { return &VoiceAsk{} },
+	TypeVoiceAnswer:  func() Message { return &VoiceAnswer{} },
 }
 
 // ErrUnknownType is returned (wrapped) by Decode for a frame whose type is not in this version's message set.
@@ -776,6 +804,10 @@ func derefMessage(m Message) Message {
 	case *JobUsage:
 		return *v
 	case *JobExit:
+		return *v
+	case *VoiceAsk:
+		return *v
+	case *VoiceAnswer:
 		return *v
 	}
 	return m

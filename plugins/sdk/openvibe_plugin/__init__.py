@@ -137,6 +137,15 @@ class Plugin:
         """The owner answered, on the machine (`openvibe-node approve|deny <id>`), an approval this plugin asked for
         with emit_event("approval", id=…). Runs on the runtime's main thread."""
 
+    def on_voice(self, on, call_word):
+        """Vibe by voice (contracts 0.214.0): the owner lets Vibe answer their voice on this machine (on) and chose
+        call_word, or stopped it. Sent to plugins whose describe lists the `voice` capability, after every config from
+        Bot and when the plugin emits the voice_ready event. A voice plugin listens for the call word only while on."""
+
+    def on_voice_answer(self, cid, state, text, url):
+        """Vibe's answer to a voice_ask this plugin emitted (emit_event("voice_ask", id=…, text=…)): state is working,
+        answered or refused; text is what to say, url the Vibe chat that keeps it."""
+
     def on_tray(self, attached, ttl_s):
         """The Node's tray (`openvibe-node tray`, in the owner's graphical session) is showing this plugin's approvals,
         for the next ttl_s seconds unless told again. A plugin that notifies the desktop itself can stay quiet then.
@@ -293,6 +302,16 @@ class Runtime:
                 self.plugin.on_tray(msg.get("attached") is True, msg.get("ttl_s"))
             except Exception as e:
                 self.plugin.log("tray handler failed: %r", e)
+        elif op == "voice":
+            try:
+                self.plugin.on_voice(msg.get("on") is True, str(msg.get("call_word") or ""))
+            except Exception as e:
+                self.plugin.log("voice handler failed: %r", e)
+        elif op == "voice_answer":
+            try:
+                self.plugin.on_voice_answer(str(msg.get("id") or ""), str(msg.get("state") or ""), str(msg.get("text") or ""), str(msg.get("url") or ""))
+            except Exception as e:
+                self.plugin.log("voice answer handler failed: %r", e)
         elif op == "resume":
             if self.local_stop_pending:
                 self.plugin.log("resume ignored: the local stop has not reached the core yet")
