@@ -396,6 +396,18 @@ func TestJobUndecodableBody(t *testing.T) {
 	}
 }
 
+func TestComputerActsDesk(t *testing.T) {
+	cases := map[string]bool{"start": true, "stop": true, "status": false}
+	for action, acts := range cases {
+		if got := ComputerActs(KindDesk, json.RawMessage(`{"action":"`+action+`"}`)); got != acts {
+			t.Errorf("desk %s acts = %v, want %v", action, got, acts)
+		}
+	}
+	if !ComputerKinds[KindDesk] {
+		t.Error("desk is a computer kind (long deadline, no clamping)")
+	}
+}
+
 func TestComputerActsBrowser(t *testing.T) {
 	want := map[string]bool{"open": true, "click": true, "fill": true, "press": true, "back": true, "read": false, "screenshot": false, "close": false}
 	for action, acts := range want {

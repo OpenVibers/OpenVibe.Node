@@ -175,13 +175,17 @@ const (
 	// machine's private OpenRestream stream); no operator sends them. The computer plugin captures the frames, the
 	// core publishes them; a latched stop ends it and refuses a start.
 	KindScreenStream = "screen_stream"
+	// KindDesk starts, stops or reports a private desk on the machine (contracts 0.214.0): {"action": "start"|"stop"|
+	// "status", "width"?, "height"?}, an Xvfb display of its own where an agent works without touching the owner's
+	// screen; screen, screen_stream, input and browser take "desk": "private" to act there. Starting and stopping act.
+	KindDesk = "desk"
 )
 
 // Kinds lists every command kind the Node understands.
-var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput, KindBrowser, KindScreenStream}
+var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput, KindBrowser, KindScreenStream, KindDesk}
 
 // ComputerKinds move nothing: they carry long deadlines (DefaultComputerMS, at most MaxComputerMS) and no clamping.
-var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true, KindBrowser: true, KindScreenStream: true}
+var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true, KindBrowser: true, KindScreenStream: true, KindDesk: true}
 
 const (
 	// DefaultComputerMS is a computer command's reply window when the server sends no deadline; MaxComputerMS caps
@@ -194,8 +198,8 @@ const (
 )
 
 // ComputerActs reports whether a computer command changes the machine (runs a program, writes a file, uses the mouse
-// or keyboard, drives the browser): those are refused while the local stop or an e-stop is latched. Capturing the
-// screen, reading files and reading or closing the browser are not.
+// or keyboard, drives the browser, starts or stops the private desk): those are refused while the local stop or an
+// e-stop is latched. Capturing the screen, reading files, reading or closing the browser and the desk's status are not.
 func ComputerActs(kind string, value json.RawMessage) bool {
 	switch kind {
 	case KindExec, KindInput:
@@ -212,6 +216,12 @@ func ComputerActs(kind string, value json.RawMessage) bool {
 		}
 		_ = json.Unmarshal(value, &v)
 		return v.Action != "read" && v.Action != "screenshot" && v.Action != "close"
+	case KindDesk:
+		var v struct {
+			Action string `json:"action"`
+		}
+		_ = json.Unmarshal(value, &v)
+		return v.Action != "status"
 	}
 	return false
 }

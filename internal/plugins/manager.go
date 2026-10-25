@@ -24,6 +24,7 @@ var capabilityFor = map[string]string{
 	protocol.KindProbe:        "probe",
 	protocol.KindInput:        "input",
 	protocol.KindBrowser:      "browser",
+	protocol.KindDesk:         "desk",
 }
 
 // Manager supervises every configured plugin.

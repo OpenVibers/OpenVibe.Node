@@ -40,6 +40,12 @@ Command kinds and their answers (the ack's ``data``):
   way; ``screenshot`` → ``{format, width, height, content_b64}``; ``close``. Reading, screenshots and closing run at every
   level; the rest are acting commands. Below level full, ``open`` refuses an address on the machine's own network.
   Config ``allow_browser: false`` turns it off; ``browser_path``, ``browser_headless`` (default true).
+* ``desk`` ``{"action": "start"|"stop"|"status", "width"?, "height"?}``: a private desk (``desk.py``): an Xvfb display with a
+  window manager and a D-Bus session of its own, where the agent works without touching the owner's screen. ``screen``,
+  ``screen_stream``, ``input`` and ``browser`` take ``"desk": "private"`` to act there (the browser shown on the desk, in a
+  profile of its own, ``browser_profile`` + ``-desk``); ``main`` (the default) is the owner's screen. Starting and stopping
+  act (refused at observe, approved at ask), ``status`` runs at every level, and the kill switch stops the desk. Linux
+  with Xvfb; config ``allow_desk: false`` turns it off.
 * ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
   etag, last_modified, body, truncated, ms}``; for ``tcp://host:port``: ``{open, ms, error?}``. Read-only, so it runs at
   every level, and only towards the machine's own network: every address the name resolves to must be private,
@@ -67,6 +73,7 @@ import urllib.parse
 from openvibe_plugin import Deferred, Fault, Plugin
 
 from .browser import KEY_CODES, Browser, BrowserError, find_binary
+from .desk import PrivateDesk
 
 LEVELS = ("observe", "ask", "trusted", "full")
 RANK = {name: i for i, name in enumerate(LEVELS)}
@@ -132,12 +139,12 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.7.0"
+    version = "0.8.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
     def __init__(self, which=shutil.which, popen=subprocess.Popen, clock=time.monotonic, env=None, platform=None, screen_size=None,
-                 browser_factory=None, resolve=None):
+                 browser_factory=None, resolve=None, desk=None):
         self.which = which
         self.popen = popen
         self.screen_size = screen_size or self._screen_size
@@ -174,7 +181,10 @@ class Computer(Plugin):
         self.stream_mu = threading.Lock()
         self.browser_mu = threading.Lock()
         self.browser_op_mu = threading.Lock()
-        self.browser_factory = browser_factory or (lambda binary, profile, headless: Browser(binary, profile, headless))
+        self.browser_factory = browser_factory or (lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env))
+        self.desk = desk or PrivateDesk(which=which, popen=popen)
+        self.allow_desk = True
+        self.desk_browser = None   # the agent's browser on the private desk (its own profile, shown there, not headless)
         self.resolve = resolve or (lambda host: [ai[4][0] for ai in socket.getaddrinfo(host, None)])
 
     # ---- configuration -------------------------------------------------------------------------------------------
@@ -199,6 +209,7 @@ class Computer(Plugin):
         self.notify = config.get("notify", True) is not False
         self.allow_browser = config.get("allow_browser", True) is not False
         self.allow_screen_stream = config.get("allow_screen_stream", True) is not False
+        self.allow_desk = config.get("allow_desk", True) is not False
         self.browser_path = config.get("browser_path") or None
         self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
         self.browser_headless = config.get("browser_headless", True) is not False
@@ -224,6 +235,9 @@ class Computer(Plugin):
         binary = self._browser_binary()
         if binary:
             caps["browser"] = {"level": self.level, "browser": os.path.basename(binary), "headless": self.browser_headless}
+        if self.allow_desk and self.platform.startswith("linux") and self.desk.available():
+            caps["desk"] = {"level": self.level, "window_manager": self.desk.window_manager(), "input": bool(self.which("xdotool")),
+                            "screen": bool(self._x11_tool())}
         return caps
 
     def setup(self, config):
@@ -248,6 +262,7 @@ class Computer(Plugin):
             self._kill(p)
         self._close_browser()
         self._end_stream("stopped on the machine")
+        self.desk.stop()
         for cid in waiting:
             self._close_prompt(cid)
             self.emit_event("approval_done", id=cid, approved=False, reason="stopped")
@@ -309,14 +324,17 @@ class Computer(Plugin):
         if not isinstance(v, dict):
             raise Fault("bad_value", "value must be an object")
         level = self.effective_level()
+        if cmd.kind == "desk":
+            return self._desk_op(cmd, v, level)
+        desk_env = self._desk_env(v) if cmd.kind in ("screen", "screen_stream", "input", "browser") else None
         if cmd.kind == "screen":
-            tool = self._screen_tool()
+            tool = self._x11_tool() if desk_env else self._screen_tool()
             if not tool:
                 raise Fault("unsupported", "no screen capture tool on this machine")
             width = _int(v.get("max_width"), "max_width", 320, 3840, 1280)
-            return self._start(cmd, lambda: self._screen(tool, width))
+            return self._start(cmd, lambda: self._screen(tool, width, env=desk_env))
         if cmd.kind == "screen_stream":
-            return self._screen_stream(v)
+            return self._screen_stream(v, env=desk_env)
         if cmd.kind == "fs":
             op = v.get("op")
             if op in READ_OPS:
@@ -333,13 +351,13 @@ class Computer(Plugin):
         if cmd.kind == "input":
             if not self.allow_input:
                 raise Fault("unsupported", "this machine does not allow mouse and keyboard input")
-            tool = self._input_tool()
+            tool = ("xdotool" if self.which("xdotool") else None) if desk_env else self._input_tool()
             if not tool:
                 raise Fault("unsupported", "no input tool on this machine (xdotool on X11, cliclick on macOS)")
-            run, summary = self._input_op(tool, v)
+            run, summary = self._input_op(tool, v, env=desk_env)
             return self._act(cmd, level, self._driving(run), summary, threaded=True)
         if cmd.kind == "browser":
-            run, summary, acting = self._browser_op(v, level)
+            run, summary, acting = self._browser_op(v, level, env=desk_env)
             if acting:
                 return self._act(cmd, level, run, summary, threaded=True)
             return self._start(cmd, run)
@@ -349,6 +367,51 @@ class Computer(Plugin):
             run, summary = self._exec_op(cmd, v, level)
             return self._act(cmd, level, run, summary, threaded=True)
         raise Fault("unsupported", "kind %s not supported" % cmd.kind)
+
+    # ---- the private desk --------------------------------------------------------------------------------------------
+    def _desk_env(self, v):
+        """None for the owner's own screen (desk main, the default); the private desk's environment for desk private."""
+        where = v.get("desk", "main")
+        if where not in ("main", "private"):
+            raise Fault("bad_value", "desk is main or private")
+        if where == "main":
+            return None
+        if not self.allow_desk:
+            raise Fault("unsupported", "this machine does not allow a private desk (allow_desk is off)")
+        return self.desk.env()
+
+    def _desk_op(self, cmd, v, level):
+        action = v.get("action")
+        if action == "status":
+            return self.desk.status()
+        if action not in ("start", "stop"):
+            raise Fault("bad_value", "action is start, stop or status")
+        if not self.allow_desk or not self.platform.startswith("linux"):
+            raise Fault("unsupported", "this machine does not offer a private desk (Linux with Xvfb, allow_desk on)")
+        if action == "start":
+            width = _int(v.get("width"), "width", 640, 3840, 1280)
+            height = _int(v.get("height"), "height", 480, 2160, 800)
+            return self._act(cmd, level, lambda: self.desk.start(width, height),
+                             "start a private desk (%d×%d) where your agent works without touching your screen" % (width, height),
+                             threaded=True)
+
+        def stop():
+            self._close_desk_browser()
+            return self.desk.stop()
+        return self._act(cmd, level, stop, "stop the private desk (and close what runs on it)", threaded=False)
+
+    def _close_desk_browser(self):
+        b, self.desk_browser = self.desk_browser, None
+        if b is not None:
+            b.close()
+
+    def _x11_tool(self):
+        """An X11 capture tool for the private desk (it is always X11, whatever the owner's session is)."""
+        if self.which("import"):
+            return ("import", lambda out: ["import", "-window", "root", out])
+        if self.which("scrot"):
+            return ("scrot", lambda out: ["scrot", "-o", out])
+        return None
 
     def _act(self, cmd, level, run, summary, threaded):
         if RANK[level] < RANK["ask"]:
@@ -828,7 +891,7 @@ class Computer(Plugin):
             raise Fault("not_allowed", "%s is on this machine's own network: only at level full" % u.hostname)
         return raw
 
-    def _browser_op(self, v, level):
+    def _browser_op(self, v, level, env=None):
         """(run, summary, acting) for one browser action; nothing is opened or clicked before run()."""
         binary = self._browser_binary()
         if not binary:
@@ -854,13 +917,17 @@ class Computer(Plugin):
 
         def browser():
             with self.browser_mu:
+                if env:   # on the private desk: shown there (never headless), in a profile of its own
+                    if self.desk_browser is None or not self.desk_browser.alive():
+                        self.desk_browser = self.browser_factory(binary, self.browser_profile + "-desk", False, env=env)
+                    return self.desk_browser
                 if self.browser is None or not self.browser.alive():
                     self.browser = self.browser_factory(binary, self.browser_profile, self.browser_headless)
                 return self.browser
 
         def run():
             if action == "close":
-                self._close_browser()
+                self._close_desk_browser() if env else self._close_browser()
                 return {"done": True}
             b = browser()
             try:
@@ -904,8 +971,9 @@ class Computer(Plugin):
             return "xdotool"
         return None
 
-    def _input_op(self, tool, v):
-        """(run, summary) for one input action; nothing touches the screen until run() (after approval at ask)."""
+    def _input_op(self, tool, v, env=None):
+        """(run, summary) for one input action; nothing touches the screen until run() (after approval at ask). With env,
+        on the private desk (its display; points scale to the desk's own size)."""
         action = v.get("action")
         if action not in INPUT_ACTIONS:
             raise Fault("bad_value", "action is one of %s" % ", ".join(sorted(INPUT_ACTIONS)))
@@ -936,9 +1004,10 @@ class Computer(Plugin):
                 raise Fault("bad_value", "keys is one key or chord, for example Return or ctrl+s")
 
         def run():
-            at = self._scale(tool, point) if point else None
+            at = (self._desk_scale(point) if env else self._scale(tool, point)) if point else None
             argv = self._input_argv(tool, action, at, v)
-            proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+            proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
+                              **({"env": env} if env else {}))
             try:
                 _, err = proc.communicate(timeout=30)
             except subprocess.TimeoutExpired:
@@ -951,18 +1020,26 @@ class Computer(Plugin):
                 out["x"], out["y"] = at
             return out
 
+        where = " on the private desk" if env else ""
         if action == "type":
             text = v["text"]
             shown = text if len(text) <= 120 else text[:120] + "…"
-            summary = "type %d characters: %r" % (len(text), shown)
+            summary = "type %d characters%s: %r" % (len(text), where, shown)
         elif action == "key":
-            summary = "press %s" % v["keys"]
+            summary = "press %s%s" % (v["keys"], where)
         elif action == "scroll":
-            summary = "scroll %s %d" % ("up" if v["dy"] < 0 else "down", abs(v["dy"]))
+            summary = "scroll %s %d%s" % ("up" if v["dy"] < 0 else "down", abs(v["dy"]), where)
         else:
             x, y, w, h = point
-            summary = "%s at %d, %d%s" % (action.replace("_", " "), x, y, " of a %d×%d picture of the screen" % (w, h) if w else "")
+            summary = "%s at %d, %d%s%s" % (action.replace("_", " "), x, y, " of a %d×%d picture of the screen" % (w, h) if w else "", where)
         return run, summary
+
+    def _desk_scale(self, point):
+        x, y, w, h = point
+        st = self.desk.status()
+        if not w or not st.get("running"):
+            return x, y
+        return min(st["width"] - 1, round(x * st["width"] / w)), min(st["height"] - 1, round(y * st["height"] / h))
 
     def _screen_size(self, tool):
         """The screen's size in the units the input tool uses: pixels for xdotool, points for cliclick (a Retina
@@ -1044,12 +1121,12 @@ class Computer(Plugin):
                     return ("gnome-screenshot", lambda out: ["gnome-screenshot", "-f", out])
         return None
 
-    def _screen(self, tool, max_width):
+    def _screen(self, tool, max_width, env=None):
         fd, out = tempfile.mkstemp(prefix="openvibe-screen-", suffix=".png")
         os.close(fd)
         try:
             proc = self.popen(tool[1](out), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.PIPE, start_new_session=True)
+                              stderr=subprocess.PIPE, start_new_session=True, **({"env": env} if env else {}))
             try:
                 _, err = proc.communicate(timeout=15)
             except subprocess.TimeoutExpired:
@@ -1088,7 +1165,7 @@ class Computer(Plugin):
     def _stream_capable(self, tool):
         return self._have_pillow() or self._native_jpeg(tool, "x.jpg") is not None
 
-    def _screen_stream(self, v):
+    def _screen_stream(self, v, env=None):
         action = v.get("action")
         if action == "stop":
             return {"streaming": False, "stopped": self._end_stream("stopped by its owner")}
@@ -1098,7 +1175,7 @@ class Computer(Plugin):
             raise Fault("unsupported", "this machine does not show its screen live (allow_screen_stream is off)")
         if self.runtime is not None and self.runtime.estopped:
             raise Fault("local_stop", "stopped on the machine")
-        tool = self._screen_tool()
+        tool = self._x11_tool() if env else self._screen_tool()
         if not tool:
             raise Fault("unsupported", "no screen capture tool on this machine")
         if not self._stream_capable(tool):
@@ -1108,12 +1185,14 @@ class Computer(Plugin):
         self._end_stream("replaced")
         frames = tempfile.mkdtemp(prefix="openvibe-screen-stream-")  # 0700, this account only
         stream = {"sid": os.urandom(8).hex(), "until": self.clock() + seconds, "fps": fps, "tool": tool, "dir": frames,
-                  "stop": threading.Event()}
+                  "stop": threading.Event(), "env": env}
         with self.stream_mu:
             self.stream = stream
         threading.Thread(target=self._stream_loop, args=(stream,), name="computer-screen-stream", daemon=True).start()
-        self._notify_stream(seconds)
-        return {"streaming": True, "sid": stream["sid"], "seconds": seconds, "fps": fps, "tool": tool[0]}
+        if not env:   # the private desk is not the owner's screen: nothing of theirs goes live
+            self._notify_stream(seconds)
+        return {"streaming": True, "sid": stream["sid"], "seconds": seconds, "fps": fps, "tool": tool[0],
+                "desk": "private" if env else "main"}
 
     def _end_stream(self, reason):
         """End the live screen, if one runs → whether one did."""
@@ -1135,7 +1214,7 @@ class Computer(Plugin):
                     break
                 path = os.path.join(stream["dir"], "frame-%d.jpg" % (n % 3))  # the core reads each one at once
                 try:
-                    self._stream_frame(stream["tool"], path)
+                    self._stream_frame(stream["tool"], path, env=stream.get("env"))
                     n += 1
                     failures = 0
                     self.emit_video(path, stream="screen")
@@ -1153,13 +1232,13 @@ class Computer(Plugin):
             # The core ends the stream with the same id (a newer one that replaced it carries its own).
             self.emit_event("screen_stream_ended", sid=stream["sid"], reason=stream.get("reason") or reason, frames=n)
 
-    def _stream_frame(self, tool, path):
+    def _stream_frame(self, tool, path, env=None):
         """One JPEG frame of the screen at path, at most STREAM_WIDTH wide when Pillow can resize it."""
         if self._have_pillow():
             fd, png = tempfile.mkstemp(prefix="openvibe-screen-", suffix=".png")
             os.close(fd)
             try:
-                self._capture(tool[1](png))
+                self._capture(tool[1](png), env=env)
                 from PIL import Image
                 with Image.open(png) as im:
                     im = im.convert("RGB")
@@ -1171,12 +1250,12 @@ class Computer(Plugin):
                 if os.path.exists(png):
                     os.unlink(png)
             return
-        self._capture(self._native_jpeg(tool, path + ".part.jpg"))
+        self._capture(self._native_jpeg(tool, path + ".part.jpg"), env=env)
         os.replace(path + ".part.jpg", path)
 
-    def _capture(self, argv):
+    def _capture(self, argv, env=None):
         proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                          start_new_session=True)
+                          start_new_session=True, **({"env": env} if env else {}))
         try:
             _, err = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
