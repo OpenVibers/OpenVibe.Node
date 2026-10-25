@@ -91,8 +91,9 @@ def find_binary(which, platform, configured=None):
 
 
 class Browser:
-    def __init__(self, binary, profile, headless=True, timeout_s=15.0, popen=subprocess.Popen, extra_args=()):
+    def __init__(self, binary, profile, headless=True, timeout_s=15.0, popen=subprocess.Popen, extra_args=(), env=None):
         self.binary = binary
+        self.env = env   # the private desk's display and bus, or None for this process's own
         self.extra_args = list(extra_args)
         self.stderr_tail = []
         self.profile = profile
@@ -136,7 +137,7 @@ class Browser:
             os.dup2(w, 4)
 
         self.proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                               pass_fds=(3, 4), preexec_fn=fds, start_new_session=True)
+                               pass_fds=(3, 4), preexec_fn=fds, start_new_session=True, **({"env": self.env} if self.env else {}))
         threading.Thread(target=self._stderr, args=(self.proc.stderr,), name="computer-browser-err", daemon=True).start()
         os.close(to_chrome_r)
         os.close(from_chrome_w)

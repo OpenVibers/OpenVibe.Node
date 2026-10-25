@@ -124,6 +124,25 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 - **Closing.** It closes after `browser_idle_s` without a command and at the kill switch.
 - **Platforms.** Linux and macOS; not offered on Windows yet.
 
+### The private desk (`desk`, Node v0.15.0)
+
+An agent can work on a desk of its own instead of your screen (plan track K: Vibe's agent mode):
+- **What it is.** An Xvfb display on your machine with a window manager (metacity, openbox, xfwm4 or fluxbox, whichever
+  is installed) and a D-Bus session of its own, so apps opened there open there, not on your screen.
+- **Using it.** `desk` `{"action": "start", "width"?, "height"?}` (1280×800 by default), `stop` or `status`. Then
+  `screen`, `screen_stream`, `input` and `browser` take `"desk": "private"`: screenshots and the live screen of the desk,
+  the mouse and keyboard on the desk (points scale to the desk's own size), and the agent's browser shown on the desk
+  in a profile of its own (`browser_profile` + `-desk`). Without `desk` (or with `main`) they act on your own screen,
+  as before.
+- **Levels.** Starting and stopping a desk are acting commands (refused at `observe`, approved one by one at `ask`);
+  `status` runs at every level. What runs on the desk keeps its own rules: input and the browser still act.
+- **Watching and taking over.** Start the live screen with `"desk": "private"` (your desktop is not told, since nothing of
+  yours is shown) and drive it the same way.
+- **It ends** on `stop`, and at once on `openvibe-node stop` or an e-stop: every process the desk started is ended by
+  handle, never by name.
+- **Needs** Linux with `Xvfb` (Debian/Ubuntu: `apt install xvfb`), `xdotool` for input and ImageMagick `import` or `scrot`
+  for screenshots. Not offered elsewhere; `allow_desk: false` turns it off.
+
 ## Config
 
 | key                  | default        | meaning |
@@ -138,6 +157,7 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 | `notify`             | `true`         | the plugin's own prompt when a request waits and no tray shows it (graphical session only) |
 | `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
 | `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
+| `allow_desk`         | `true`         | `false`: never start a private desk (no `desk` capability) |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
 | `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |
 | `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |
