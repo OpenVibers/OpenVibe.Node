@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openvibe-voice"
+version = "0.1.0"
+description = "OpenVibe Node voice plugin: Vibe by voice on your own machine; a call word heard locally, only what follows goes to Vibe"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = ["openvibe-plugin"]
+
+[project.optional-dependencies]
+vosk = ["vosk"]
+
+[tool.setuptools]
+packages = ["openvibe_voice"]

@@ -78,12 +78,17 @@ type Node struct {
 	allowed    map[string]bool
 	telemetry  map[string]map[string]any // per plugin, latest
 	events     []protocol.Event
-	telemMS    int
-	jpeg       *video.JPEGSource
-	jpegFrom   string
-	videoSrc   string
-	lastTelem  time.Time
-	started    time.Time
+	// Vibe by voice (contracts 0.214.0): the owner's setting from Bot's config, and which plugin asked each voice_ask
+	// still waiting for its answer.
+	voiceOn      bool
+	callWord     string
+	voiceAskedBy map[string]string
+	telemMS      int
+	jpeg         *video.JPEGSource
+	jpegFrom     string
+	videoSrc     string
+	lastTelem    time.Time
+	started      time.Time
 
 	// configured is set by the first config on a connection; until then only halt runs, so a latch the owner set
 	// while the link was down is applied before any motion.
@@ -310,6 +315,8 @@ func (n *Node) Frame(f protocol.Frame) {
 		n.job(m)
 	case protocol.JobCancel:
 		n.jobCancel(m)
+	case protocol.VoiceAnswer:
+		n.voiceAnswer(m)
 	case protocol.JobExitAck:
 		if n.worker != nil {
 			n.worker.ExitAck(m.ID)
@@ -370,6 +377,65 @@ func (n *Node) applyConfig(c protocol.Config) {
 	}
 	n.log.Info("config", "max_speed", l.MaxSpeed, "max_turn", l.MaxTurn, "max_command_ms", l.MaxCommandMS,
 		"allowed", c.AllowedCommands, "estop_latched", c.EstopLatched)
+	n.mu.Lock()
+	n.voiceOn, n.callWord = c.Voice, c.CallWord
+	n.mu.Unlock()
+	n.tellVoice(nil)
+}
+
+// tellVoice gives the voice plugins (or just p) the owner's voice setting: they listen for the call word only while on.
+func (n *Node) tellVoice(only *plugins.Plugin) {
+	n.mu.Lock()
+	on, word := n.voiceOn, n.callWord
+	n.mu.Unlock()
+	for _, p := range n.mgr.Plugins() {
+		if (only == nil || p == only) && p.HasCapability("voice") {
+			if err := p.Voice(on, word); err != nil {
+				n.log.Debug("voice setting not delivered", "plugin", p.Name(), "err", err)
+			}
+		}
+	}
+}
+
+// voiceAsk sends a voice plugin's question to Bot (never into telemetry: what the person said is theirs) and remembers
+// which plugin asked, so the answers reach it.
+func (n *Node) voiceAsk(pluginName string, data map[string]any) {
+	id, _ := data["id"].(string)
+	text, _ := data["text"].(string)
+	lang, _ := data["lang"].(string)
+	if id == "" || text == "" || len(id) > 64 || len(text) > 2000 {
+		n.log.Warn("voice_ask from a plugin without id or text, or too long: dropped", "plugin", pluginName)
+		return
+	}
+	n.mu.Lock()
+	if n.voiceAskedBy == nil {
+		n.voiceAskedBy = map[string]string{}
+	}
+	if len(n.voiceAskedBy) > 100 {
+		n.voiceAskedBy = map[string]string{}
+	}
+	n.voiceAskedBy[id] = pluginName
+	n.mu.Unlock()
+	n.log.Info("voice question to Vibe", "plugin", pluginName, "id", id, "chars", len(text))
+	n.send(protocol.VoiceAsk{ID: id, Text: text, Lang: lang})
+}
+
+// voiceAnswer hands Bot's answer to the plugin that asked; a final answer (not working) forgets the question.
+func (n *Node) voiceAnswer(a protocol.VoiceAnswer) {
+	n.mu.Lock()
+	name := n.voiceAskedBy[a.ID]
+	if a.State != "working" {
+		delete(n.voiceAskedBy, a.ID)
+	}
+	n.mu.Unlock()
+	p := n.mgr.Get(name)
+	if name == "" || p == nil {
+		n.log.Debug("voice_answer for no waiting question", "id", a.ID)
+		return
+	}
+	if err := p.VoiceAnswer(a.ID, a.State, a.Text, a.URL); err != nil {
+		n.log.Warn("voice answer not delivered", "plugin", name, "err", err)
+	}
 }
 
 // command validates and routes one command. The synchronous part (checks, clamping, queueing to the plugin) keeps
@@ -696,6 +762,16 @@ func (n *Node) output(o plugins.Output) {
 		n.mu.Unlock()
 	case plugins.OutEvent:
 		name, _ := o.Data["name"].(string)
+		// Vibe by voice: a question goes to Bot on its own (never as a telemetry event); a voice plugin that has just
+		// started asks for the owner's setting.
+		if name == "voice_ask" {
+			n.voiceAsk(o.Plugin, o.Data)
+			return
+		}
+		if name == "voice_ready" {
+			n.tellVoice(n.mgr.Get(o.Plugin))
+			return
+		}
 		fields := map[string]any{}
 		for k, v := range o.Data {
 			if k != "name" {

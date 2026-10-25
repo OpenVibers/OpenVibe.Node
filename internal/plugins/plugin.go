@@ -206,6 +206,27 @@ func (p *Plugin) Answer(id string, approved bool) error {
 	return p.send(map[string]any{"op": "approval", "id": id, "approved": approved})
 }
 
+// Voice tells a voice plugin whether its owner lets Vibe answer their voice here, and the call word to listen for.
+func (p *Plugin) Voice(on bool, callWord string) error {
+	return p.send(map[string]any{"op": "voice", "on": on, "call_word": callWord})
+}
+
+// VoiceAnswer gives a voice plugin Vibe's answer to a voice_ask it raised (to speak and show).
+func (p *Plugin) VoiceAnswer(id, state, text, url string) error {
+	return p.send(map[string]any{"op": "voice_answer", "id": id, "state": state, "text": text, "url": url})
+}
+
+// HasCapability says whether the plugin's describe lists the capability (false before it described itself).
+func (p *Plugin) HasCapability(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.desc == nil {
+		return false
+	}
+	_, ok := p.desc.Capabilities[name]
+	return ok
+}
+
 // Tray tells the plugin whether the Node's tray shows its approvals, for the next ttlS seconds unless told again.
 func (p *Plugin) Tray(on bool, ttlS int) error {
 	return p.send(map[string]any{"op": "tray", "attached": on, "ttl_s": ttlS})

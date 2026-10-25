@@ -55,6 +55,8 @@ describes itself and waits for EOF without opening any hardware.
 | `resume`    |                                                               | accept motion again                                    |
 | `approval`  | `id`, `approved` bool                                         | the owner's answer to an `approval` event it raised    |
 | `tray`      | `attached` bool, `ttl_s`                                      | (computer plugin only) the tray shows its approvals for `ttl_s` s unless told again: its own desktop prompts may stay quiet |
+| `voice`     | `on` bool, `call_word`                                        | (plugins that describe a `voice` capability) the owner's Vibe by voice setting from Bot's config: listen for `call_word` only while `on` ([voice.md](voice.md)) |
+| `voice_answer` | `id`, `state` (working, answered, refused), `text`, `url`  | (voice plugins) Vibe's answer to a `voice_ask` event the plugin raised: speak and show it |
 
 `value` has already been validated and clamped to the owner's limits by the core ([protocol.md](protocol.md#commands)).
 `deadline_ms` is relative to receipt and already capped.
@@ -86,6 +88,11 @@ Python: `cmd.turn_epoch` (an int, or `None`).
 | `event`     | `name` (`cliff`, `picked_up`, `low_battery`, `heartbeat_lost`, `stop_failed`, …), any fields |
 | `video`     | `format` (`jpeg`), `path`, optional `width`, `height`, `seq`                                |
 | `local_stop` | `reason` — the driver's own stop (a button, a sensor it trusts): latches the Node's local stop, see below |
+
+Two `event` names are the core's own, for voice plugins: `voice_ready` asks for the owner's setting (the core answers
+with `voice`), and `voice_ask` (`id`, `text`, optional `lang`) is what the person said after the call word. The core sends
+it to Bot as a `voice_ask` frame and never as a telemetry event, and routes the `voice_answer` frames back to the plugin
+that asked.
 
 For `video`, the plugin writes each frame to a file (write to a temporary name, then rename, and rotate a few names so
 a slow reader never sees a partial file) and announces it with `{"op": "video", "format": "jpeg", "path": …}`
