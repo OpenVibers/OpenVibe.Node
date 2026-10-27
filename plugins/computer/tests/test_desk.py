@@ -120,6 +120,58 @@ class FakeDesk:
         return {"DISPLAY": ":%d" % self.display}
 
 
+class FakePageBrowser:
+    """A browser desk's browser, recorded: its page is the desk's screen, mouse, keyboard and live view."""
+
+    def __init__(self, binary, profile, headless, env=None):
+        self.profile, self.headless, self.env, self.download_dir = profile, headless, env, None
+        self.window = (1280, 900)
+        self.calls = []
+        self.on = True
+
+    def alive(self):
+        return self.on
+
+    def page(self):
+        self.calls.append(("page",))
+
+    def viewport(self):
+        return self.window
+
+    def open(self, url):
+        self.calls.append(("open", url))
+        return {"url": url, "title": "Example", "text": "", "links": []}
+
+    def mouse(self, action, x, y):
+        self.calls.append(("mouse", action, x, y))
+        return {"done": True, "receipt": {"url_changed": False, "appeared": ["Row added"], "gone": 0}}
+
+    def wheel(self, x, y, dy):
+        self.calls.append(("wheel", x, y, dy))
+        return {"done": True}
+
+    def insert(self, text):
+        self.calls.append(("insert", text))
+        return {"done": True}
+
+    def keys(self, chord):
+        self.calls.append(("keys", chord))
+        return {"done": True}
+
+    def screenshot(self, max_width):
+        self.calls.append(("screenshot", max_width))
+        return {"format": "jpeg", "width": 1000, "height": 500, "content_b64": "/9j/"}
+
+    def frame(self, path, max_width, quality):
+        self.calls.append(("frame", max_width, quality))
+        with open(path, "wb") as f:
+            f.write(b"\xff\xd8\xff")
+
+    def close(self):
+        self.on = False
+        self.calls.append(("close",))
+
+
 class DeskPluginTest(unittest.TestCase):
     def boot(self, level, **config):
         self.out = Out()
@@ -157,11 +209,11 @@ class DeskPluginTest(unittest.TestCase):
     def test_describe_offers_the_desk(self):
         caps = self.boot("trusted")[0]["capabilities"]
         self.assertEqual(caps["desk"], {"level": "trusted", "window_manager": "metacity", "input": True, "screen": True,
-                                        "named": True, "max_desks": default_max_desks()})
+                                        "named": True, "max_desks": default_max_desks(), "kinds": ["desktop", "browser"]})
 
     def test_observe_reports_but_does_not_start(self):
         self.boot("observe")
-        self.assertEqual(reply(self.out, self.cmd("desk", {"action": "status"}))["data"], {"running": False, "available": True, "desk": "private"})
+        self.assertEqual(reply(self.out, self.cmd("desk", {"action": "status"}))["data"], {"running": False, "available": True, "desk": "private", "kind": "desktop"})
         r = reply(self.out, self.cmd("desk", {"action": "start"}))
         self.assertEqual((r["op"], r["fault_code"]), ("nack", "not_allowed"))
         self.assertFalse(self.desk.on)
@@ -268,6 +320,93 @@ class DeskPluginTest(unittest.TestCase):
         self.assertEqual(made[1].download_dir, os.path.join(self.desk_dir, "desk-a", "downloads"))
         self.assertNotEqual(made[0].download_dir, made[1].download_dir)
         self.assertNotEqual(made[0].env["DISPLAY"], made[1].env["DISPLAY"])
+
+    def test_browser_desks_their_page_is_the_screen(self):
+        # Desks plan D2: a browser alone, with no display. Its page is its screen, mouse, keyboard and live view.
+        self.boot("trusted", max_desks=1)
+        made = []
+
+        def factory(binary, profile, headless, env=None):
+            b = FakePageBrowser(binary, profile, headless, env)
+            made.append(b)
+            return b
+        self.plugin.browser_factory = factory
+        before = len(self.calls)
+        r = reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-a", "kind": "browser", "width": 1000, "height": 500}))
+        self.assertEqual((r["op"], r["data"]["kind"], r["data"]["running"], r["data"]["width"]), ("ack", "browser", True, 1000), r)
+        r = reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-b", "kind": "browser"}))
+        self.assertEqual(r["op"], "ack", r)
+        self.assertEqual((self.made_desks, len(self.calls)), ([], before), "no display, no process started")
+        # Two browser desks fill max_desks 1 (each counts as half): a whole desk more is refused.
+        r = reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-c"}))
+        self.assertEqual(r["fault_code"], "not_ready")
+        self.assertIn("counts as half", r["message"])
+        listed = reply(self.out, self.cmd("desk", {"action": "list"}))["data"]["desks"]
+        self.assertEqual([(d["desk"], d["kind"]) for d in listed], [("desk-a", "browser"), ("desk-b", "browser")])
+        # Its browser: headless, the desk's size, a profile of its own, and never the owner's display.
+        r = reply(self.out, self.cmd("browser", {"action": "open", "url": "https://example.org/", "desk": "desk-a"}))
+        self.assertEqual(r["op"], "ack", r)
+        a = made[0]
+        self.assertEqual((a.headless, a.window), (True, (1000, 500)))
+        self.assertTrue(a.profile.endswith("-desk-a"))
+        self.assertNotIn("DISPLAY", a.env)
+        self.assertTrue(os.path.basename(a.env["TMPDIR"]).startswith("ov-desk-a-"))
+        # The mouse and keyboard are the page's: a point in a 100×100 picture lands on the 1000×500 page.
+        r = reply(self.out, self.cmd("input", {"action": "click", "x": 50, "y": 50, "width": 100, "height": 100, "desk": "desk-a"}))
+        self.assertEqual((r["op"], r["data"]["x"], r["data"]["y"], r["data"]["receipt"]["appeared"]), ("ack", 500, 250, ["Row added"]), r)
+        self.assertIn(("mouse", "click", 500, 250), a.calls)
+        reply(self.out, self.cmd("input", {"action": "scroll", "dy": 3, "desk": "desk-a"}))
+        reply(self.out, self.cmd("input", {"action": "type", "text": "hello", "desk": "desk-a"}))
+        reply(self.out, self.cmd("input", {"action": "key", "keys": "ctrl+a", "desk": "desk-a"}))
+        self.assertEqual([c for c in a.calls if c[0] in ("wheel", "insert", "keys")],
+                         [("wheel", 500, 250, 3), ("insert", "hello"), ("keys", "ctrl+a")], "a scroll with no point is at the middle")
+        self.assertEqual(len(self.calls), before, "never xdotool")
+        # A look and the live view are pictures of the page.
+        shot = reply(self.out, self.cmd("screen", {"desk": "desk-a", "max_width": 800}))
+        self.assertEqual(shot["data"]["format"], "jpeg")
+        self.assertIn(("screenshot", 800), a.calls)
+        live = reply(self.out, self.cmd("screen_stream", {"action": "start", "seconds": 30, "desk": "desk-a"}))
+        self.assertEqual((live["data"]["streaming"], live["data"]["desk"], live["data"]["tool"]), (True, "desk-a", "page"), live)
+        reply(self.out, self.cmd("screen_stream", {"action": "stop"}))
+        frame = os.path.join(self.desk_dir, "frame.jpg")
+        self.plugin._stream_frame(("page", None), frame, desk="desk-a")
+        with open(frame, "rb") as f:
+            self.assertEqual(f.read(2), b"\xff\xd8")
+        # desk-b has a browser of its own.
+        reply(self.out, self.cmd("screen", {"desk": "desk-b"}))
+        self.assertEqual(len(made), 2)
+        self.assertTrue(made[1].profile.endswith("-desk-b"))
+        # Stopping a browser desk closes its browser. The private desk is always a whole desk; kinds are checked.
+        reply(self.out, self.cmd("desk", {"action": "stop", "desk": "desk-a"}))
+        self.assertFalse(a.alive())
+        self.assertEqual(reply(self.out, self.cmd("desk", {"action": "start", "kind": "browser"}))["fault_code"], "bad_value")
+        self.assertEqual(reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-z", "kind": "vm"}))["fault_code"], "bad_value")
+        self.plugin.stop()
+        self.assertFalse(made[1].alive())
+
+    def test_a_named_desk_scales_points_to_its_own_size(self):
+        # A click on desk-a scales to desk-a's size, not to the private desk's (which may not even run).
+        self.boot("trusted", max_desks=2)
+        reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-a", "width": 1000, "height": 500}))
+        reply(self.out, self.cmd("input", {"action": "click", "x": 50, "y": 50, "width": 100, "height": 100, "desk": "desk-a"}))
+        self.assertEqual(self.calls[-1][0][3:5], ["500", "250"])
+
+    def test_a_mac_runs_browser_desks(self):
+        out = Out()
+        plugin = Computer(env={}, platform="darwin", which=lambda n: "/usr/bin/chromium" if n == "chromium" else None,
+                          screen_size=lambda tool: (100, 100))
+        rt = Runtime(plugin, infile=io.StringIO(""), outfile=out)
+        rt.dispatch({"op": "hello", "config": {"level": "trusted", "roots": [tempfile.gettempdir()], "notify": False,
+                                                "desk_dir": tempfile.mkdtemp(prefix="ov-desks-")}})
+        desk = out.msgs()[0]["capabilities"]["desk"]
+        self.assertEqual((desk["kinds"], desk["window_manager"], desk["screen"], desk["input"]), (["browser"], None, True, True))
+        rt.dispatch({"op": "command", "id": "m1", "kind": "desk", "value": {"action": "start", "desk": "desk-a"}, "deadline_ms": 30000})
+        r = reply(out, "m1")
+        self.assertEqual(r["fault_code"], "unsupported")
+        self.assertIn("browser desks", r["message"])
+        rt.dispatch({"op": "command", "id": "m2", "kind": "desk", "value": {"action": "start", "desk": "desk-a", "kind": "browser"}, "deadline_ms": 30000})
+        self.assertEqual(reply(out, "m2")["data"]["kind"], "browser")
+        plugin.stop()
 
     def test_the_kill_switch_stops_the_desk(self):
         self.boot("trusted")

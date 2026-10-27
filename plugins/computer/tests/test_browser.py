@@ -1,4 +1,5 @@
 import http.server
+import io
 import os
 import shutil
 import socketserver
@@ -12,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "sdk"))
 sys.path.insert(0, HERE)
 
 from openvibe_computer import Computer  # noqa: E402
-from openvibe_computer.browser import Browser, find_binary  # noqa: E402
+from openvibe_computer.browser import Browser, BrowserError, find_binary  # noqa: E402
 from openvibe_plugin import Runtime  # noqa: E402
 from test_computer import Out, reply  # noqa: E402
 
@@ -172,6 +173,40 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(len(long["appeared"][0]), 160)
 
 
+class PageKeysTest(unittest.TestCase):
+    """A browser desk's keys (Desks plan D2): xdotool's names, pressed on the page as the browser's own key events."""
+
+    def browser(self):
+        b = Browser("chromium", "/nonexistent")
+        self.sent = []
+        b.call = lambda method, params=None, **kw: self.sent.append(params) or {}
+        b.start = lambda: None
+        b._eval = lambda expression: {"url": "https://a/", "text": ""}
+        b._settle = lambda *a: None
+        return b
+
+    def pressed(self):
+        return [(p["type"], p["key"], p["modifiers"], p.get("text")) for p in self.sent]
+
+    def test_keys_and_chords(self):
+        b = self.browser()
+        b.keys("ctrl+a")
+        self.assertEqual(self.pressed(), [("rawKeyDown", "Control", 2, None), ("rawKeyDown", "a", 2, None),
+                                          ("keyUp", "a", 2, None), ("keyUp", "Control", 0, None)], "a chord types nothing")
+        self.sent.clear()
+        b.keys("Return")
+        self.assertEqual(self.pressed(), [("keyDown", "Enter", 0, "\r"), ("keyUp", "Enter", 0, None)])
+        self.sent.clear()
+        b.keys("shift+a")
+        self.assertEqual(self.pressed()[1], ("keyDown", "A", 8, "A"))
+        self.sent.clear()
+        b.keys("Page_Down")
+        self.assertEqual(self.pressed()[0][:2], ("rawKeyDown", "PageDown"))
+        for bad in ("hyper+a", "Menu"):
+            with self.assertRaises(BrowserError):
+                b.keys(bad)
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     PAGES = {
         "/": b"<!doctype html><title>Home</title><h1>Hello</h1><a href='/two'>Second page</a>"
@@ -233,6 +268,59 @@ class RealBrowserTest(unittest.TestCase):
         self.assertEqual(b.back()["receipt"]["url_changed"], True)
         self.assertTrue(shot["content_b64"])
         b.close()
+        self.assertFalse(b.alive())
+
+    def test_a_browser_desk_its_page_is_the_screen(self):
+        # Desks plan D2 in a real browser: no display; the page is the desk's screen, mouse and keyboard, and live view.
+        srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        base = "http://127.0.0.1:%d" % srv.server_address[1]
+        tmp = __import__("tempfile").mkdtemp(prefix="ov-bdesk-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        extra = ["--no-sandbox"] if os.environ.get("CI") else []
+        out = Out()
+        plugin = Computer(platform=sys.platform)
+        plugin.browser_factory = lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env, extra_args=extra)
+        rt = Runtime(plugin, infile=io.StringIO(""), outfile=out)
+        # Level full: the test page is on 127.0.0.1, which only full may open.
+        rt.dispatch({"op": "hello", "config": {"level": "full", "roots": [tmp], "notify": False, "desk_dir": os.path.join(tmp, "desks"),
+                                                "browser_profile": os.path.join(tmp, "profile")}})
+        self.addCleanup(plugin.stop)
+        n = [0]
+
+        def cmd(kind, value):
+            n[0] += 1
+            rt.dispatch({"op": "command", "id": "b%d" % n[0], "kind": kind, "value": dict(value, desk="desk-t"), "deadline_ms": 60000})
+            cid = "b%d" % n[0]
+            r = out.wait_for(lambda m: m.get("id") == cid and m.get("op") in ("ack", "nack"), timeout=60)   # a first start is slow
+            self.assertEqual(r["op"], "ack", r)
+            return r["data"]
+        self.assertEqual(cmd("desk", {"action": "start", "kind": "browser", "width": 1000, "height": 600})["kind"], "browser")
+        cmd("browser", {"action": "open", "url": base + "/app"})
+        shot = cmd("screen", {"max_width": 500})
+        self.assertEqual((shot["format"], shot["width"]), ("jpeg", 500), "a picture of the 1000-wide page, at most 500 wide")
+        b = plugin.desk_browsers["desk-t"]
+        self.assertEqual(b.viewport(), (1000, 600), "the page is the desk's size")
+        # Click the button where it is in the 500-wide picture: the page's own click, with what it changed.
+        r = b._eval("(() => { const r = document.getElementById('go').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()")
+        x, y = round(r[0] * shot["width"] / 1000), round(r[1] * shot["height"] / 600)
+        clicked = cmd("input", {"action": "click", "x": x, "y": y, "width": shot["width"], "height": shot["height"]})
+        self.assertEqual(clicked["receipt"]["appeared"], ["Row added"], clicked)
+        # Type into the field it focused, select all, delete.
+        b._eval("document.querySelector('input[type=email]').focus()")
+        cmd("input", {"action": "type", "text": "a@b.co"})
+        self.assertEqual(b._eval("document.querySelector('input[type=email]').value"), "a@b.co")
+        cmd("input", {"action": "key", "keys": "ctrl+a"})
+        cmd("input", {"action": "key", "keys": "BackSpace"})
+        self.assertEqual(b._eval("document.querySelector('input[type=email]').value"), "")
+        cmd("input", {"action": "scroll", "dy": 2})
+        # A frame of the live view: a JPEG from the browser itself.
+        frame = os.path.join(tmp, "frame.jpg")
+        plugin._stream_frame(("page", None), frame, desk="desk-t")
+        with open(frame, "rb") as f:
+            self.assertEqual(f.read(2), b"\xff\xd8")
+        cmd("desk", {"action": "stop"})
         self.assertFalse(b.alive())
 
 

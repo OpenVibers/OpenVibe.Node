@@ -9,6 +9,9 @@ that setting at one.
     Browser(binary, profile, headless).open(url) / read() / click(selector|text) / fill(selector, text) / press(key)
         / back() / screenshot(max_width) / close()
 
+On a browser desk (Desks plan D2: a browser alone, no display) the page is also the desk's screen: ``mouse``,
+``wheel``, ``insert`` and ``keys`` are its mouse and keyboard, and ``frame`` writes one picture of it for the live view.
+
 Every page answer is ``{url, title, text, links}``: the page's visible text (cut at ``MAX_TEXT``) and its first links.
 """
 
@@ -29,6 +32,41 @@ KEY_CODES = {
     "ArrowUp": (38, ""), "ArrowDown": (40, ""), "ArrowLeft": (37, ""), "ArrowRight": (39, ""),
     "PageUp": (33, ""), "PageDown": (34, ""), "Home": (36, ""), "End": (35, ""), "Space": (32, " "),
 }
+# xdotool's key names (what `input` takes) → the browser's keys: (key, code, Windows key code, text).
+PAGE_KEYS = {
+    "return": ("Enter", "Enter", 13, "\r"), "enter": ("Enter", "Enter", 13, "\r"), "kp_enter": ("Enter", "NumpadEnter", 13, "\r"),
+    "tab": ("Tab", "Tab", 9, ""), "escape": ("Escape", "Escape", 27, ""), "esc": ("Escape", "Escape", 27, ""),
+    "backspace": ("Backspace", "Backspace", 8, ""), "delete": ("Delete", "Delete", 46, ""), "space": (" ", "Space", 32, " "),
+    "up": ("ArrowUp", "ArrowUp", 38, ""), "down": ("ArrowDown", "ArrowDown", 40, ""), "left": ("ArrowLeft", "ArrowLeft", 37, ""),
+    "right": ("ArrowRight", "ArrowRight", 39, ""), "home": ("Home", "Home", 36, ""), "end": ("End", "End", 35, ""),
+    "page_up": ("PageUp", "PageUp", 33, ""), "prior": ("PageUp", "PageUp", 33, ""), "page_down": ("PageDown", "PageDown", 34, ""),
+    "next": ("PageDown", "PageDown", 34, ""), "insert": ("Insert", "Insert", 45, ""),
+}
+# Modifiers: the bit CDP's `modifiers` takes, and the key event that holds it down.
+PAGE_MODIFIERS = {
+    "alt": (1, ("Alt", "AltLeft", 18)), "option": (1, ("Alt", "AltLeft", 18)),
+    "ctrl": (2, ("Control", "ControlLeft", 17)), "control": (2, ("Control", "ControlLeft", 17)),
+    "super": (4, ("Meta", "MetaLeft", 91)), "meta": (4, ("Meta", "MetaLeft", 91)), "cmd": (4, ("Meta", "MetaLeft", 91)),
+    "command": (4, ("Meta", "MetaLeft", 91)), "win": (4, ("Meta", "MetaLeft", 91)),
+    "shift": (8, ("Shift", "ShiftLeft", 16)),
+}
+
+
+def page_key(name, shift=False):
+    """(key, code, Windows key code, text) for one xdotool key name on a page, or None."""
+    low = name.lower()
+    if low in PAGE_KEYS:
+        return PAGE_KEYS[low]
+    if len(name) == 1 and name.isalpha():
+        ch = name.upper() if shift else name.lower()
+        return (ch, "Key" + name.upper(), ord(name.upper()), ch)
+    if len(name) == 1 and name.isdigit():
+        return (name, "Digit" + name, ord(name), name)
+    if low.startswith("f") and low[1:].isdigit() and 1 <= int(low[1:]) <= 12:
+        return ("F" + low[1:], "F" + low[1:], 111 + int(low[1:]), "")
+    return None
+
+
 CANDIDATES = ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge", "brave-browser")
 MAC_APPS = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -155,20 +193,28 @@ class Browser:
         self.session = None
         self.used_at = 0.0
         self.download_dir = None   # a desk's own downloads folder (set before the first action), else the browser's default
+        self.window = (1280, 900)  # the window's size
+        self.page_size = None      # on a browser desk, the page's exact size (the desk's: its page is its screen)
+        self.write_mu = threading.Lock()   # one message at a time on the pipe: actions and the live view share it
+        self.start_mu = threading.Lock()
 
     # ---- the process and the pipe ------------------------------------------------------------------------------------
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
     def start(self):
-        if self.alive():
-            return
+        # One start at a time: an action and a browser desk's live view may both find the browser closed at once.
+        with self.start_mu:
+            if not self.alive():
+                self._start()
+
+    def _start(self):
         os.makedirs(self.profile, mode=0o700, exist_ok=True)
         to_chrome_r, to_chrome_w = os.pipe()
         from_chrome_r, from_chrome_w = os.pipe()
         argv = [self.binary, "--remote-debugging-pipe", "--user-data-dir=%s" % self.profile, "--no-first-run",
                 "--no-default-browser-check", "--disable-background-networking", "--disable-sync",
-                "--disable-component-update", "--password-store=basic", "--window-size=1280,900", "about:blank"]
+                "--disable-component-update", "--password-store=basic", "--window-size=%d,%d" % self.window, "about:blank"]
         if self.headless:
             argv.insert(1, "--headless=new")
         argv[1:1] = self.extra_args
@@ -195,6 +241,9 @@ class Browser:
         self.session = self.call("Target.attachToTarget", {"targetId": target, "flatten": True}, session=False)["sessionId"]
         self.call("Page.enable")
         self.call("Runtime.enable")
+        if self.page_size:
+            self.call("Emulation.setDeviceMetricsOverride", {"width": self.page_size[0], "height": self.page_size[1],
+                                                              "deviceScaleFactor": 1, "mobile": False})
         if self.download_dir:
             self.call("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.download_dir}, session=False)
 
@@ -244,7 +293,8 @@ class Browser:
         if session and self.session:
             msg["sessionId"] = self.session
         try:
-            self.out.write(json.dumps(msg).encode("utf-8") + b"\0")
+            with self.write_mu:
+                self.out.write(json.dumps(msg).encode("utf-8") + b"\0")
         except (OSError, ValueError, AttributeError):
             raise BrowserError("hardware", "the browser is not running")
         ok = slot[0].wait(timeout_s or self.timeout_s)
@@ -376,6 +426,98 @@ class Browser:
     def _need(self):
         if not self.alive() or not self.session:
             raise BrowserError("not_ready", "no page is open: open a URL first")
+
+    # ---- a browser desk: the page is the screen ---------------------------------------------------------------------
+    def page(self):
+        """Make sure the browser runs (a blank page until one is opened): a browser desk always has a screen."""
+        self.start()
+        self.used_at = time.monotonic()
+
+    def viewport(self):
+        """The page's size in CSS pixels, which mouse events use."""
+        metrics = self.call("Page.getLayoutMetrics")
+        view = metrics.get("cssVisualViewport") or metrics.get("visualViewport") or {}
+        return int(view.get("clientWidth") or self.window[0]), int(view.get("clientHeight") or self.window[1])
+
+    def mouse(self, action, x, y):
+        """move, click, double_click or right_click at (x, y) on the page, with what it changed (a receipt) for a click."""
+        self.page()
+        before = self._before() if action != "move" else None
+        self._mark()
+        self.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        if action == "move":
+            return {"done": True}
+        button = "right" if action == "right_click" else "left"
+        for n in range(1, (2 if action == "double_click" else 1) + 1):
+            self.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": button, "clickCount": n})
+            self.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": button, "clickCount": n})
+        self._settle(1.0)
+        return self._receipt_only(before)
+
+    def wheel(self, x, y, dy):
+        """Scroll at (x, y): dy clicks of the wheel (negative is up), about 100 pixels each."""
+        self.page()
+        self.call("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": dy * 100})
+        time.sleep(0.2)
+        return {"done": True}
+
+    def insert(self, text):
+        """Type text where the page's focus is."""
+        self.page()
+        self.call("Input.insertText", {"text": text})
+        return {"done": True}
+
+    def keys(self, chord):
+        """One key or chord in xdotool's names (Return, ctrl+a, shift+Tab, F5), pressed on the page."""
+        parts = chord.split("+")
+        mods = [PAGE_MODIFIERS.get(p.lower()) for p in parts[:-1]]
+        if None in mods:
+            raise BrowserError("bad_value", "unknown modifier in %s" % chord)
+        bits = sum(m[0] for m in mods)
+        key = page_key(parts[-1], shift=bool(bits & 8))
+        if key is None:
+            raise BrowserError("unsupported", "the key %s is not supported on a browser desk" % parts[-1])
+        self.page()
+        before = self._before()
+        self._mark()
+        held = 0
+        for bit, (k, code, vk) in mods:
+            held |= bit
+            self.call("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": k, "code": code, "windowsVirtualKeyCode": vk, "modifiers": held})
+        k, code, vk, text = key
+        typed = text if text and not bits & 7 else ""   # with ctrl, alt or meta held a key types nothing
+        down = {"type": "keyDown" if typed else "rawKeyDown", "key": k, "code": code, "windowsVirtualKeyCode": vk, "modifiers": bits}
+        if typed:
+            down["text"] = down["unmodifiedText"] = typed
+        self.call("Input.dispatchKeyEvent", down)
+        self.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": k, "code": code, "windowsVirtualKeyCode": vk, "modifiers": bits})
+        for bit, (mk, mcode, mvk) in reversed(mods):
+            held &= ~bit
+            self.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": mk, "code": mcode, "windowsVirtualKeyCode": mvk, "modifiers": held})
+        self._settle(1.0)
+        return self._receipt_only(before)
+
+    def _receipt_only(self, before):
+        out = {"done": True}
+        try:
+            r = receipt(before, self._eval(BEFORE_JS))
+        except BrowserError:
+            r = None
+        if r is not None:
+            out["receipt"] = r
+        return out
+
+    def frame(self, path, max_width, quality):
+        """One JPEG picture of the page at path (written whole, then moved into place), at most max_width wide."""
+        self.page()
+        width, height = self.viewport()
+        params = {"format": "jpeg", "quality": quality}
+        if width > max_width:
+            params["clip"] = {"x": 0, "y": 0, "width": width, "height": height, "scale": max_width / float(width)}
+        data = base64.b64decode(self.call("Page.captureScreenshot", params)["data"])
+        with open(path + ".part", "wb") as f:
+            f.write(data)
+        os.replace(path + ".part", path)
 
     def close(self):
         proc, self.proc, self.session = self.proc, None, None

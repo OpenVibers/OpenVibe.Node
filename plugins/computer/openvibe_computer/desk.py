@@ -29,6 +29,8 @@ START_TIMEOUT_S = 8.0
 
 
 class PrivateDesk:
+    kind = "desktop"
+
     def __init__(self, which=shutil.which, popen=subprocess.Popen, clock=time.time, sleep=time.sleep,
                  exists=os.path.exists, base_env=None, displays=DISPLAYS):
         self.which = which
@@ -179,6 +181,72 @@ class PrivateDesk:
                 pass
 
 
+# What a browser desk leaves out of the machine's environment: the owner's display, session bus and X cookie, so
+# nothing started for it can reach the owner's screen or their desktop apps.
+OWNER_SESSION = ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY")
+
+
+class BrowserDesk:
+    """A browser desk (Desks plan D2): a browser alone, with no display, on Linux or macOS.
+
+    Nothing runs here. The plugin starts the desk's headless browser (its own profile, downloads and temp folder) on
+    the desk's first command and closes it when the desk stops. Its screen, mouse and keyboard and its live view are
+    the page's own, over the browser's debugging pipe. The desk is its size, its start time and an environment
+    without the owner's session (OWNER_SESSION). It costs about half of a whole desk: no display, no window manager,
+    nothing drawn on a screen.
+    """
+    kind = "browser"
+
+    def __init__(self, clock=time.time, base_env=None):
+        self.clock = clock
+        self.base_env = dict(os.environ if base_env is None else base_env)
+        self.mu = threading.Lock()
+        self.on = False
+        self.width = self.height = self.since = None
+
+    def available(self):
+        return True   # the plugin checks for a browser before it starts one
+
+    def window_manager(self):
+        return None
+
+    def running(self):
+        return self.on
+
+    def status(self):
+        with self.mu:
+            if not self.on:
+                return {"running": False, "available": True}
+            return {"running": True, "width": self.width, "height": self.height, "since": int(self.since)}
+
+    def start(self, width=1280, height=800):
+        with self.mu:
+            if not self.on:
+                self.on, self.width, self.height, self.since = True, width, height, self.clock()
+        return self.status()
+
+    def stop(self):
+        with self.mu:
+            was, self.on = self.on, False
+            self.width = self.height = self.since = None
+        return {"running": False, "stopped": was}
+
+    def env(self):
+        with self.mu:
+            if not self.on:
+                raise Fault("not_ready", "start the desk first (desk start)")
+            return {k: v for k, v in self.base_env.items() if k not in OWNER_SESSION}
+
+
+# A browser desk counts as half a desk against max_desks (a whole desk counts 2 of 2 * max_desks).
+DESK_COST = {"desktop": 2, "browser": 1}
+
+
+def kind_of(d):
+    """A desk's kind; a desk object without one is a whole desk (desktop)."""
+    return getattr(d, "kind", "desktop")
+
+
 # A desk's name: `private` (the first desk, as before) or `desk-<name>` (Desks plan D1: several desks on one machine,
 # one per agent task). Lower case, digits and dashes, so a name is also a safe path part.
 DESK_NAME = re.compile(r"^(private|desk-[a-z0-9][a-z0-9-]{0,23})$")
@@ -199,15 +267,18 @@ def default_max_desks(meminfo="/proc/meminfo"):
 
 
 class Desks:
-    """The machine's desks by name, each a PrivateDesk with a display, a bus and (in the plugin) a browser of its own.
+    """The machine's desks by name: each a PrivateDesk (kind desktop: a display, a bus and, in the plugin, a browser
+    shown there) or a BrowserDesk (kind browser: a headless browser alone).
 
     Two desks never share a display, a bus, a browser profile or a temp folder, so two agents working at once cannot
-    see or drive each other's screen. At most `max_desks` run at once; starting one more is refused, never queued.
+    see or drive each other's screen. At most `max_desks` whole desks run at once (a browser desk counts as half);
+    starting one more is refused, never queued.
     Starts are serialized, so two desks starting together cannot pick the same display number.
     """
 
-    def __init__(self, factory, private=None, max_desks=2, base_dir=None):
+    def __init__(self, factory, private=None, max_desks=2, base_dir=None, browser_factory=None):
         self.factory = factory
+        self.browser_factory = browser_factory or BrowserDesk
         self.max_desks = max_desks
         self.base_dir = base_dir
         self.mu = threading.Lock()
@@ -222,11 +293,11 @@ class Desks:
             raise Fault("bad_value", "desk is main, private or desk-<name> (lower-case letters, digits and dashes, at most 29 characters)")
         return name
 
-    def _desk(self, name, create=False):
-        d = self.desks.get(name)
-        if d is None and create:
-            d = self.desks[name] = self.factory()
-        return d
+    def kind(self, name):
+        """The kind of desk that name is now (desktop or browser), or None when there is no such desk."""
+        with self.mu:
+            d = self.desks.get(name)
+        return kind_of(d) if d is not None else None
 
     def available(self):
         d = self.desks.get("private") or self.factory()
@@ -240,17 +311,25 @@ class Desks:
         with self.mu:
             return [n for n, d in self.desks.items() if d.running()]
 
-    def start(self, name, width=1280, height=800):
+    def start(self, name, width=1280, height=800, kind="desktop"):
         self.check(name)
+        if kind not in DESK_COST:
+            raise Fault("bad_value", "kind is desktop or browser")
+        if name == "private" and kind != "desktop":
+            raise Fault("bad_value", "private is a whole desk: name a browser desk desk-<name>")
         with self.mu:
-            d = self._desk(name, create=True)
+            d = self.desks.get(name)
+            if d is not None and d.running() and kind_of(d) != kind:
+                raise Fault("not_ready", "desk %s already runs as a %s desk: stop it first" % (name, kind_of(d)))
+            if d is None or kind_of(d) != kind:
+                d = self.desks[name] = self.factory() if kind == "desktop" else self.browser_factory()
             if not d.running():
-                busy = [n for n, other in self.desks.items() if n != name and other.running()]
-                if len(busy) >= self.max_desks:
-                    raise Fault("not_ready", "this machine already runs %d desks (%s), its limit (max_desks): stop one first"
-                                % (len(busy), ", ".join(sorted(busy))))
+                busy = sorted((n, kind_of(other)) for n, other in self.desks.items() if n != name and other.running())
+                if sum(DESK_COST[k] for _, k in busy) + DESK_COST[kind] > 2 * self.max_desks:
+                    raise Fault("not_ready", "this machine already runs %s, its limit (max_desks %d; a browser desk counts "
+                                "as half): stop one first" % (", ".join("%s (%s)" % b for b in busy), self.max_desks))
             st = d.start(width, height)
-        return dict(st, desk=name)
+        return dict(st, desk=name, kind=kind_of(d))
 
     def stop(self, name):
         self.check(name)
@@ -276,12 +355,12 @@ class Desks:
             d = self.desks.get(name)
         if d is None:
             return {"running": False, "available": self.available(), "desk": name}
-        return dict(d.status(), desk=name)
+        return dict(d.status(), desk=name, kind=kind_of(d))
 
     def list(self):
         with self.mu:
             desks = sorted(self.desks.items())
-        running = [dict(d.status(), desk=n) for n, d in desks if d.running()]
+        running = [dict(d.status(), desk=n, kind=kind_of(d)) for n, d in desks if d.running()]
         return {"desks": running, "max_desks": self.max_desks, "available": self.available()}
 
     def env(self, name):

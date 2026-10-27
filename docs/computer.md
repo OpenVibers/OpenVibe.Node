@@ -167,6 +167,25 @@ An agent can work on a desk of its own instead of your screen (plan track K: Vib
 - **Needs** Linux with `Xvfb` (Debian/Ubuntu: `apt install xvfb`), `xdotool` for input and ImageMagick `import` or `scrot`
   for screenshots. Not offered elsewhere; `allow_desk: false` turns it off.
 
+### Browser desks (`"kind": "browser"`, Node v0.23.0)
+
+Most agent work happens in a browser, and a browser does not need a screen. `{"action": "start", "desk": "desk-<name>",
+"kind": "browser"}` starts a **browser desk** (the Desks plan's step D2): a headless browser alone, with no display or
+window manager.
+- **About half the cost of a whole desk.** A browser desk counts as half a desk against `max_desks`, so a machine with
+  `max_desks: 2` runs four browser desks, or one whole desk and two browser desks.
+- **On a Mac too.** A browser desk needs only Chromium, Chrome, Edge or Brave, so it runs on macOS as well as Linux.
+  `describe` lists the kinds a machine runs in `desk.kinds` (`desktop`, `browser`).
+- **Its page is its screen.** `screen` takes a picture of the page. `input` is the page's own mouse and keyboard:
+  clicks, the wheel, keys and chords in xdotool's names (`Return`, `ctrl+a`), and text. A click answers with what it
+  changed (a receipt, as in the browser kind). `screen_stream` sends frames of the page, so you can watch a browser desk
+  live and take it over like any desk. All of it goes through the browser's pipe: no display, no capture tool, no
+  Pillow.
+- **Like any desk.** It has its own profile (`browser_profile` + `-<name>`), downloads and temp folder, and nothing of
+  your session (no `DISPLAY`, session bus or X cookie). `browser` drives its page, and its page is exactly the desk's
+  size (1280×800 by default).
+- `private` is always a whole desk; a whole desk is `"kind": "desktop"`, the default.
+
 ### Desk hosts (`--desk-host`, Node v0.20.0)
 
 An old laptop, a mini PC or a spare workstation can host desks for your agents: no screen, keyboard or login needed.
@@ -182,6 +201,9 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
   many. Each agent task gets a desk of its own (OpenVibe.Actor with OpenVibe.Bot, Node v0.19.0): its own screen,
   browser profile, downloads and temp folder. A task beyond `max_desks` is told the machine is busy (its desk does not
   start); it never shares another task's desk.
+- **No screen of its own.** A desk host offers no screen, mouse or keyboard of its own, only its desks'. The Node gives
+  `screen`, `screen_stream` and `input` to the plugin with desks, which acts on the desk named and refuses the host's
+  own screen (Node v0.23.0).
 - **Then** turn on "Let my agent use this computer" for the machine on openvibe.bot/machines. Watch any desk live from
   there, and take it over the same way.
 
@@ -200,7 +222,7 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
 | `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
 | `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
 | `allow_desk`         | `true`         | `false`: never start a private desk (no `desk` capability) |
-| `max_desks`          | memory / 2 GiB, 1 to 8 | how many desks run at once (1 to 10) |
+| `max_desks`          | memory / 2 GiB, 1 to 8 | how many whole desks run at once (1 to 10); a browser desk counts as half |
 | `desk_idle_s`        | `900`          | a desk no command used this long is stopped (60 to 86400) |
 | `desk_dir`           | `~/.local/share/openvibe-node/desks` | each desk's own temp and downloads folders |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
