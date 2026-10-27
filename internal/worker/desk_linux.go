@@ -99,7 +99,9 @@ func RunDesk(ctx context.Context, cfg config.WorkerConfig, d DeskSpec) (int, err
 	if err != nil {
 		return 0, err
 	}
-	root, err := os.MkdirTemp("", "openvibe-desk-")
+	// Under /tmp whatever TMPDIR says: a plugin starts desk-sandbox with a desk's own temp folder there, closed to
+	// everyone else, and the sandbox mounts its root as worker.run_as, who must be able to reach it.
+	root, err := os.MkdirTemp("/tmp", "openvibe-desk-")
 	if err != nil {
 		return 0, err
 	}
