@@ -61,6 +61,10 @@ class Ai(Plugin):
         self.busy = threading.Lock()
         self.cfg = {}
         self.reachable = False
+        # How fast each model answers here, in tokens a second of its reply (an average that favours the latest
+        # answers), and the model that answered last: the telemetry Bot shows beside the machine's models.
+        self.speed = {}
+        self.last_model = None
 
     # ---- the model server -----------------------------------------------------------------------------------------
     def _get(self, url, timeout):
@@ -149,6 +153,25 @@ class Ai(Plugin):
         threading.Thread(target=self._reply, args=(cmd.id, body), name="ai-reply", daemon=True).start()
         raise Deferred()
 
+    def _measure(self, model, tokens, ms):
+        """Keeps how fast this model answered: the reply's tokens over the whole answer's time (reading the prompt
+        included, so it is what a person waits), averaged with the earlier answers, the latest counting most."""
+        if not isinstance(tokens, int) or tokens < 1 or not ms or ms < 1:
+            return
+        rate = tokens / (ms / 1000.0)
+        before = self.speed.get(model)
+        self.speed[model] = rate if before is None else before * 0.7 + rate * 0.3
+        self.last_model = model
+
+    def poll(self):
+        """Sensors: whether a model is answering now (ai_busy), and the last model's speed here (ai_model,
+        ai_tokens_per_s) once one has answered."""
+        sensors = {"ai_busy": 1 if self.busy.locked() else 0}
+        if self.last_model is not None and self.last_model in self.speed:
+            sensors["ai_model"] = self.last_model[:120]
+            sensors["ai_tokens_per_s"] = round(self.speed[self.last_model], 1)
+        return {"sensors": sensors}
+
     def _configure_again(self):
         try:
             self._configure(self.cfg)
@@ -176,6 +199,7 @@ class Ai(Plugin):
             if isinstance(usage, dict):
                 out["usage"] = {k: int(usage[k]) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
                                 if isinstance(usage.get(k), (int, float))}
+            self._measure(body["model"], (out.get("usage") or {}).get("completion_tokens"), out["ms"])
             self.complete(cid, out)
         except urllib.error.HTTPError as e:
             self.fail(cid, "hardware", "the model server answered %d" % e.code)
