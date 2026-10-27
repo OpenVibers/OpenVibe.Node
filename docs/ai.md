@@ -53,6 +53,22 @@ computer's models** for the machine on openvibe.bot/machines.
 | `max_tokens` | `2048` | the most one reply may be (at most 32768) |
 | `timeout_s` | `180` | how long one reply may take (at most 900) |
 
+## Where your models answer
+
+Once "Let my AI use this computer's models" is on for the machine, on openvibe.bot/machines:
+
+- **OpenVibe.Chat.** Under "Your AI key" in your settings, choose "A model on my own computer". The machine card's
+  "Use these models in OpenVibe.Chat" fills it in. Your Vibe (tick "Vibe thinks with it too") and the AI members you
+  set up in rooms then think with it.
+- **OpenVibe.Live.** A streamer's AI chat viewers: Dashboard, Chat AI, AI Chat Viewers, Key & Budget, AI source "A
+  model on my own computer (free)".
+- **Any of your computers.** Choose "any" instead of one machine. OpenVibe asks the fastest of yours that is on and
+  has the model (by `ai_tokens_per_s`), then the next when one is busy. It is never anyone else's machine.
+- **Your own code.** `openvibe-sdk/bot`: `bot.machines.chat(id, { model, messages })` asks one of the machine's
+  models as you (SDK 0.67.0).
+
+When the machine is off or its model server is down, the request fails and says so. Nothing else answers in its place.
+
 ## The command
 
 `ai` `{"model", "messages": [{"role": "system"|"user"|"assistant", "content"}], "max_tokens"?, "temperature"?}` →
