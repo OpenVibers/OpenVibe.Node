@@ -42,6 +42,12 @@
 #                    window manager, D-Bus, xdotool, ImageMagick, Chromium) and sizes them to the machine's memory
 #                    (max_desks: one per 2 GiB); each agent task gets a desk of its own. Implies --computer trusted
 #                    (for that account's own files only); give another level with --computer.
+#   --shared         with --desk-host: the desks serve people other than the machine's owner (a desk host OpenVibe or
+#                    a community member runs for others; Desks plan D5). Browser desks only, each one's browser in the
+#                    worker's sandbox (its own namespaces and cgroup, as the unprivileged user openvibe-job, 1 GiB and
+#                    one core at most, the public internet only), and nothing of the machine itself offered. The
+#                    service runs as root, which the sandbox needs; the installer adds Google Chrome's .deb (amd64) or
+#                    Debian's Chromium, nftables and iproute2. Linux only.
 #   --computer LEVEL this machine's terminal, files and screen for its owner's agents (the computer plugin,
 #                    docs/computer.md), at LEVEL observe, ask, trusted or full. The service then runs as YOUR account
 #                    (the one that ran sudo), never root, and its folders are your home. Linux only; not with --worker.
@@ -85,6 +91,7 @@ TAG="latest"
 WORKER=0
 COMPUTER=""
 DESK_HOST=0
+SHARED=0
 AI=0
 AI_ENDPOINT=""
 CLAIM_OK=1
@@ -97,7 +104,7 @@ CODES_DIR=/opt/openvibe-codes
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
 	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker]"
-	echo "                  [--computer observe|ask|trusted|full] [--desk-host] [--ai] [--ai-endpoint URL]"
+	echo "                  [--computer observe|ask|trusted|full] [--desk-host [--shared]] [--ai] [--ai-endpoint URL]"
 	echo "                  [--no-service] [--no-claim] [--setup osk_…]"
 	echo "                  [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh      (finds the kit, then shows a code to approve on openvibe.bot/link)"
@@ -130,6 +137,7 @@ while [ $# -gt 0 ]; do
 	--pairing=*) PAIRING="${1#*=}"; shift ;;
 	--worker) WORKER=1; shift ;;
 	--desk-host) DESK_HOST=1; shift ;;
+	--shared) SHARED=1; shift ;;
 	--ai) AI=1; shift ;;
 	--ai-endpoint) AI=1; AI_ENDPOINT="${2:-}"; shift 2 ;;
 	--ai-endpoint=*) AI=1; AI_ENDPOINT="${1#*=}"; shift ;;
@@ -150,6 +158,12 @@ done
 case "$DRIVER" in adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo, looi, ros2, ros2-holonomic or none" ;; esac
 case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
 case "$AI_ENDPOINT" in ""|http://*|https://*) ;; *) die "--ai-endpoint is the model server's http(s) base, for example http://127.0.0.1:11434" ;; esac
+if [ "$SHARED" = 1 ]; then
+	[ "$DESK_HOST" = 1 ] || die "--shared goes with --desk-host (a desk host that serves other people)"
+	# Nobody sits at a shared desk host to approve, and its desks act on other people's behalf only.
+	case "$COMPUTER" in ""|trusted|observe) ;; *) die "a shared desk host runs at level trusted (or observe): nobody is at it to approve" ;; esac
+	DESK_HOST=shared
+fi
 # --pairing takes the pair_… id; with no --code, anything else there is the code itself.
 case "$PAIRING" in ""|pair_*) ;; *) [ -z "$CODE" ] || die "--pairing must be a pair_… id"; CODE="$PAIRING"; PAIRING="" ;; esac
 if [ -n "$PAIRING" ] && [ -z "$NETWORK" ]; then die "--pairing needs --network, the OpenVibe.Network URL"; fi
@@ -159,7 +173,7 @@ case "$NETWORK" in ""|https://*|http://localhost*|http://127.0.0.1*) ;; *) die "
 if [ -n "$SETUP" ]; then
 	printf '%s' "$SETUP" | grep -Eq '^osk_[A-Za-z0-9_-]{43}$' || die "--setup takes the osk_… key from your card files (openvibe.bot/setup/sd-card)"
 	[ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] || die "--setup is used on its own (no --robot, --code, --network or --pairing)"
-	if [ "$CLAIM_OK" = 0 ] || [ "$WORKER" = 1 ] || [ -n "$COMPUTER" ] || [ "$DESK_HOST" = 1 ] || [ "$AI" = 1 ]; then die "--setup cannot be used with --no-claim, --worker, --computer, --desk-host or --ai"; fi
+	if [ "$CLAIM_OK" = 0 ] || [ "$WORKER" = 1 ] || [ -n "$COMPUTER" ] || [ "$DESK_HOST" != 0 ] || [ "$AI" = 1 ]; then die "--setup cannot be used with --no-claim, --worker, --computer, --desk-host or --ai"; fi
 fi
 # No robot, no code, no Network pairing, not a worker, a computer or a model machine: the one command (openvibe.bot/link,
 # see the top).
@@ -319,12 +333,14 @@ fi
 # and, with a Node.js and a Codes install, the `openvibe-codes@1.0.0` job runner. Keys stay empty for the owner to add.
 # write_computer_config <config.json> <level> <home> [desk-host]: add the computer plugin at that level (replacing an
 # earlier entry), its folder the owner's home; the rest of the config is kept. A desk host (4th argument 1) keeps its
-# desks under <home>/desks, shows no notifications (nobody sits at it) and turns the camera off.
+# desks under <home>/desks, shows no notifications (nobody sits at it) and turns the camera off; a shared one (4th
+# argument shared) sandboxes every desk (desk_isolation sandbox) and offers nothing else.
 write_computer_config() {
 	${SUDO:-} python3 - "$@" <<'PY'
 import json, os, sys
 path, level, home = sys.argv[1], sys.argv[2], sys.argv[3]
-desk_host = len(sys.argv) > 4 and sys.argv[4] == '1'
+desk_host = len(sys.argv) > 4 and sys.argv[4] in ('1', 'shared')
+shared = len(sys.argv) > 4 and sys.argv[4] == 'shared'
 with open(path) as f:
     conf = json.load(f)
 plugins = [p for p in conf.get('plugins') or [] if p.get('name') not in ('computer', 'dryrun')]
@@ -333,6 +349,14 @@ if desk_host:
     computer.update({'notify': False, 'allow_desk': True, 'desk_dir': os.path.join(home, 'desks'),
                      'browser_profile': os.path.join(home, 'browser')})
     conf['video'] = {'source': 'off'}
+if shared:
+    previous = next((p.get('config') or {} for p in conf.get('plugins') or [] if p.get('name') == 'computer'), {})
+    computer.update({'desk_isolation': 'sandbox', 'desk_egress': 'public', 'allow_exec': False, 'probe': False,
+                     'allow_screen_stream': False})
+    for k, v in {'desk_memory_mb': 1024, 'desk_cpu_millis': 1000, 'desk_disk_mb': 512, 'desk_pids': 512}.items():
+        computer[k] = previous.get(k, v)   # an operator's own sizes are kept on a second run
+    if previous.get('max_desks'):
+        computer['max_desks'] = previous['max_desks']
 plugins.append({'name': 'computer', 'config': computer})
 conf['plugins'] = plugins
 old = os.umask(0o077)
@@ -456,6 +480,7 @@ if [ -n "${OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY:-}" ]; then
 	[ "$DESK_HOST" = 0 ] || [ -n "$COMPUTER" ] || COMPUTER=trusted
 	case "$COMPUTER" in observe|ask|trusted|full) ;; *) die "--computer is observe, ask, trusted or full" ;; esac
 	write_computer_config "$OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY" "$COMPUTER" "${OPENVIBE_COMPUTER_HOME:?}" "$DESK_HOST"
+	[ "$DESK_HOST" != shared ] || write_worker_config "$OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY" "${OPENVIBE_JOB_UID:-999}" "${OPENVIBE_JOB_GID:-999}"
 	exit 0
 fi
 
@@ -711,7 +736,17 @@ say "installed $BIN_DIR/openvibe-node ($("$BIN_DIR/openvibe-node" version))"
 SVC_USER=""
 if [ "$WORKER" = 1 ] && [ "$OS" != linux ]; then die "--worker is for Linux"; fi
 COMPUTER_HOME=""
-if [ "$DESK_HOST" = 1 ]; then
+if [ "$DESK_HOST" = shared ]; then
+	# A desk host for other people: the service runs as root, which the desk sandbox needs (namespaces, a cgroup per
+	# desk, its network), and every desk's browser runs in it as the unprivileged openvibe-job, as a worker's jobs do.
+	[ "$OS" = linux ] || die "--desk-host --shared is for Linux (namespaces and cgroup v2)"
+	[ "$WORKER" = 0 ] || die "--desk-host --shared already runs the worker's sandbox for its desks; leave out --worker"
+	[ -n "$COMPUTER" ] || COMPUTER=trusted
+	COMPUTER_HOME=/var/lib/openvibe-desk
+	$SUDO mkdir -p "$COMPUTER_HOME/desks"
+	$SUDO chown -R root:root "$COMPUTER_HOME"
+	$SUDO chmod 700 "$COMPUTER_HOME"
+elif [ "$DESK_HOST" = 1 ]; then
 	# A desk host: the desks run as an account of their own, never the person's, so an agent there never reaches the
 	# owner's files, browser or sessions. --computer still sets the level (trusted by default).
 	[ "$OS" = linux ] || die "--desk-host is for Linux (desks are Xvfb displays)"
@@ -736,7 +771,7 @@ elif [ -n "$COMPUTER" ]; then
 	if [ -z "$COMPUTER_HOME" ] || [ ! -d "$COMPUTER_HOME" ]; then die "no home folder for $SVC_USER"; fi
 fi
 case "$COMPUTER" in ""|observe|ask|trusted|full) ;; *) die "--computer is observe, ask, trusted or full" ;; esac
-if [ "$OS" = linux ] && [ "$SERVICE" = 1 ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ]; then
+if [ "$OS" = linux ] && [ "$SERVICE" = 1 ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ] && [ "$DESK_HOST" != shared ]; then
 	SVC_USER=openvibe-node
 	if ! id "$SVC_USER" >/dev/null 2>&1; then
 		$SUDO useradd --system --home-dir "$STATE" --no-create-home --shell /usr/sbin/nologin "$SVC_USER" 2>/dev/null ||
@@ -808,7 +843,33 @@ if [ -n "$COMPUTER" ]; then
 	$SUDO "$PIP" install --quiet "$STATE/plugins/computer[screen]" 2>/dev/null || $SUDO "$PIP" install --quiet "$STATE/plugins/computer"
 	[ "$DRIVER" = none ] && VIDEO='"source": "off"'
 fi
-if [ "$DESK_HOST" = 1 ]; then
+if [ "$DESK_HOST" = shared ]; then
+	# What a sandboxed browser desk needs: a browser installed under /usr or /opt (never a snap, which cannot run in
+	# the sandbox), fonts, and the sandbox's network tools (its egress is a veth the Node NATs).
+	if command -v apt-get >/dev/null 2>&1; then
+		say "installing what shared desks need (a browser, fonts, nftables, iproute2)"
+		$SUDO apt-get install -y nftables iproute2 util-linux fonts-dejavu-core fonts-noto-color-emoji fonts-liberation >/dev/null 2>&1 ||
+			say "warning: apt-get could not install nftables iproute2 util-linux and fonts; install them yourself"
+		if [ ! -x /opt/google/chrome/chrome ] && [ "$(dpkg --print-architecture 2>/dev/null)" = amd64 ]; then
+			say "installing Google Chrome (its .deb from dl.google.com)"
+			if ! curl -fsSL -o "$TMP/chrome.deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb ||
+				! $SUDO apt-get install -y "$TMP/chrome.deb" >/dev/null 2>&1; then
+				say "warning: could not install Google Chrome"
+			fi
+		elif [ ! -x /opt/google/chrome/chrome ]; then
+			# No Chrome for Linux on ARM: Debian's Chromium is a .deb (Ubuntu's is a snap, which cannot run sandboxed).
+			$SUDO apt-get install -y chromium >/dev/null 2>&1 ||
+				say "warning: no Chromium .deb here (Ubuntu's is a snap): use Debian on an ARM desk host, or a Chromium build under /opt"
+		fi
+	else
+		say "install Google Chrome (or a Chromium that is not a snap), fonts, nftables and iproute2: shared desks need them"
+	fi
+	if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" != 1 ]; then
+		say "turning on IPv4 forwarding (the sandbox NATs each desk's own network; /etc/sysctl.d/90-openvibe-node-worker.conf)"
+		$SUDO sh -c "printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/90-openvibe-node-worker.conf"
+		$SUDO sysctl -q -p /etc/sysctl.d/90-openvibe-node-worker.conf || say "warning: could not turn IPv4 forwarding on"
+	fi
+elif [ "$DESK_HOST" = 1 ]; then
 	# What a desk needs: a display (Xvfb), a window manager, its own D-Bus, input (xdotool), screenshots (ImageMagick),
 	# fonts, and a Chromium-family browser.
 	if command -v apt-get >/dev/null 2>&1; then
@@ -837,7 +898,36 @@ else
 	# The one command sets up the robot it found: the driver's plugins, kind and video replace the old ones.
 	[ "$CLAIM" = 0 ] || set_driver_config "$CONF/config.json"
 fi
-if [ "$DESK_HOST" = 1 ]; then
+if [ "$DESK_HOST" = shared ]; then
+	if ! id openvibe-job >/dev/null 2>&1; then
+		$SUDO useradd --system --no-create-home --shell /usr/sbin/nologin --user-group openvibe-job 2>/dev/null ||
+			$SUDO adduser --system --no-create-home --shell /usr/sbin/nologin --group openvibe-job
+	fi
+	# The worker is on (no functions: no jobs are offered) so the Node sets up its cgroup before any desk starts, and
+	# its sandbox, run_as and egress are the desks'.
+	write_worker_config "$CONF/config.json" "$(id -u openvibe-job)" "$(id -g openvibe-job)"
+	write_computer_config "$CONF/config.json" "$COMPUTER" "$COMPUTER_HOME" shared
+	mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+	# A browser desk counts as half a desk against max_desks and may use 1 GiB: keep 1 GiB for the system.
+	desks=$(( (mem_kb / 1048576 - 1) / 2 )); [ "$desks" -ge 1 ] || desks=1; [ "$desks" -le 10 ] || desks=10
+	$SUDO python3 - "$CONF/config.json" "$desks" <<'PY'
+import json, os, sys
+path, desks = sys.argv[1], int(sys.argv[2])
+conf = json.load(open(path))
+for p in conf.get('plugins') or []:
+    if p.get('name') == 'computer':
+        p.setdefault('config', {}).setdefault('max_desks', desks)
+old = os.umask(0o077)
+with open(path + '.tmp', 'w') as f:
+    json.dump(conf, f, indent=2)
+    f.write('\n')
+os.umask(old)
+os.replace(path + '.tmp', path)
+PY
+	say "this machine is a shared desk host: up to $((desks * 2)) browser desks at once for other people's agents, each"
+	say "in its own sandbox (1 GiB, one core, the public internet only); nothing of this machine is offered to them"
+	say "(desk_memory_mb, desk_cpu_millis and max_desks in $CONF/config.json change it)."
+elif [ "$DESK_HOST" = 1 ]; then
 	write_computer_config "$CONF/config.json" "$COMPUTER" "$COMPUTER_HOME" 1
 	mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
 	desks=$(( mem_kb / 2097152 )); [ "$desks" -ge 1 ] || desks=1; [ "$desks" -le 8 ] || desks=8

@@ -56,7 +56,11 @@ func cmdDeskSandbox(args []string, stderr io.Writer) int {
 		fs.Usage()
 		return 2
 	}
+	// Started by a plugin, it reads the config of the Node that started it (which names the plugin's environment).
 	paths := config.DefaultPaths(*home)
+	if c, st := os.Getenv(config.EnvConfigDir), os.Getenv(config.EnvStateDir); *home == "" && c != "" && st != "" {
+		paths = config.Paths{ConfigDir: c, StateDir: st}
+	}
 	cfg, err := config.Load(paths.ConfigFile())
 	if err != nil {
 		fmt.Fprintln(stderr, "desk-sandbox:", err)

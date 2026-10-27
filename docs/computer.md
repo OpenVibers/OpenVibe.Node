@@ -256,6 +256,33 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
 - **Then** turn on "Let my agent use this computer" for the machine on openvibe.bot/machines. Watch any desk live from
   there, and take it over the same way.
 
+### Desk hosts for other people (`--desk-host --shared`, Node v0.32.0)
+
+A desk host OpenVibe or a community member runs for **other people's** agents (the Desks plan's step D5, second part)
+must keep each person's desk away from the machine and from every other desk. Such a host runs browser desks only, and
+each desk's browser runs in the job worker's sandbox (docs/worker.md):
+```
+curl -fsSL https://openvibe.bot/install | sudo sh -s -- --network … --pairing pair_… --code … --desk-host --shared
+```
+- **Each desk sandboxed.** The plugin starts a desk's browser as `openvibe-node desk-sandbox -- <browser> …`: its own
+  user, mount, network, PID and IPC namespaces, as the unprivileged `openvibe-job` (`worker.run_as`), in a cgroup of its
+  own with `desk_memory_mb` of memory (swap off: running out ends that desk alone), `desk_cpu_millis` of CPU,
+  `desk_pids` processes and a `desk_disk_mb` private `/tmp`, where its profile and downloads live. It sees only the
+  system's own files read-only, the browser's install directory and the fonts; never the Node's config or credential,
+  another desk, or a home. Its network is the public internet only (`desk_egress: public`), enforced by the kernel
+  (the worker's veth and nftables rules), never the machine's own network or the host itself. Chrome's own sandbox is
+  off inside it (ours replaces it; it cannot nest), and the browser gets nothing of the plugin's environment.
+- **Nothing of the machine.** `exec`, `fs`, `probe`, the machine's own screen, mouse, keyboard and browser, whole desks,
+  kept profiles and `screen_stream` (the machine's one live stream is its operator's) are refused; `screen`, `input` and
+  `browser` act on a browser desk. `describe` reports only `desk`, with `isolation: "sandbox"` and the limits.
+- **What it runs as.** The Node runs as root, which the sandbox needs (namespaces, a cgroup per desk, its network), with
+  its worker on (no functions: no jobs offered) so it sets up its cgroup before any desk starts; the computer plugin
+  runs as root only here, at level `trusted` (nobody is at the machine to approve), and starts nothing unconfined.
+- **What it needs.** Linux 5.14+ with cgroup v2 and the Node's service delegated (`Delegate=yes`), a browser installed
+  under `/usr` or `/opt` (Google Chrome's .deb on amd64, Debian's Chromium on ARM; a snap cannot run sandboxed),
+  nftables, iproute2 and IPv4 forwarding. The installer adds them, sizes `max_desks` to the machine (a desk may use
+  1 GiB; a browser desk counts half) and keeps your own sizes on a second run.
+
 ## Config
 
 | key                  | default        | meaning |
@@ -275,6 +302,12 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
 | `desk_idle_s`        | `900`          | a desk no command used this long is stopped (60 to 86400) |
 | `desk_dir`           | `~/.local/share/openvibe-node/desks` (Windows: `%LOCALAPPDATA%\openvibe-node\desks`) | each desk's own temp and downloads folders |
 | `desk_profile_max_mb` | `256`         | a kept profile larger than this is not saved (16 to 4096) |
+| `desk_isolation`     | `none`         | `sandbox`: a desk host for other people: browser desks only, each in its own sandbox, nothing of the machine offered (Linux, the Node as root with its worker on) |
+| `desk_memory_mb`     | `1024`         | with `sandbox`: each desk's memory (256 to 16384; swap off) |
+| `desk_cpu_millis`    | `1000`         | with `sandbox`: each desk's CPU in thousandths of a core (100 to 16000) |
+| `desk_disk_mb`       | `512`          | with `sandbox`: each desk's private `/tmp`, its profile and downloads (64 to 16384) |
+| `desk_pids`          | `512`          | with `sandbox`: each desk's processes and threads (64 to 8192) |
+| `desk_egress`        | `public`       | with `sandbox`: `public` (the public internet only) or `none` |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
 | `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |
 | `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |

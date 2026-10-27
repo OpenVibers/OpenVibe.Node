@@ -144,7 +144,9 @@ func RunDesk(ctx context.Context, cfg config.WorkerConfig, d DeskSpec) (int, err
 		}
 	}
 	if sb.cg, err = newJobCgroup(caps, protocol.JobLimits{MemBytes: d.MemBytes}); err != nil {
-		return 0, err
+		// Its cgroup is made beside the Node's own leaf, which the Node sets up when its worker is on (the probe);
+		// a desk started by a plugin cannot rearrange the Node's cgroup itself.
+		return 0, fmt.Errorf("desk cgroup: %w (a desk host runs its Node with worker.enabled, so the cgroup is set up first)", err)
 	}
 	attr.UseCgroupFD, attr.CgroupFD = true, sb.cg.fd
 	cmd := &exec.Cmd{Path: "/proc/self/exe", Args: []string{sandboxArg0}, Env: []string{}, Dir: "/", Stderr: d.Stderr,

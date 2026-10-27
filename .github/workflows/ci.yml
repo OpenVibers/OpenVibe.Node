@@ -47,6 +47,21 @@ jobs:
             (cd internal/$1 && sudo systemd-run --scope --quiet -p Delegate=yes \
               env OPENVIBE_WORKER_TESTS=require "$d/$1/$1.test" -test.count=1 -test.v -test.run "$2")
           done
+      # A desk host for other people (computer plugin desk_isolation sandbox): the plugin, as root, drives a real
+      # browser desk through `openvibe-node desk-sandbox`. The shell stands in for the Node, which moves itself into its
+      # openvibe-node leaf and enables the controllers (its worker's probe) before any plugin starts.
+      - name: shared desk host (root)
+        run: |
+          d=$(mktemp -d) && chmod 755 "$d"
+          go build -o "$d/openvibe-node" ./cmd/openvibe-node
+          mkdir -m 700 "$d/config" "$d/state"
+          echo '{"worker":{"enabled":true,"run_as":{"uid":65534,"gid":65534}}}' > "$d/config/config.json"
+          sudo systemd-run --scope --quiet -p Delegate=yes env OPENVIBE_DESK_SANDBOX_TESTS=require \
+            OPENVIBE_NODE_EXE="$d/openvibe-node" OPENVIBE_NODE_CONFIG="$d/config" OPENVIBE_NODE_STATE="$d/state" sh -c '
+              cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)
+              mkdir "$cg/openvibe-node" && echo $$ > "$cg/openvibe-node/cgroup.procs"
+              echo "+memory +pids +cpu +io" > "$cg/cgroup.subtree_control"
+              exec python3 plugins/computer/tests/test_shared_desks.py -v RealSharedDeskTest'
 
   build:
     name: cross-compile

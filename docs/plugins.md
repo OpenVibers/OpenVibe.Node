@@ -22,7 +22,9 @@ hardware.
 
 A bundled plugin needs only its `name`; the core runs `<state>/venv/bin/python -m openvibe_<name>`. Anything else needs
 `command`. `config` is sent to the plugin in `hello`. The core adds `frame_dir` (where to write camera frames) unless
-set, and the environment variable `OPENVIBE_NODE_STATE`.
+set, and the environment variables `OPENVIBE_NODE_STATE` and `OPENVIBE_NODE_CONFIG` (its state and config directories)
+and `OPENVIBE_NODE_EXE` (its own executable), so a command a plugin runs with it (`openvibe-node desk-sandbox`, the
+computer plugin's shared desks) reads the same config as the Node that started it.
 
 ## Lifecycle
 
