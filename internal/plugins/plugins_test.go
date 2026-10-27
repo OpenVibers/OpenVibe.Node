@@ -253,7 +253,7 @@ func TestShutdownStopsAndClosesStdin(t *testing.T) {
 	fx.stop()
 	fx.m.Wait()
 	l := fx.lines()
-	if !strings.Contains(l[len(l)-2], `"op":"stop"`) || l[len(l)-1] != "EOF-STOP" {
+	if l[len(l)-2] != `{"cause":"shutdown","op":"stop"}` || l[len(l)-1] != "EOF-STOP" {
 		t.Fatalf("want stop then EOF, got %v", l)
 	}
 }
@@ -262,8 +262,8 @@ func TestCrashRestartsWithEstop(t *testing.T) {
 	fx := start(t, "")
 	fx.waitState(StateReady)
 	p := fx.m.Get("fake")
-	p.Estop()
-	fx.waitLog(`{"op":"estop"}`)
+	p.Estop(EstopRemote, "staff: test")
+	fx.waitLog(`{"cause":"remote","op":"estop","reason":"staff: test"}`)
 	r := p.Command(context.Background(), "boom", "crash", nil, 300)
 	if r.OK || r.FaultCode != protocol.FaultPluginDown {
 		t.Fatalf("%+v", r)
@@ -273,7 +273,7 @@ func TestCrashRestartsWithEstop(t *testing.T) {
 	if p.Info().Restarts < 1 {
 		t.Fatal("no restart counted")
 	}
-	// After the restart the latched e-stop is sent again right after hello.
+	// After the restart the latched e-stop is sent again right after hello, as a replay of the same emergency.
 	l := fx.lines()
 	var afterCrash []string
 	for i, s := range l {
@@ -281,7 +281,8 @@ func TestCrashRestartsWithEstop(t *testing.T) {
 			afterCrash = l[i+1:]
 		}
 	}
-	if len(afterCrash) < 2 || !strings.Contains(afterCrash[0], `"op":"hello"`) || afterCrash[1] != `{"op":"estop"}` {
+	replay := `{"cause":"latched","first_cause":"remote","op":"estop","reason":"staff: test","replayed":true}`
+	if len(afterCrash) < 2 || !strings.Contains(afterCrash[0], `"op":"hello"`) || afterCrash[1] != replay {
 		t.Fatalf("after restart: %v", afterCrash)
 	}
 }
@@ -296,7 +297,7 @@ func TestReplyTimeout(t *testing.T) {
 	if r.FaultCode != protocol.FaultPluginTimeout {
 		t.Fatalf("%+v", r)
 	}
-	fx.waitLog(`{"op":"stop"}`)
+	fx.waitLog(`{"cause":"timeout","op":"stop"}`)
 }
 
 func TestFaultState(t *testing.T) {

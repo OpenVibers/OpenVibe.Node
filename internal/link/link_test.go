@@ -201,6 +201,71 @@ func TestHeartbeatRTTReportedAfterAck(t *testing.T) {
 	}
 }
 
+// The clock estimate's bound is the connection's fastest round trip: none before the first heartbeat_ack, the
+// minimum after several, and none again on a new connection until its own first ack.
+func TestClockUncertaintyIsTheFastestRoundTrip(t *testing.T) {
+	// 400 ms heartbeats: the muted server answers only these acks, well inside the 800 ms deadman.
+	srv, l, rec, _, _ := setup(t, 400*time.Millisecond)
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeConfig)
+	c.Mute()
+	if _, ok := l.ClockUncertainty(); ok {
+		t.Fatal("a bound before any round trip")
+	}
+	ack := func(delay time.Duration) time.Duration {
+		f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		echo := f.Msg.(protocol.Heartbeat).T
+		time.Sleep(delay)
+		before := l.Stats().RTT
+		if err := c.Send(protocol.HeartbeatAck{Echo: &echo}); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for l.Stats().RTT == before {
+			if time.Now().After(deadline) {
+				t.Fatal("the ack set no RTT")
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		return l.Stats().RTT
+	}
+	slow := ack(80 * time.Millisecond)
+	u, ok := l.ClockUncertainty()
+	if !ok || u != slow || u < 80*time.Millisecond {
+		t.Fatalf("after one slow round trip: %v %v (rtt %v)", u, ok, slow)
+	}
+	fast := ack(0)
+	if u, _ := l.ClockUncertainty(); u != fast || fast >= slow {
+		t.Fatalf("the faster round trip did not tighten the bound: %v (fast %v, slow %v)", u, fast, slow)
+	}
+	ack(60 * time.Millisecond)
+	if u, _ := l.ClockUncertainty(); u != fast {
+		t.Fatalf("a slower round trip loosened the bound: %v (fast %v)", u, fast)
+	}
+	c.Close()
+	c2, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2.Mute()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := l.ClockUncertainty(); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a new connection kept the old connection's bound")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // An ack that carries only echo (Bot's newer field, no t) still sets the RTT.
 func TestHeartbeatAckEchoOnlySetsRTT(t *testing.T) {
 	srv, l, rec, _, _ := setup(t, 200*time.Millisecond)

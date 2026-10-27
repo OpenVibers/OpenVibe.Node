@@ -259,6 +259,10 @@ const DefaultDeadlineMS = 300
 // DefaultMaxCommandMS caps deadlines when the profile sets no max_command_ms.
 const DefaultMaxCommandMS = 1000
 
+// MaxClockUncertaintyMS is the most clock uncertainty (the connection's fastest round trip) Node times motion with: past
+// it, a motion command with a deadline is refused as not_ready rather than run on a clock it cannot bound.
+const MaxClockUncertaintyMS = 1000
+
 // DefaultHeartbeatMS is the device heartbeat interval; the link is declared lost after two intervals without a frame.
 const DefaultHeartbeatMS = 1000
 

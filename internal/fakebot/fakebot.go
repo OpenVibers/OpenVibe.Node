@@ -42,6 +42,9 @@ type Server struct {
 	PairBody []byte
 	// WHIP, when set, serves POST/DELETE under /whip/.
 	WHIP http.Handler
+	// HoldHeartbeatAcks makes new connections leave heartbeats unanswered until Conn.SetAutoAck(true): the device has
+	// no measured round trip, so no bound on its clock estimate.
+	HoldHeartbeatAcks bool
 
 	mu           sync.Mutex
 	codes        map[string]string // code → robot id
@@ -329,7 +332,7 @@ func (s *Server) device(w http.ResponseWriter, r *http.Request) {
 		old.CloseWith(protocol.CloseReplaced, "replaced by a newer connection")
 	}
 	s.count.Add(1)
-	c.autoAck.Store(true)
+	c.autoAck.Store(!s.HoldHeartbeatAcks)
 	if greeting != nil {
 		for _, b := range greeting {
 			_ = c.SendRaw(b)
@@ -468,6 +471,9 @@ func (c *Conn) SendRaw(b []byte) error {
 	defer c.wmu.Unlock()
 	return c.ws.WriteMessage(websocket.TextMessage, b)
 }
+
+// SetAutoAck turns the automatic heartbeat_ack answers on or off for this connection.
+func (c *Conn) SetAutoAck(on bool) { c.autoAck.Store(on) }
 
 // Mute stops answering heartbeats and sending anything, as a hung server would.
 func (c *Conn) Mute() { c.muted.Store(true); c.autoAck.Store(false) }

@@ -19,8 +19,9 @@ import sys
 import threading
 import time
 
-__all__ = ["Plugin", "Fault", "Deferred", "Command", "Runtime", "run", "clamp", "MOTION_KINDS", "HEARTBEAT_TIMEOUT_S",
-           "DEFAULT_DEADLINE_MS", "PROTOCOL_VERSION"]
+__all__ = ["Plugin", "Fault", "Deferred", "Command", "StopInfo", "Runtime", "run", "clamp", "MOTION_KINDS",
+           "HEARTBEAT_TIMEOUT_S", "DEFAULT_DEADLINE_MS", "PROTOCOL_VERSION", "STOP_CAUSES", "EMERGENCY_CAUSES",
+           "RUNTIME_CAUSES"]
 
 PROTOCOL_VERSION = 1
 HEARTBEAT_TIMEOUT_S = 1.0
@@ -67,8 +68,10 @@ class Command:
     provenance is where it came from, unchanged from Bot (a dict, or None from older Nodes): "session" (the link
     session it arrived on; a new one on every connection), "seq" (the frame's number on that session, strictly
     increasing with gaps), "issued_at_ms" (Bot's clock when it sent the command and minted its id) and "expires_at_ms"
-    (the absolute deadline on Bot's clock, motion kinds only). Bot sends a command once and never again; the runtime
-    already refuses one whose seq is not above the last on its session (plugins.md, "Provenance")."""
+    (the absolute deadline on Bot's clock, motion kinds only), and "clock_uncertainty_ms" (Node v0.17.0: how far the
+    core's estimate of Bot's clock may trail it, the connection's fastest round trip; the deadline was already checked
+    against estimate + this, and a driver may refuse motion above a cap of its own). Bot sends a command once and never
+    again; the runtime already refuses one whose seq is not above the last on its session (plugins.md, "Provenance")."""
     __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target", "operator", "turn_epoch", "provenance")
 
     def __init__(self, id, kind, value, deadline_ms, now, target=None, operator=None, turn_epoch=None, provenance=None):
@@ -97,7 +100,63 @@ def _provenance(p):
         v = p.get(k)
         if isinstance(v, int) and not isinstance(v, bool) and v > 0:
             out[k] = v
+    u = p.get("clock_uncertainty_ms")
+    if isinstance(u, int) and not isinstance(u, bool) and u >= 0:
+        out["clock_uncertainty_ms"] = u
     return out or None
+
+
+# Why a driver is stopped (StopInfo.cause). From the core: an ordinary stop revokes remote motion and latches nothing;
+# an emergency latches the platform's stop until its owner clears it.
+STOP_CAUSES = ("halt", "link_lost", "shutdown", "timeout")
+EMERGENCY_CAUSES = ("remote", "local", "driver", "latched")
+# From the runtime itself: a motion command's own deadline, the core going quiet, the handler failing, stdin closing.
+RUNTIME_CAUSES = ("setup", "deadline", "heartbeat", "handler_error", "eof")
+
+
+class StopInfo:
+    """Why the plugin is told to stop: what on_stop() and on_resume() receive (Node v0.17.0; plugins.md, "Why a plugin
+    is stopped").
+
+    cause, from the core: "halt" (Bot ended the controlling turn: a release, a handoff to the next viewer, a timeout or
+    an unbind; turn_epoch is that halt's epoch), "link_lost" (the link to Bot dropped), "shutdown" (the Node is
+    stopping), "timeout" (a command got no answer within its window). From the runtime: "setup" (the stop every setup
+    ends with, so all actuators start stopped), "deadline" (a motion command's
+    own deadline passed; motion_only is True: stop what moves on its own), "heartbeat" (the core went quiet),
+    "handler_error", "eof". An older core sends no cause: "stop".
+    emergency is True for the platform's e-stop, with cause "remote" (a robot owner or staff), "local"
+    (`openvibe-node stop` on the device), "driver" (a driver's own local stop) or "latched" (the stop was already
+    latched when this process or the Node started: replayed is True and first_cause is the original cause when the core
+    knows it); an older core sends "estop". reason is the latch's reason text, when there is one.
+    latched is whether the platform's stop latch is set as this is delivered. It is cleared only by its owner, which
+    on_resume() reports with cause "cleared": information, never a re-arm.
+    halt_epoch is the newest halt epoch the runtime knows; it survives a restart of this process (the core's hello)."""
+    __slots__ = ("cause", "emergency", "latched", "reason", "turn_epoch", "halt_epoch", "replayed", "first_cause",
+                 "motion_only")
+
+    def __init__(self, cause, emergency=False, latched=False, reason=None, turn_epoch=None, halt_epoch=0,
+                 replayed=False, first_cause=None, motion_only=False):
+        self.cause = cause
+        self.emergency = emergency
+        self.latched = latched
+        self.reason = reason
+        self.turn_epoch = turn_epoch
+        self.halt_epoch = halt_epoch
+        self.replayed = replayed
+        self.first_cause = first_cause
+        self.motion_only = motion_only
+
+    def __repr__(self):
+        return "StopInfo(cause=%r, emergency=%r, latched=%r, turn_epoch=%r, halt_epoch=%r, replayed=%r)" % (
+            self.cause, self.emergency, self.latched, self.turn_epoch, self.halt_epoch, self.replayed)
+
+
+def _text(v, limit=200):
+    return str(v)[:limit] if isinstance(v, str) and v else None
+
+
+def _epoch(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
 def clamp(v, lo, hi):
@@ -146,6 +205,22 @@ class Plugin:
 
     def stop(self):
         """Stop every actuator. Must be idempotent and safe to call at any time, including before setup."""
+
+    def on_stop(self, info):
+        """Stop, knowing why: info is a StopInfo (its cause, whether it is an emergency, the halt epoch, the latch).
+        Every stop the runtime makes calls this. The default calls stop_motion() for a motion deadline and stop() for
+        everything else, so a plugin that overrides only those behaves as before. Override it to tell an ordinary stop
+        (revoke remote motion; latch nothing of your own) from an emergency (info.emergency). Like stop() it must stop
+        every actuator it is asked to, be idempotent, and is reported, not retried, if it raises."""
+        if info.motion_only:
+            self.stop_motion()
+        else:
+            self.stop()
+
+    def on_resume(self, info):
+        """The platform's stop latch was cleared by its owner (info.cause "cleared"). Information only: never re-arm
+        hardware, clear a physical latch or restore a remote grant here. Commands are accepted again by the runtime and
+        each still passes every check. The default does nothing."""
 
     def poll(self):
         """Return a telemetry dict (battery, rssi, sensors) or None. Called every telemetry_interval_s."""
@@ -237,6 +312,7 @@ class Runtime:
         self.setup_retry_at = None
         self.closed = False
         self.stop_reasons = []  # for tests: why stop() was called, in order
+        self.stop_infos = []  # and the StopInfo each on_stop() got
         # The newest turn_epoch a halt carried ("stop" with turn_epoch); a command from an older turn is refused.
         self.halt_epoch = 0
         # The link session of the last command handled, and its seq: a command on that session whose seq is not above
@@ -255,15 +331,17 @@ class Runtime:
                 pass
 
     # Safety.
-    def safe_stop(self, reason, motion_only=False):
+    def safe_stop(self, reason, motion_only=False, info=None):
+        """Stop through the plugin's on_stop with why (info; built from reason when not given). reason is what
+        stop_reasons records: the op or the runtime's own cause."""
+        if info is None:
+            info = StopInfo(reason, latched=self.estopped, halt_epoch=self.halt_epoch, motion_only=motion_only)
         with self.lock:
             self.stop_reasons.append(reason)
+            self.stop_infos.append(info)
             self.motion_deadline = None
             try:
-                if motion_only:
-                    self.plugin.stop_motion()
-                else:
-                    self.plugin.stop()
+                self.plugin.on_stop(info)
             except Exception as e:  # a failing stop is the worst case; report it loudly
                 self.plugin.log("stop failed (%s): %r", reason, e)
                 self.send({"op": "event", "name": "stop_failed", "reason": reason, "error": str(e)})
@@ -272,7 +350,8 @@ class Runtime:
         with self.lock:
             self.estopped = True
             self.local_stop_pending = True
-        self.safe_stop("local_stop")
+        self.safe_stop("local_stop", info=StopInfo("driver", emergency=True, latched=True, reason=_text(reason, 120),
+                                                   halt_epoch=self.halt_epoch))
         self.send({"op": "local_stop", "reason": str(reason or "")[:120]})
 
     def tick(self):
@@ -313,14 +392,19 @@ class Runtime:
         elif op == "command":
             self.on_command(msg, at)
         elif op == "stop":
-            epoch = msg.get("turn_epoch")
-            if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > self.halt_epoch:
+            epoch = _epoch(msg.get("turn_epoch"))
+            if epoch and epoch > self.halt_epoch:
                 self.halt_epoch = epoch
-            self.safe_stop("stop")
+            cause = _text(msg.get("cause"), 40) or "stop"
+            self.safe_stop("stop", info=StopInfo(cause, latched=self.estopped, turn_epoch=epoch,
+                                                 halt_epoch=self.halt_epoch))
         elif op == "estop":
             self.estopped = True
             self.local_stop_pending = False
-            self.safe_stop("estop")
+            self.safe_stop("estop", info=StopInfo(_text(msg.get("cause"), 40) or "estop", emergency=True, latched=True,
+                                                  reason=_text(msg.get("reason")), halt_epoch=self.halt_epoch,
+                                                  replayed=msg.get("replayed") is True,
+                                                  first_cause=_text(msg.get("first_cause"), 40)))
         elif op == "approval":
             try:
                 with self.lock:
@@ -347,12 +431,22 @@ class Runtime:
                 self.plugin.log("resume ignored: the local stop has not reached the core yet")
             else:
                 self.estopped = False
+                try:
+                    with self.lock:
+                        self.plugin.on_resume(StopInfo(_text(msg.get("cause"), 40) or "cleared",
+                                                       halt_epoch=self.halt_epoch))
+                except Exception as e:
+                    self.plugin.log("resume handler failed: %r", e)
         else:
             self.plugin.log("unknown op %r", op)
 
     def on_hello(self, msg):
         self.config = msg.get("config") or {}
         self.probe = bool(msg.get("probe"))
+        # The newest halt epoch the core has seen (Node v0.17.0): a restarted process keeps refusing older turns.
+        epoch = _epoch(msg.get("halt_epoch"))
+        if epoch and epoch > self.halt_epoch:
+            self.halt_epoch = epoch
         try:
             caps = self.plugin.describe(self.config)
         except Exception as e:
@@ -371,7 +465,7 @@ class Runtime:
         try:
             with self.lock:
                 self.plugin.setup(self.config)
-                self.plugin.stop()
+                self.plugin.on_stop(StopInfo("setup", latched=self.estopped, halt_epoch=self.halt_epoch))
             self.ready = True
             self.last_heartbeat = self.clock()
             self.send({"op": "ready"})
@@ -400,7 +494,8 @@ class Runtime:
         if kind == "halt":
             if cmd.turn_epoch and cmd.turn_epoch > self.halt_epoch:
                 self.halt_epoch = cmd.turn_epoch
-            self.safe_stop("halt")
+            self.safe_stop("halt", info=StopInfo("halt", latched=self.estopped, turn_epoch=cmd.turn_epoch,
+                                                 halt_epoch=self.halt_epoch))
             self.send({"op": "ack", "id": cid})
             return
         if cmd.turn_epoch and cmd.turn_epoch < self.halt_epoch:

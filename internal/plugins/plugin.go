@@ -99,11 +99,15 @@ type Plugin struct {
 	desc     *Describe
 	fault    *protocol.Fault
 	estopped bool
-	pending  map[string]chan Reply
-	queue    chan []byte // to the current process's stdin; nil while down
-	kill     func()
-	restarts int
-	pid      int
+	// The e-stop's cause and reason, sent again (replayed) to a restarted process while the stop is latched.
+	estopCause, estopReason string
+	// The newest turn_epoch a halt carried: hello tells a restarted process, so a stale turn stays refused there too.
+	haltEpoch int64
+	pending   map[string]chan Reply
+	queue     chan []byte // to the current process's stdin; nil while down
+	kill      func()
+	restarts  int
+	pid       int
 }
 
 func newPlugin(spec Spec, log *slog.Logger, out chan<- Output) *Plugin {
@@ -182,33 +186,51 @@ func (p *Plugin) send(msg map[string]any) error {
 	}
 }
 
-// Stop tells the plugin to stop every actuator.
-func (p *Plugin) Stop() { _ = p.send(map[string]any{"op": "stop"}) }
+// Why a plugin is told to stop (the `cause` of its stop and estop ops; docs/plugins.md "Why a plugin is stopped"). A
+// `stop` is ordinary: revoke remote motion, latch nothing. An `estop` is the emergency: the platform's latch is set and
+// stays set until the owner clears it, which a driver only hears as `resume` and must never treat as a re-arm.
+const (
+	StopHalt     = "halt"      // Bot's halt: the controlling turn ended (release, handoff, timeout, unbind)
+	StopLinkLost = "link_lost" // the link to Bot was lost
+	StopShutdown = "shutdown"  // the Node is stopping (service stop, `openvibe-node quit`)
+	StopTimeout  = "timeout"   // a command got no answer from the driver within its window
+	EstopRemote  = "remote"    // an e-stop from the platform (a robot owner or staff)
+	EstopLocal   = "local"     // `openvibe-node stop` on the device
+	EstopDriver  = "driver"    // a driver's own local stop (a plugin reported one)
+	EstopLatched = "latched"   // the stop was already latched when the Node or this process started
+)
+
+// Stop tells the plugin to stop every actuator, saying why.
+func (p *Plugin) Stop(cause string) { _ = p.send(map[string]any{"op": "stop", "cause": cause}) }
 
 // Halt is Stop for a halt command: it carries the halt's turn_epoch (when Bot sent one), the newest epoch a driver
 // should take commands from.
 func (p *Plugin) Halt(turnEpoch int64) {
-	if turnEpoch <= 0 {
-		p.Stop()
-		return
+	msg := map[string]any{"op": "stop", "cause": StopHalt}
+	if turnEpoch > 0 {
+		msg["turn_epoch"] = turnEpoch
+		p.mu.Lock()
+		p.haltEpoch = max(p.haltEpoch, turnEpoch)
+		p.mu.Unlock()
 	}
-	_ = p.send(map[string]any{"op": "stop", "turn_epoch": turnEpoch})
+	_ = p.send(msg)
 }
 
-// Estop latches the plugin's e-stop (the core also refuses motion itself).
-func (p *Plugin) Estop() {
+// Estop latches the plugin's e-stop (the core also refuses motion itself), saying why.
+func (p *Plugin) Estop(cause, reason string) {
 	p.mu.Lock()
-	p.estopped = true
+	p.estopped, p.estopCause, p.estopReason = true, cause, reason
 	p.mu.Unlock()
-	_ = p.send(map[string]any{"op": "estop"})
+	_ = p.send(map[string]any{"op": "estop", "cause": cause, "reason": reason})
 }
 
-// Resume clears the plugin's e-stop.
+// Resume tells the plugin the platform's e-stop latch was cleared by its owner. It is information, never a re-arm: the
+// driver keeps its own hardware latch and grants as they are.
 func (p *Plugin) Resume() {
 	p.mu.Lock()
-	p.estopped = false
+	p.estopped, p.estopCause, p.estopReason = false, "", ""
 	p.mu.Unlock()
-	_ = p.send(map[string]any{"op": "resume"})
+	_ = p.send(map[string]any{"op": "resume", "cause": "cleared"})
 }
 
 // Answer gives the plugin its owner's answer to an approval it asked for (`openvibe-node approve|deny <id>`).
@@ -276,6 +298,10 @@ type Provenance struct {
 	Seq         uint64 `json:"seq,omitempty"`
 	IssuedAtMS  int64  `json:"issued_at_ms,omitempty"`
 	ExpiresAtMS int64  `json:"expires_at_ms,omitempty"`
+	// How far Node's estimate of the server's clock may trail it (the connection's fastest round trip): the deadline
+	// was already checked against estimate + this, and a driver may apply a stricter cap of its own. Absent when the
+	// Node has no link clock (local commands).
+	ClockUncertaintyMS *int64 `json:"clock_uncertainty_ms,omitempty"`
 }
 
 // BeginWith is BeginTurn with the command's provenance (nil: none).
@@ -334,10 +360,10 @@ func (p *Plugin) BeginWith(ctx context.Context, id, kind string, value json.RawM
 		case r := <-ch:
 			return r
 		case <-t.C:
-			p.Stop()
+			p.Stop(StopTimeout)
 			return Reply{FaultCode: protocol.FaultPluginTimeout}
 		case <-ctx.Done():
-			p.Stop()
+			p.Stop(StopShutdown)
 			return Reply{FaultCode: protocol.FaultShuttingDown}
 		}
 	}
@@ -426,7 +452,7 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 	kill := func() { killOnce.Do(func() { killProcess(cmd) }) }
 	p.mu.Lock()
 	p.queue, p.kill, p.pid, p.fault, p.desc = queue, kill, cmd.Process.Pid, nil, nil
-	estopped := p.estopped
+	estopped, estopCause, estopReason, haltEpoch := p.estopped, p.estopCause, p.estopReason, p.haltEpoch
 	p.mu.Unlock()
 
 	// Writer: the only goroutine touching stdin. Closing stdin is the plugin's signal to stop and exit.
@@ -465,9 +491,14 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 		p.readStdout(stdout, described)
 	}()
 
-	_ = p.send(map[string]any{"op": "hello", "config": nonNil(p.spec.Config), "probe": false})
+	hello := map[string]any{"op": "hello", "config": nonNil(p.spec.Config), "probe": false}
+	if haltEpoch > 0 {
+		hello["halt_epoch"] = haltEpoch
+	}
+	_ = p.send(hello)
 	if estopped {
-		_ = p.send(map[string]any{"op": "estop"})
+		// Still latched: the new process hears the same emergency again, marked as a replay, never a fresh one.
+		_ = p.send(map[string]any{"op": "estop", "cause": EstopLatched, "reason": estopReason, "first_cause": estopCause, "replayed": true})
 	}
 
 	// Watch the plugin process itself, not its stdout: a child it started (speech, a camera helper) can hold stdout
@@ -495,7 +526,7 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 	describeTimer := time.NewTimer(DescribeTimeout)
 	defer describeTimer.Stop()
 	shutdown := func() error {
-		_ = p.send(map[string]any{"op": "stop"})
+		_ = p.send(map[string]any{"op": "stop", "cause": StopShutdown})
 		p.mu.Lock()
 		p.queue = nil
 		p.mu.Unlock()
