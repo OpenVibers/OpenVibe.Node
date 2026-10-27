@@ -47,7 +47,8 @@ Command kinds and their answers (the ack's ``data``):
   once (Node v0.19, Desks plan D1): ``"desk": "desk-<name>"`` names one (start it with ``desk`` and that name), each with
   its own display, bus, browser profile (``browser_profile`` + ``-<name>``), temp folder and downloads folder, so two
   agents working at once never see or drive each other's screen. ``max_desks`` (default: one per 2 GiB of memory, 1 to
-  8) caps how many run at once; ``list`` reports the running ones. Starting and stopping
+  8) caps how many run at once; ``list`` reports the running ones. A desk no command used for ``desk_idle_s`` (15
+  minutes by default) is stopped, so a desk an agent left behind (it crashed or restarted mid-task) ends by itself. Starting and stopping
   act (refused at observe, approved at ask), ``status`` runs at every level, and the kill switch stops the desk. Linux
   with Xvfb; config ``allow_desk: false`` turns it off.
 * ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
@@ -143,7 +144,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.10.0"
+    version = "0.10.1"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -191,6 +192,8 @@ class Computer(Plugin):
         self.desks = Desks(self.desk_factory, private=self.desk, max_desks=default_max_desks())
         self.allow_desk = True
         self.desk_browsers = {}    # desk name -> the agent's browser on that desk (its own profile, shown there)
+        self.desk_used = {}        # desk name -> when a command last used it (clock), for desk_idle_s
+        self.desk_idle_s = 900
         self.browser_locks = {}    # "main" or a desk name -> one action at a time in that browser
         self.resolve = resolve or (lambda host: [ai[4][0] for ai in socket.getaddrinfo(host, None)])
 
@@ -218,6 +221,7 @@ class Computer(Plugin):
         self.allow_screen_stream = config.get("allow_screen_stream", True) is not False
         self.allow_desk = config.get("allow_desk", True) is not False
         self.desks.max_desks = _int(config.get("max_desks"), "max_desks", 1, MAX_DESKS_CAP, default_max_desks())
+        self.desk_idle_s = _int(config.get("desk_idle_s"), "desk_idle_s", 60, 86400, 900)
         self.desks.base_dir = os.path.expanduser(config.get("desk_dir") or "~/.local/share/openvibe-node/desks")
         self.browser_path = config.get("browser_path") or None
         self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
@@ -292,6 +296,17 @@ class Computer(Plugin):
         b = self.browser
         if b is not None and b.alive() and b.used_at and time.monotonic() - b.used_at > self.browser_idle_s:
             self._close_browser()
+        # A desk no command used for desk_idle_s is stopped: an agent that crashed or restarted mid-task never ran its
+        # own stop, and a desk left running would hold its share of the machine and its browser's sessions.
+        for name in self.desks.running_names():
+            if now - self.desk_used.get(name, now) > self.desk_idle_s:
+                self._close_desk_browser(name)
+                self.desks.stop(name)
+                self.desk_used.pop(name, None)
+                self.emit_event("desk_idle_stopped", desk=name, idle_s=self.desk_idle_s)
+                self.log("desk %s stopped after %d s without a command", name, self.desk_idle_s)
+            elif name not in self.desk_used:
+                self.desk_used[name] = now
         expired = []
         with self.mu:
             for cid, (_, at, _) in list(self.pending.items()):
@@ -339,6 +354,8 @@ class Computer(Plugin):
             return self._desk_op(cmd, v, level)
         desk_env = self._desk_env(v) if cmd.kind in ("screen", "screen_stream", "input", "browser") else None
         desk_name = v.get("desk") if desk_env else None
+        if desk_name:
+            self.desk_used[desk_name] = self.clock()
         if cmd.kind == "screen":
             tool = self._x11_tool() if desk_env else self._screen_tool()
             if not tool:
@@ -401,6 +418,7 @@ class Computer(Plugin):
             return self.desks.status(name)
         if action not in ("start", "stop"):
             raise Fault("bad_value", "action is start, stop, status or list")
+        self.desk_used[name] = self.clock()
         if not self.allow_desk or not self.platform.startswith("linux"):
             raise Fault("unsupported", "this machine does not offer a private desk (Linux with Xvfb, allow_desk on)")
         what = "a private desk" if name == "private" else "desk %s" % name

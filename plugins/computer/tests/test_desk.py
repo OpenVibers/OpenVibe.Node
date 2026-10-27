@@ -202,12 +202,13 @@ class DeskPluginTest(unittest.TestCase):
         self.assertEqual(self.calls[-1][1]["DISPLAY"], ":92")
         reply(self.out, self.cmd("input", {"action": "click", "x": 1, "y": 1, "width": 100, "height": 100, "desk": "desk-b"}))
         self.assertEqual(self.calls[-1][1]["DISPLAY"], ":93")
-        # A temp folder each, inside the desks folder, 0700.
+        # A temp folder each, 0700, short enough for a Unix socket in it (Chrome's SingletonSocket: 108 bytes).
         tmp_a = self.calls[-2][1]["TMPDIR"]
         tmp_b = self.calls[-1][1]["TMPDIR"]
         self.assertNotEqual(tmp_a, tmp_b)
-        self.assertTrue(tmp_a.startswith(self.desk_dir) and os.path.isdir(tmp_a))
+        self.assertTrue(os.path.isdir(tmp_a) and os.path.basename(tmp_a).startswith("ov-desk-a-"))
         self.assertEqual(os.stat(tmp_a).st_mode & 0o777, 0o700)
+        self.assertLess(len(os.path.join(tmp_a, ".com.google.Chrome.XXXXXX", "SingletonSocket")), 108)
         # list reports both; a desk that never started is not_ready; names are checked.
         listed = reply(self.out, self.cmd("desk", {"action": "list"}))["data"]
         self.assertEqual(([d["desk"] for d in listed["desks"]], listed["max_desks"]), (["desk-a", "desk-b"], 2))
@@ -217,7 +218,25 @@ class DeskPluginTest(unittest.TestCase):
         # Stopping one leaves the other running; the kill switch stops every desk.
         self.assertEqual(reply(self.out, self.cmd("desk", {"action": "stop", "desk": "desk-a"}))["data"]["stopped"], True)
         self.assertEqual([d.on for d in self.made_desks], [False, True])
+        self.assertFalse(os.path.exists(tmp_a), "a stopped desk's temp folder is removed")
         self.plugin.stop()
+        self.assertEqual([d.on for d in self.made_desks], [False, False])
+
+    def test_a_desk_nobody_uses_stops_by_itself(self):
+        # An agent that crashed or restarted mid-task never stops its desk: desk_idle_s does.
+        self.boot("trusted", max_desks=2, desk_idle_s=60)
+        now = [1000.0]
+        self.plugin.clock = lambda: now[0]
+        reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-a"}))
+        reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-b"}))
+        now[0] += 40
+        reply(self.out, self.cmd("input", {"action": "move", "x": 1, "y": 1, "width": 10, "height": 10, "desk": "desk-b"}))
+        now[0] += 30
+        self.plugin.poll()
+        self.assertEqual([d.on for d in self.made_desks], [False, True], "a, 70 s without a command, stopped; b was used 30 s ago")
+        self.assertTrue(any(m.get("op") == "event" and m.get("name") == "desk_idle_stopped" and m.get("desk") == "desk-a" for m in self.out.msgs()))
+        now[0] += 61
+        self.plugin.poll()
         self.assertEqual([d.on for d in self.made_desks], [False, False])
 
     def test_each_desk_has_a_browser_profile_and_downloads_of_its_own(self):
