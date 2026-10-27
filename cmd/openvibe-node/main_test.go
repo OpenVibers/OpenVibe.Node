@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -251,8 +252,18 @@ func TestRunDryRun(t *testing.T) {
 		}
 		return r
 	}
-	if _, ok := send("c1", "drive", `{"throttle":0.4}`).(protocol.Ack); !ok {
-		t.Fatal("drive not acked")
+	// Timed motion waits for the connection's first measured round trip (v0.17.0): a drive sent the moment the driver is
+	// ready can still be refused not_ready, as Bot would see it, so send again (a new id each time) until it runs.
+	var first protocol.Message
+	for i := 0; i < 40; i++ {
+		first = send("c1-"+strconv.Itoa(i), "drive", `{"throttle":0.4}`)
+		if n, ok := first.(protocol.Nack); !ok || n.FaultCode != protocol.FaultNotReady {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, ok := first.(protocol.Ack); !ok {
+		t.Fatalf("drive not acked: %+v", first)
 	}
 	out, errOut, code := cli(t, "status", "--home", home)
 	if code != 0 || !strings.Contains(out, "Link:     up") || !strings.Contains(out, "dryrun") || strings.Contains(out, c.Credential.Reveal()) {
