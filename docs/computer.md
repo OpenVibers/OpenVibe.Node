@@ -152,7 +152,9 @@ An agent can work on a desk of its own instead of your screen (plan track K: Vib
   - its own temp folder (`TMPDIR`), so its clipboard, cookies, files and windows never meet another desk's.
 
   Two agents can work at once without either seeing or driving the other's screen, and two desks' browsers act in
-  parallel. `{"action": "list"}` reports the desks that run. `max_desks` caps how many run at once (by default one per
+  parallel. `{"action": "list"}` reports the desks that run. A desk no command used for `desk_idle_s` (15 minutes by
+  default) is stopped, with an event `desk_idle_stopped`: a desk an agent left behind when it crashed or restarted
+  mid-task ends by itself. `max_desks` caps how many run at once (by default one per
   2 GiB of memory, 1 to 8); one more is refused (`not_ready`), never queued. Stopping a desk ends only its processes,
   and the kill switch stops them all. The desks' own folders are under `desk_dir`
   (`~/.local/share/openvibe-node/desks`).
@@ -199,6 +201,7 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
 | `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
 | `allow_desk`         | `true`         | `false`: never start a private desk (no `desk` capability) |
 | `max_desks`          | memory / 2 GiB, 1 to 8 | how many desks run at once (1 to 10) |
+| `desk_idle_s`        | `900`          | a desk no command used this long is stopped (60 to 86400) |
 | `desk_dir`           | `~/.local/share/openvibe-node/desks` | each desk's own temp and downloads folders |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
 | `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |

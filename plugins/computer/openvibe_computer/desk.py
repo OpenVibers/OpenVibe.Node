@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import tempfile
 import signal
 import subprocess
 import threading
@@ -211,6 +212,7 @@ class Desks:
         self.base_dir = base_dir
         self.mu = threading.Lock()
         self.desks = {}
+        self.tmpdirs = {}   # desk name -> its own temp folder (short: under the system's temp folder)
         if private is not None:
             self.desks["private"] = private
 
@@ -256,12 +258,17 @@ class Desks:
             d = self.desks.get(name)
         if d is None:
             return {"running": False, "stopped": False, "desk": name}
-        return dict(d.stop(), desk=name)
+        out = dict(d.stop(), desk=name)
+        self._drop_tmp(name)
+        return out
 
     def stop_all(self):
         with self.mu:
             desks = list(self.desks.items())
-        return [n for n, d in desks if d.stop().get("stopped")]
+        stopped = [n for n, d in desks if d.stop().get("stopped")]
+        for n, _ in desks:
+            self._drop_tmp(n)
+        return stopped
 
     def status(self, name):
         self.check(name)
@@ -285,11 +292,22 @@ class Desks:
         if d is None:
             raise Fault("not_ready", "start the desk first (desk start, desk %s)" % name)
         env = d.env()
-        if self.base_dir:
-            tmp = os.path.join(self.base_dir, name, "tmp")
-            os.makedirs(tmp, mode=0o700, exist_ok=True)
-            env["TMPDIR"] = tmp
+        # A temp folder of the desk's own, made once per run of the desk (0700) and removed when it stops. It sits in
+        # the system's temp folder, not under desk_dir: Chrome puts its SingletonSocket in TMPDIR, and a Unix socket's
+        # path must fit 108 bytes (a desk_dir path on a desk host, /var/lib/…/desks/<name>/tmp/.com.google.Chrome.…,
+        # did not, and Chrome closed as it started).
+        with self.mu:
+            tmp = self.tmpdirs.get(name)
+            if tmp is None or not os.path.isdir(tmp):
+                tmp = self.tmpdirs[name] = tempfile.mkdtemp(prefix="ov-%s-" % name)
+        env["TMPDIR"] = tmp
         return env
+
+    def _drop_tmp(self, name):
+        with self.mu:
+            tmp = self.tmpdirs.pop(name, None)
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def dir(self, name, part):
         """A folder of the desk's own (downloads, …), 0700, under base_dir; None without one."""
