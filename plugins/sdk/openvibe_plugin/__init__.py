@@ -414,6 +414,13 @@ class Runtime:
                            "message": "a replay: seq %d is not above %d on this session" % (prov["seq"], self.last_seq)})
                 return
             self.last_session, self.last_seq = prov["session"], prov["seq"]
+        # A motion command whose time ran out while it waited behind a slow handler (its deadline counts from when its
+        # line arrived) never reaches the driver: the runtime holds nothing past its deadline.
+        if moves and self.clock() >= cmd.deadline:
+            self.send({"op": "nack", "id": cid, "fault_code": "expired",
+                       "message": "its deadline passed while it waited behind earlier input (%d ms after it arrived)"
+                       % round((self.clock() - now) * 1000)})
+            return
         if not self.ready:
             self.send({"op": "nack", "id": cid, "fault_code": "not_ready"})
             return

@@ -195,16 +195,36 @@ class RuntimeTest(unittest.TestCase):
         self.assertFalse(p.moving)
 
     def test_backlog_counts_from_arrival(self):
-        # A command that waited in the inbox while a handler blocked keeps its arrival-based deadline.
+        # A command that waited in the inbox while a handler blocked keeps its arrival-based deadline, and one whose
+        # deadline passed while it waited is refused without reaching the driver: it never moves the robot at all.
         rt, p, out, clock = make()
         self.hello(rt)
         arrived = clock.t
         clock.t += 0.5  # the handler was stuck for 500 ms
         rt.feed_line(json.dumps({"op": "heartbeat", "t": 1}), arrived)
         rt.feed_line(json.dumps({"op": "command", "id": "old", "kind": "drive", "deadline_ms": 300}), arrived)
+        last = lines(out)[-1]
+        self.assertEqual((last["op"], last["id"], last["fault_code"]), ("nack", "old", "expired"))
+        self.assertIn("500 ms after it arrived", last["message"])
+        self.assertFalse(p.moving)
+        # One that waited less than its deadline still runs, with only the time it has left.
+        rt.feed_line(json.dumps({"op": "command", "id": "fresh", "kind": "drive", "deadline_ms": 300}), clock.t - 0.1)
+        self.assertEqual(lines(out)[-1], {"op": "ack", "id": "fresh"})
+        self.assertTrue(p.moving)
+        clock.t += 0.21
         rt.tick()
         self.assertFalse(p.moving)
         self.assertIn("deadline", rt.stop_reasons)
+
+    def test_only_motion_expires_in_the_backlog(self):
+        # say has no motion deadline to miss (its deadline is a reply window): a late one still runs.
+        rt, p, out, clock = make()
+        self.hello(rt)
+        arrived = clock.t
+        clock.t += 0.5
+        rt.feed_line(json.dumps({"op": "heartbeat", "t": 1}), arrived)
+        rt.feed_line(json.dumps({"op": "command", "id": "s1", "kind": "say", "deadline_ms": 300}), arrived)
+        self.assertEqual(lines(out)[-1], {"op": "ack", "id": "s1"})
 
     def test_heartbeat_loss_stops_and_refuses(self):
         rt, p, out, clock = make()
