@@ -49,6 +49,10 @@ Command kinds and their answers (the ack's ``data``):
   agents working at once never see or drive each other's screen. ``max_desks`` (default: one per 2 GiB of memory, 1 to
   8) caps how many run at once; ``list`` reports the running ones. A desk no command used for ``desk_idle_s`` (15
   minutes by default) is stopped, so a desk an agent left behind (it crashed or restarted mid-task) ends by itself.
+  ``"profile": "<name>"`` on start (Node v0.24, Desks plan D7 on one machine) keeps the desk's browser profile by
+  name: the desk's browser starts from that profile (its cookies and site storage: sign in once, on any desk) and the
+  desk saves it back when it stops (the last desk to stop wins), then removes its own copy. Caches are never kept, a
+  profile larger than ``desk_profile_max_mb`` is not saved, and the kill switch saves nothing.
   ``"kind": "browser"`` on start (Node v0.23, Desks plan D2) makes a **browser desk**: a headless browser alone, with no
   display, about half the cost of a whole desk (``kind: desktop``, the default), on Linux or macOS. Its page is its
   screen: ``screen``, ``input`` (mouse, wheel, keys and text, sent to the page) and ``screen_stream`` (frames of the page)
@@ -67,6 +71,7 @@ import contextlib
 import http.client
 import ipaddress
 import os
+import re
 import socket
 import ssl
 import shlex
@@ -111,6 +116,12 @@ INPUT_ACTIONS = frozenset({"move", "click", "double_click", "right_click", "scro
 BROWSER_READS = frozenset({"read", "screenshot", "close"})
 BROWSER_ACTS = frozenset({"open", "click", "fill", "press", "back"})
 MAX_URL = 2048
+PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
+# What a kept profile leaves out: caches, crash reports, locks and the last session's tabs (a desk opens on a blank page).
+PROFILE_SKIP = shutil.ignore_patterns("Cache", "Code Cache", "GPUCache", "GrShaderCache", "GraphiteDawnCache", "ShaderCache",
+                                      "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache", "CacheStorage", "ScriptCache",
+                                      "component_crx_cache", "Crashpad", "BrowserMetrics*", "Safe Browsing",
+                                      "optimization_guide_*", "Singleton*", "Sessions", "blob_storage", "*.tmp")
 MAX_SELECTOR = 500
 POINT_ACTIONS = frozenset({"move", "click", "double_click", "right_click"})
 MAX_TYPE = 2000
@@ -139,6 +150,21 @@ def _parse_dialog(out):
         return None
     return True if "button returned:Approve" in out else False if "button returned:Deny" in out else None
 
+def _tree_size(path, ignore):
+    """The bytes a copy of path with that ignore would hold."""
+    total = 0
+    for root, dirs, files in os.walk(path):
+        skip = ignore(root, dirs + files)
+        dirs[:] = [d for d in dirs if d not in skip]
+        for f in files:
+            if f not in skip:
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+    return total
+
+
 def _int(v, name, lo, hi, default):
     if v is None:
         return default
@@ -149,7 +175,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.11.0"
+    version = "0.12.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -199,6 +225,10 @@ class Computer(Plugin):
         self.allow_desk = True
         self.desk_browsers = {}    # desk name -> the agent's browser on that desk (its own profile, shown there)
         self.desk_used = {}        # desk name -> when a command last used it (clock), for desk_idle_s
+        self.desk_profiles = {}    # desk name -> the kept profile it started with (Node v0.24.0)
+        self.desk_restored = set() # desks whose browser started from their kept profile (so it is saved back on stop)
+        self.profile_locks = {}    # profile name -> one copy in or out at a time
+        self.desk_profile_max_mb = 256
         self.desk_idle_s = 900
         self.browser_locks = {}    # "main" or a desk name -> one action at a time in that browser
         self.resolve = resolve or (lambda host: [ai[4][0] for ai in socket.getaddrinfo(host, None)])
@@ -228,6 +258,7 @@ class Computer(Plugin):
         self.allow_desk = config.get("allow_desk", True) is not False
         self.desks.max_desks = _int(config.get("max_desks"), "max_desks", 1, MAX_DESKS_CAP, default_max_desks())
         self.desk_idle_s = _int(config.get("desk_idle_s"), "desk_idle_s", 60, 86400, 900)
+        self.desk_profile_max_mb = _int(config.get("desk_profile_max_mb"), "desk_profile_max_mb", 16, 4096, 256)
         self.desks.base_dir = os.path.expanduser(config.get("desk_dir") or "~/.local/share/openvibe-node/desks")
         self.browser_path = config.get("browser_path") or None
         self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
@@ -261,7 +292,7 @@ class Computer(Plugin):
             caps["desk"] = {"level": self.level, "window_manager": self.desks.window_manager() if whole else None,
                             "input": page or (whole and bool(self.which("xdotool"))),
                             "screen": page or (whole and bool(self._x11_tool())),
-                            "named": True, "max_desks": self.desks.max_desks, "kinds": kinds}
+                            "named": True, "max_desks": self.desks.max_desks, "kinds": kinds, "profiles": True}
         return caps
 
     def _desk_kinds(self):
@@ -299,6 +330,7 @@ class Computer(Plugin):
         self._end_stream("stopped on the machine")
         self._close_desk_browsers()
         self.desks.stop_all()
+        self._drop_desk_profiles()
         for cid in waiting:
             self._close_prompt(cid)
             self.emit_event("approval_done", id=cid, approved=False, reason="stopped")
@@ -322,7 +354,7 @@ class Computer(Plugin):
         # own stop, and a desk left running would hold its share of the machine and its browser's sessions.
         for name in self.desks.running_names():
             if now - self.desk_used.get(name, now) > self.desk_idle_s:
-                self._close_desk_browser(name)
+                self._end_desk_browser(name)
                 self.desks.stop(name)
                 self.desk_used.pop(name, None)
                 self.emit_event("desk_idle_stopped", desk=name, idle_s=self.desk_idle_s)
@@ -462,15 +494,29 @@ class Computer(Plugin):
                 raise Fault("unsupported", "a whole desk needs Linux with Xvfb%s" % (": this machine runs browser desks (kind browser)" if kinds else ""))
             width = _int(v.get("width"), "width", 640, 3840, 1280)
             height = _int(v.get("height"), "height", 480, 2160, 800)
+            profile = v.get("profile")
+            if profile is not None and (not isinstance(profile, str) or not PROFILE_NAME.match(profile)):
+                raise Fault("bad_value", "profile is a name: lower-case letters, digits and dashes, at most 24 characters")
+            if profile is not None and name == "private":
+                raise Fault("bad_value", "the private desk keeps its own profile: name a desk desk-<name> to start one from a kept profile")
             if kind == "browser":
                 what = "a browser desk" if name == "private" else "browser desk %s" % name
-            return self._act(cmd, level, lambda: self.desks.start(name, width, height, kind),
-                             "start %s (%d×%d) where your agent works without touching your screen" % (what, width, height),
+
+            def start():
+                st = self.desks.start(name, width, height, kind)
+                if profile and self.desk_profiles.get(name) != profile:
+                    self.desk_profiles[name] = profile
+                    self.desk_restored.discard(name)
+                return dict(st, profile=profile) if profile else st
+            return self._act(cmd, level, start,
+                             "start %s (%d×%d) where your agent works without touching your screen%s"
+                             % (what, width, height, ", in your kept browser profile %s" % profile if profile else ""),
                              threaded=True)
 
         def stop():
-            self._close_desk_browser(name)
-            return self.desks.stop(name)
+            saved = self._end_desk_browser(name)
+            out = self.desks.stop(name)
+            return dict(out, profile_saved=saved) if saved is not None else out
         return self._act(cmd, level, stop, "stop %s (and close what runs on it)" % what, threaded=False)
 
     def _desk_browser(self, desk, binary=None, env=None):
@@ -485,7 +531,8 @@ class Computer(Plugin):
                 raise Fault("unsupported", "no browser on this machine (Chromium, Chrome, Edge or Brave), or this machine does not allow it")
             env = env or self.desks.env(desk)
             page = self.desks.kind(desk) == "browser"
-            profile = self.browser_profile + ("-desk" if desk == "private" else "-" + desk)
+            profile = self._desk_profile_dir(desk)
+            self._restore_profile(desk)
             b = self.desk_browsers[desk] = self.browser_factory(binary, profile, page, env=env)
             b.download_dir = self.desks.dir(desk, "downloads")
             if page:
@@ -515,6 +562,73 @@ class Computer(Plugin):
             return b.screenshot(width)
         except BrowserError as e:
             raise Fault(e.code, e.message)
+
+    def _desk_profile_dir(self, desk):
+        return self.browser_profile + ("-desk" if desk == "private" else "-" + desk)
+
+    def _kept_profile_dir(self, profile):
+        return self.browser_profile + "-kept-" + profile
+
+    def _profile_lock(self, profile):
+        with self.mu:
+            return self.profile_locks.setdefault(profile, threading.Lock())
+
+    def _restore_profile(self, desk):
+        """Before a desk's browser first starts in this run of the desk: its profile is a fresh copy of the kept one."""
+        profile = self.desk_profiles.get(desk)
+        if not profile or desk in self.desk_restored:
+            return
+        self.desk_restored.add(desk)
+        own, kept = self._desk_profile_dir(desk), self._kept_profile_dir(profile)
+        shutil.rmtree(own, ignore_errors=True)
+        with self._profile_lock(profile):
+            if os.path.isdir(kept):
+                shutil.copytree(kept, own, symlinks=True, ignore=PROFILE_SKIP)
+                os.chmod(own, 0o700)
+
+    def _end_desk_browser(self, desk):
+        """Close a desk's browser so it writes everything down, save its profile back when it started from a kept one
+        (the last desk to stop wins), and remove the desk's own copy. → True when saved, False when not (too large or
+        a failed copy), None for a desk without a kept profile."""
+        b = self.desk_browsers.pop(desk, None)
+        if b is not None:
+            b.close(graceful=True)
+        profile = self.desk_profiles.pop(desk, None)
+        used = desk in self.desk_restored
+        self.desk_restored.discard(desk)
+        if not profile:
+            return None
+        own, kept = self._desk_profile_dir(desk), self._kept_profile_dir(profile)
+        try:
+            if not used or not os.path.isdir(own):
+                return False
+            size = _tree_size(own, PROFILE_SKIP)
+            if size > self.desk_profile_max_mb * 1024 * 1024:
+                self.emit_event("desk_profile_too_big", desk=desk, profile=profile, mb=size // (1024 * 1024))
+                return False
+            with self._profile_lock(profile):
+                new, old = kept + ".new", kept + ".old"
+                shutil.rmtree(new, ignore_errors=True)
+                shutil.rmtree(old, ignore_errors=True)
+                shutil.copytree(own, new, symlinks=True, ignore=PROFILE_SKIP)
+                os.chmod(new, 0o700)
+                if os.path.isdir(kept):
+                    os.rename(kept, old)
+                os.rename(new, kept)
+                shutil.rmtree(old, ignore_errors=True)
+            return True
+        except OSError as e:
+            self.log("desk %s: its profile %s was not saved: %s", desk, profile, e)
+            return False
+        finally:
+            shutil.rmtree(own, ignore_errors=True)   # a copy for one run of the desk
+
+    def _drop_desk_profiles(self):
+        """The kill switch: nothing is saved, and the desks' own copies go."""
+        for desk in list(self.desk_profiles):
+            self.desk_profiles.pop(desk, None)
+            self.desk_restored.discard(desk)
+            shutil.rmtree(self._desk_profile_dir(desk), ignore_errors=True)
 
     def _close_desk_browser(self, name):
         b = self.desk_browsers.pop(name, None)

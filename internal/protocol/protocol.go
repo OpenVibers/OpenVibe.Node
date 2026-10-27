@@ -181,7 +181,8 @@ const (
 	KindScreenStream = "screen_stream"
 	// KindDesk starts, stops, reports or lists desks on the machine (contracts 0.214.0; named desks, Node v0.19.0):
 	// {"action": "start"|"stop"|"status"|"list", "desk"?: "private"|"desk-<name>", "kind"?: "desktop"|"browser", …}
-	// (kind browser, contracts 0.216.0 and Node v0.23.0: a headless browser alone, its page the desk's screen). Older
+	// (kind browser, contracts 0.216.0 and Node v0.23.0: a headless browser alone, its page the desk's screen;
+	// "profile"?, contracts 0.217.0 and Node v0.24.0: the kept browser profile it starts from and saves back). Older
 	// form, kept:
 	// {"action": "start"|"stop"|
 	// "status", "width"?, "height"?}, an Xvfb display of its own where an agent works without touching the owner's

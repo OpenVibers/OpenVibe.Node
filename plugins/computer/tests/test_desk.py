@@ -167,9 +167,37 @@ class FakePageBrowser:
         with open(path, "wb") as f:
             f.write(b"\xff\xd8\xff")
 
-    def close(self):
+    def close(self, graceful=False):
         self.on = False
         self.calls.append(("close",))
+
+
+class ProfileBrowser:
+    """A desk's browser that keeps one cookie in its profile folder, like a site's sign-in."""
+    made = []
+
+    def __init__(self, binary, profile, headless, env=None):
+        self.profile, self.download_dir, self.window, self.page_size = profile, None, (1280, 900), None
+        self.on, self.graceful = True, None
+        path = os.path.join(profile, "Default", "Cookies")
+        self.found = open(path).read() if os.path.exists(path) else None   # what the desk started with
+        ProfileBrowser.made.append(self)
+
+    def alive(self):
+        return self.on
+
+    def sign_in(self, who, cache_mb=0):
+        os.makedirs(os.path.join(self.profile, "Default", "Cache"), exist_ok=True)
+        with open(os.path.join(self.profile, "Default", "Cookies"), "w") as f:
+            f.write(who)
+        with open(os.path.join(self.profile, "Default", "Cache", "data"), "wb") as f:
+            f.write(b"x" * (cache_mb * 1024 * 1024 or 10))
+
+    def open(self, url):
+        return {"url": url}
+
+    def close(self, graceful=False):
+        self.on, self.graceful = False, graceful
 
 
 class DeskPluginTest(unittest.TestCase):
@@ -209,7 +237,7 @@ class DeskPluginTest(unittest.TestCase):
     def test_describe_offers_the_desk(self):
         caps = self.boot("trusted")[0]["capabilities"]
         self.assertEqual(caps["desk"], {"level": "trusted", "window_manager": "metacity", "input": True, "screen": True,
-                                        "named": True, "max_desks": default_max_desks(), "kinds": ["desktop", "browser"]})
+                                        "named": True, "max_desks": default_max_desks(), "kinds": ["desktop", "browser"], "profiles": True})
 
     def test_observe_reports_but_does_not_start(self):
         self.boot("observe")
@@ -305,7 +333,7 @@ class DeskPluginTest(unittest.TestCase):
             def open(self, url):
                 return {"url": url}
 
-            def close(self):
+            def close(self, graceful=False):
                 pass
         self.boot("trusted", max_desks=3)
         self.plugin.browser_factory = FakeBrowser
@@ -407,6 +435,78 @@ class DeskPluginTest(unittest.TestCase):
         rt.dispatch({"op": "command", "id": "m2", "kind": "desk", "value": {"action": "start", "desk": "desk-a", "kind": "browser"}, "deadline_ms": 30000})
         self.assertEqual(reply(out, "m2")["data"]["kind"], "browser")
         plugin.stop()
+
+    def test_a_kept_profile_follows_the_agent_from_desk_to_desk(self):
+        # Node v0.24.0: sign in once. A desk started with profile "agent" starts from the kept profile and saves it back
+        # when it stops (the last to stop wins); its own copy is removed; caches are never kept.
+        home = tempfile.mkdtemp(prefix="ov-prof-")
+        self.addCleanup(lambda: shutil.rmtree(home, ignore_errors=True))
+        self.boot("trusted", max_desks=4, browser_profile=os.path.join(home, "browser"), desk_profile_max_mb=16)
+        ProfileBrowser.made = []
+        self.plugin.browser_factory = ProfileBrowser
+        kept = os.path.join(home, "browser-kept-agent", "Default")
+
+        def start(desk, **extra):
+            return reply(self.out, self.cmd("desk", {"action": "start", "desk": desk, "kind": "browser", **extra}))
+
+        def use(desk):
+            self.assertEqual(reply(self.out, self.cmd("browser", {"action": "open", "url": "https://example.org/", "desk": desk}))["op"], "ack")
+            return ProfileBrowser.made[-1]
+
+        def stop(desk):
+            return reply(self.out, self.cmd("desk", {"action": "stop", "desk": desk}))["data"]
+        self.assertEqual(start("desk-a", profile="agent")["data"]["profile"], "agent")
+        a = use("desk-a")
+        self.assertIsNone(a.found, "nothing kept yet")
+        self.assertEqual(a.profile, os.path.join(home, "browser-desk-a"))
+        a.sign_in("one")
+        self.assertEqual(stop("desk-a")["profile_saved"], True)
+        self.assertTrue(a.graceful, "closed so it writes its cookies down")
+        with open(os.path.join(kept, "Cookies")) as f:
+            self.assertEqual(f.read(), "one")
+        self.assertFalse(os.path.exists(os.path.join(kept, "Cache")), "caches are never kept")
+        self.assertFalse(os.path.exists(a.profile), "the desk's own copy is removed")
+        self.assertEqual(os.stat(os.path.dirname(kept)).st_mode & 0o777, 0o700)
+        # Two desks at once start from the same kept profile; the last to stop wins.
+        start("desk-b", profile="agent")
+        start("desk-c", profile="agent")
+        b, c = use("desk-b"), use("desk-c")
+        self.assertEqual((b.found, c.found), ("one", "one"), "signed in on both")
+        c.sign_in("three")
+        b.sign_in("two")
+        stop("desk-c")
+        stop("desk-b")
+        with open(os.path.join(kept, "Cookies")) as f:
+            self.assertEqual(f.read(), "two")
+        # A desk whose browser never opened leaves the kept profile alone; a desk without a profile keeps its own folder.
+        start("desk-d", profile="agent")
+        self.assertEqual(stop("desk-d")["profile_saved"], False)
+        start("desk-e")
+        use("desk-e").sign_in("mine")
+        self.assertNotIn("profile_saved", stop("desk-e"))
+        self.assertTrue(os.path.exists(os.path.join(home, "browser-desk-e")), "as before v0.24.0")
+        with open(os.path.join(kept, "Cookies")) as f:
+            self.assertEqual(f.read(), "two")
+        # Too large to keep (desk_profile_max_mb 16): not saved, and said.
+        start("desk-f", profile="agent")
+        use("desk-f").sign_in("big", cache_mb=0)
+        with open(os.path.join(home, "browser-desk-f", "Default", "big"), "wb") as f:
+            f.write(b"x" * (17 * 1024 * 1024))
+        self.assertEqual(stop("desk-f")["profile_saved"], False)
+        self.assertTrue(any(m.get("name") == "desk_profile_too_big" for m in self.out.msgs()))
+        # The kill switch saves nothing and removes the desks' copies.
+        start("desk-g", profile="agent")
+        use("desk-g").sign_in("stopped")
+        self.plugin.stop()
+        self.assertFalse(os.path.exists(os.path.join(home, "browser-desk-g")))
+        with open(os.path.join(kept, "Cookies")) as f:
+            self.assertEqual(f.read(), "two")
+        # Names are checked; the private desk keeps its own profile.
+        self.assertEqual(start("desk-h", profile="../x")["fault_code"], "bad_value")
+        r = reply(self.out, self.cmd("desk", {"action": "start", "profile": "agent"}))
+        self.assertEqual(r["fault_code"], "bad_value")
+        caps = self.plugin.describe({"level": "trusted"})
+        self.assertTrue(caps["desk"]["profiles"])
 
     def test_the_kill_switch_stops_the_desk(self):
         self.boot("trusted")

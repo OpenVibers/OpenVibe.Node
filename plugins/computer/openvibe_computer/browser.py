@@ -27,6 +27,7 @@ STARTUP_S = 45.0
 MAX_LINKS = 60
 MAX_ELEMENTS = 120
 MAX_APPEARED = 8
+MAX_FOLLOWED = 5   # pages opened from pages (a sign-in popup, a new tab) followed at most this deep
 KEY_CODES = {
     "Enter": (13, "\r"), "Tab": (9, "\t"), "Escape": (27, ""), "Backspace": (8, ""), "Delete": (46, ""),
     "ArrowUp": (38, ""), "ArrowDown": (40, ""), "ArrowLeft": (37, ""), "ArrowRight": (39, ""),
@@ -197,6 +198,11 @@ class Browser:
         self.page_size = None      # on a browser desk, the page's exact size (the desk's: its page is its screen)
         self.write_mu = threading.Lock()   # one message at a time on the pipe: actions and the live view share it
         self.start_mu = threading.Lock()
+        self.target = None         # the page in front: the agent reads and acts on it, a browser desk shows it
+        self.behind = []           # (target, session) of the pages it was opened from, newest last
+        self.tab_events = []       # Target.targetCreated / targetDestroyed seen since the last _follow
+        self.tab_change = None     # "opened" or "closed" since the last _mark: said in the action's receipt
+        self.follow_mu = threading.Lock()
 
     # ---- the process and the pipe ------------------------------------------------------------------------------------
     def alive(self):
@@ -238,14 +244,76 @@ class Browser:
         threading.Thread(target=self._reader, name="computer-browser", daemon=True).start()
         # A first start on a fresh profile can take a while on a slow machine: the first command gets a longer window.
         target = self.call("Target.createTarget", {"url": "about:blank"}, session=False, timeout_s=max(self.timeout_s, STARTUP_S))["targetId"]
+        self.target, self.behind = target, []
+        self._attach(target)
+        # Pages this page opens (a sign-in popup, a link to a new tab) are followed: see _follow.
+        self.call("Target.setDiscoverTargets", {"discover": True}, session=False)
+        if self.download_dir:
+            self.call("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.download_dir}, session=False)
+
+    def _attach(self, target):
+        """Drive that page: a session of its own, its events on, and a browser desk's exact size."""
         self.session = self.call("Target.attachToTarget", {"targetId": target, "flatten": True}, session=False)["sessionId"]
         self.call("Page.enable")
         self.call("Runtime.enable")
         if self.page_size:
             self.call("Emulation.setDeviceMetricsOverride", {"width": self.page_size[0], "height": self.page_size[1],
                                                               "deviceScaleFactor": 1, "mobile": False})
-        if self.download_dir:
-            self.call("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.download_dir}, session=False)
+
+    def _follow(self):
+        """Keep the page in front in front: a page this page opened (a sign-in popup, a link that opens a new tab)
+        becomes the page the agent reads and acts on, and a browser desk shows; when it closes (a popup closes itself
+        after a sign-in), the page it came from is in front again. Only pages opened from the followed pages, at most
+        MAX_FOLLOWED deep; anything else in the browser is left alone."""
+        with self.follow_mu:
+            with self.mu:
+                events, self.tab_events = self.tab_events, []
+            for method, params in events:
+                info = params.get("targetInfo") or {}
+                ours = [self.target] + [t for t, _ in self.behind]
+                if method == "Target.targetCreated" and info.get("type") == "page" and info.get("openerId") in ours:
+                    if len(self.behind) >= MAX_FOLLOWED:
+                        continue
+                    was = (self.target, self.session)
+                    try:
+                        self.target = info["targetId"]
+                        self._attach(self.target)
+                    except BrowserError:
+                        self.target, self.session = was
+                        continue
+                    self.behind.append(was)
+                    self.tab_change = "opened"
+                    self._ready()
+                elif method == "Target.targetDestroyed":
+                    gone = params.get("targetId")
+                    if gone == self.target and self.behind:
+                        self.target, self.session = self.behind.pop()
+                        self.tab_change = "closed"
+                    else:
+                        self.behind = [(t, sess) for t, sess in self.behind if t != gone]
+
+    def _front_changed(self, session, timeout_s=1.0):
+        """Whether the page in front changed from that session's (its page closed), waiting up to timeout_s for the
+        browser to say so."""
+        end = time.monotonic() + timeout_s
+        while True:
+            self._follow()
+            if self.session != session:
+                return True
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+
+    def _ready(self, timeout_s=10.0):
+        """Wait (a little) for a page just followed to finish loading."""
+        end = time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            try:
+                if self._eval("document.readyState") == "complete":
+                    return
+            except BrowserError:
+                pass
+            time.sleep(0.1)
 
     def _stderr(self, stream):
         """Keep the browser's last lines of stderr: why it closed, when it does."""
@@ -277,6 +345,8 @@ class Browser:
                 elif "method" in msg:
                     with self.mu:
                         self.events.append(msg["method"])
+                        if msg["method"] in ("Target.targetCreated", "Target.targetDestroyed"):
+                            self.tab_events = (self.tab_events + [(msg["method"], msg.get("params") or {})])[-50:]
                         if len(self.events) > 500:
                             del self.events[:250]
         with self.mu:
@@ -312,6 +382,7 @@ class Browser:
     def _mark(self):
         with self.mu:
             self.events = []
+        self.tab_change = None
 
     def _wait_for(self, methods, timeout_s):
         end = time.monotonic() + timeout_s
@@ -322,8 +393,20 @@ class Browser:
             time.sleep(0.05)
         return False
 
-    def _eval(self, expression):
-        r = self.call("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
+    def _eval(self, expression, gesture=False):
+        # gesture: as a person's click (user activation), so a page may open its sign-in popup from the agent's click.
+        params = {"expression": expression, "returnByValue": True, "awaitPromise": True}
+        if gesture:
+            params["userGesture"] = True
+        session = self.session
+        try:
+            r = self.call("Runtime.evaluate", params)
+        except BrowserError as e:
+            # The page in front just closed (a popup closes itself after a sign-in) before the browser said so: wait for
+            # it to say so (a second at most), then once more on the page in front again.
+            if "session" not in e.message.lower() or not self._front_changed(session):
+                raise
+            r = self.call("Runtime.evaluate", params)
         if r.get("exceptionDetails"):
             raise BrowserError("bad_value", "the page refused: %s" % r["exceptionDetails"].get("text", "an exception"))
         return r.get("result", {}).get("value")
@@ -337,6 +420,7 @@ class Browser:
     # ---- the actions -----------------------------------------------------------------------------------------------
     def summary(self):
         self.used_at = time.monotonic()
+        self._follow()
         return self._eval(SUMMARY_JS)
 
     def open(self, url):
@@ -363,6 +447,8 @@ class Browser:
         after = self.summary()
         r = receipt(before, after)
         if r is not None:
+            if self.tab_change:
+                r["page"] = self.tab_change   # a page it opened is now in front ("opened"), or that page closed ("closed")
             after["receipt"] = r
         return after
 
@@ -370,7 +456,7 @@ class Browser:
         self._need()
         before = self._before()
         self._mark()
-        if not self._eval(CLICK_JS % (json.dumps(selector), json.dumps(text or ""))):
+        if not self._eval(CLICK_JS % (json.dumps(selector), json.dumps(text or "")), gesture=True):
             raise BrowserError("bad_value", "nothing on the page matches %s" % (selector or repr(text)))
         self._settle()
         return self._with_receipt(before)
@@ -426,12 +512,14 @@ class Browser:
     def _need(self):
         if not self.alive() or not self.session:
             raise BrowserError("not_ready", "no page is open: open a URL first")
+        self._follow()
 
     # ---- a browser desk: the page is the screen ---------------------------------------------------------------------
     def page(self):
         """Make sure the browser runs (a blank page until one is opened): a browser desk always has a screen."""
         self.start()
         self.used_at = time.monotonic()
+        self._follow()
 
     def viewport(self):
         """The page's size in CSS pixels, which mouse events use."""
@@ -500,10 +588,13 @@ class Browser:
     def _receipt_only(self, before):
         out = {"done": True}
         try:
+            self._follow()
             r = receipt(before, self._eval(BEFORE_JS))
         except BrowserError:
             r = None
         if r is not None:
+            if self.tab_change:
+                r["page"] = self.tab_change
             out["receipt"] = r
         return out
 
@@ -519,8 +610,20 @@ class Browser:
             f.write(data)
         os.replace(path + ".part", path)
 
-    def close(self):
+    def close(self, graceful=False):
+        """End the browser. graceful: ask it to quit first (a few seconds), so it writes its cookies and storage to the
+        profile (a desk's profile is kept, Node v0.24.0); else, and when it does not quit, it is killed."""
+        if graceful and self.alive():
+            try:
+                self.call("Browser.close", session=False, timeout_s=5.0)
+            except BrowserError:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
         proc, self.proc, self.session = self.proc, None, None
+        self.target, self.behind = None, []
         for f in (self.out, self.inp):
             try:
                 if f:
