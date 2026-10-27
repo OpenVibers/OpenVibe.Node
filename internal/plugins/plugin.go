@@ -104,7 +104,7 @@ type Plugin struct {
 	// The newest turn_epoch a halt carried: hello tells a restarted process, so a stale turn stays refused there too.
 	haltEpoch int64
 	pending   map[string]chan Reply
-	queue     chan []byte // to the current process's stdin; nil while down
+	queue     chan line // to the current process's stdin; nil while down
 	kill      func()
 	restarts  int
 	pid       int
@@ -160,6 +160,57 @@ func (p *Plugin) emit(o Output, important bool) {
 	}
 }
 
+// line is one write to the plugin's stdin: bytes, or a timed command the writer renders at the moment it writes it.
+type line struct {
+	b   []byte
+	cmd *timed
+}
+
+// timed is a command that expires at an instant on this machine. Lines can wait in the queue to the plugin while the
+// writer is blocked on a full pipe (a plugin slow to read), so the writer, not the sender, stamps what is left: a timed
+// command is written with deadline_ms = the whole milliseconds left at that moment and expires_at_mono_ns = the instant
+// on the clock the plugin shares (monotonicNS), and is never written once less than a millisecond is left (Maticus,
+// 2026-10-27: queue and pipe time must not extend a command's validity).
+type timed struct {
+	id      string
+	msg     map[string]any
+	expires time.Time // on this process's monotonic clock
+	queued  time.Time
+}
+
+// render is the command's line as it is written now, or ok false when less than a millisecond is left.
+func (c *timed) render() (b []byte, ok bool) {
+	// The shared clock is read before the time left, so expires_at_mono_ns can only come out early.
+	mono, hasMono := monotonicNS()
+	left := time.Until(c.expires)
+	if left < time.Millisecond {
+		return nil, false
+	}
+	c.msg["deadline_ms"] = int64(left / time.Millisecond)
+	if hasMono {
+		c.msg["expires_at_mono_ns"] = mono + int64(left)
+	}
+	b, err := json.Marshal(c.msg)
+	if err != nil {
+		return nil, false
+	}
+	return append(b, '\n'), true
+}
+
+// expired answers a timed command that was never written: its time ran out in the queue to the plugin.
+func (p *Plugin) expired(c *timed) {
+	p.mu.Lock()
+	ch := p.pending[c.id]
+	p.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- Reply{FaultCode: protocol.FaultExpired, Message: fmt.Sprintf("its deadline passed while it waited %d ms in the queue to the driver; it was never sent", time.Since(c.queued).Milliseconds())}:
+	default:
+	}
+}
+
 // send queues one line for the plugin. A plugin that stops reading its stdin is killed: it can no longer be told to
 // stop, and its own heartbeat watchdog is the only thing left, so we make sure by ending it.
 func (p *Plugin) send(msg map[string]any) error {
@@ -167,7 +218,10 @@ func (p *Plugin) send(msg map[string]any) error {
 	if err != nil {
 		return err
 	}
-	b = append(b, '\n')
+	return p.enqueue(line{b: append(b, '\n')})
+}
+
+func (p *Plugin) enqueue(l line) error {
 	p.mu.Lock()
 	q, kill := p.queue, p.kill
 	p.mu.Unlock()
@@ -175,7 +229,7 @@ func (p *Plugin) send(msg map[string]any) error {
 		return errors.New(protocol.FaultPluginDown)
 	}
 	select {
-	case q <- b:
+	case q <- l:
 		return nil
 	default:
 		p.log.Error("plugin is not reading its input; killing it")
@@ -285,7 +339,7 @@ func (p *Plugin) BeginAs(ctx context.Context, id, kind string, value json.RawMes
 // BeginTurn is BeginAs with the robot's control epoch the command was decided under (protocol.Command.TurnEpoch), sent
 // to the plugin as turn_epoch when it is set, so a driver can refuse a command older than the newest turn halt itself.
 func (p *Plugin) BeginTurn(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator, turnEpoch int64) func() Reply {
-	return p.BeginWith(ctx, id, kind, value, deadlineMS, op, turnEpoch, nil)
+	return p.begin(ctx, id, kind, value, deadlineMS, time.Time{}, op, turnEpoch, nil)
 }
 
 // Provenance is where a command came from, passed unchanged from Bot to the driver as `provenance` (plugins.md): the
@@ -304,8 +358,15 @@ type Provenance struct {
 	ClockUncertaintyMS *int64 `json:"clock_uncertainty_ms,omitempty"`
 }
 
-// BeginWith is BeginTurn with the command's provenance (nil: none).
-func (p *Plugin) BeginWith(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
+// BeginWith is BeginTurn for a command that expires at an instant on this machine (the Node's receipt of it plus the
+// time its deadline left), with its provenance (nil: none). The plugin gets what is left when the line is written to
+// it, never more, and a command whose time runs out before then is answered expired without reaching the plugin.
+func (p *Plugin) BeginWith(ctx context.Context, id, kind string, value json.RawMessage, expires time.Time, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
+	return p.begin(ctx, id, kind, value, 0, expires, op, turnEpoch, prov)
+}
+
+// begin queues a command: with deadline_ms as given when expires is zero, else timed (BeginWith).
+func (p *Plugin) begin(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, expires time.Time, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
 	now := func(r Reply) func() Reply { return func() Reply { return r } }
 	p.mu.Lock()
 	if p.state != StateReady && kind != protocol.KindHalt {
@@ -344,13 +405,22 @@ func (p *Plugin) BeginWith(ctx context.Context, id, kind string, value json.RawM
 	if prov != nil {
 		msg["provenance"] = prov
 	}
-	if err := p.send(msg); err != nil {
+	var err error
+	if expires.IsZero() {
+		err = p.send(msg)
+	} else {
+		err = p.enqueue(line{cmd: &timed{id: id, msg: msg, expires: expires, queued: time.Now()}})
+	}
+	if err != nil {
 		done()
 		return now(Reply{FaultCode: protocol.FaultPluginDown})
 	}
 	return func() Reply {
 		defer done()
 		wait := time.Duration(deadlineMS) * time.Millisecond
+		if !expires.IsZero() {
+			wait = time.Until(expires)
+		}
 		if wait < MinReplyTimeout {
 			wait = MinReplyTimeout
 		}
@@ -447,7 +517,7 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", p.spec.Argv[0], err)
 	}
-	queue := make(chan []byte, 256)
+	queue := make(chan line, 256)
 	var killOnce sync.Once
 	kill := func() { killOnce.Do(func() { killProcess(cmd) }) }
 	p.mu.Lock()
@@ -458,21 +528,33 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 	// Writer: the only goroutine touching stdin. Closing stdin is the plugin's signal to stop and exit.
 	writerDone := make(chan struct{})
 	stopWriter := make(chan struct{})
+	write := func(l line) error {
+		b := l.b
+		if l.cmd != nil {
+			var ok bool
+			if b, ok = l.cmd.render(); !ok {
+				p.expired(l.cmd)
+				return nil
+			}
+		}
+		_, err := stdin.Write(b)
+		return err
+	}
 	go func() {
 		defer close(writerDone)
 		defer stdin.Close()
 		for {
 			select {
-			case b := <-queue:
-				if _, err := stdin.Write(b); err != nil {
+			case l := <-queue:
+				if err := write(l); err != nil {
 					return
 				}
 			case <-stopWriter:
 				// Drain what is queued (a final stop) and close.
 				for {
 					select {
-					case b := <-queue:
-						if _, err := stdin.Write(b); err != nil {
+					case l := <-queue:
+						if err := write(l); err != nil {
 							return
 						}
 					default:

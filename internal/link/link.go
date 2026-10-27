@@ -102,8 +102,9 @@ type Link struct {
 	heartbeat time.Duration
 	deadman   time.Duration
 
-	// The server clock estimate of this connection (see ServerNow): skew is the largest ts − local receive time (ms)
-	// seen since clockBase, the local time of its first frame; hasSkew is false until a frame arrives.
+	// The server clock estimate of this connection (see ServerNow): skew is the largest ts − local receive time seen
+	// (ns; receive times are measured from clockBase, the local time of its first frame, on the monotonic clock);
+	// hasSkew is false until a frame arrives.
 	skew      int64
 	hasSkew   bool
 	clockBase time.Time
@@ -168,41 +169,42 @@ func (l *Link) observe(ts int64, at time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.hasSkew {
-		l.clockBase, l.skew, l.hasSkew = at, ts-at.UnixMilli(), true
+		l.clockBase, l.skew, l.hasSkew = at, ts*int64(time.Millisecond), true
 		return
 	}
-	l.skew = max(l.skew, ts-l.localMS(at))
+	l.skew = max(l.skew, ts*int64(time.Millisecond)-int64(at.Sub(l.clockBase)))
 }
 
-// localMS is local time at in epoch ms, measured from clockBase on the monotonic clock so a step of the wall clock
-// cannot move the estimate.
-func (l *Link) localMS(at time.Time) int64 {
-	return l.clockBase.UnixMilli() + at.Sub(l.clockBase).Milliseconds()
-}
+// TSResolution is the resolution of the server's ts: Bot stamps whole milliseconds (Date.now(), rounded down), so a
+// frame may have left up to this much after its ts says.
+const TSResolution = time.Millisecond
 
-// ServerNow estimates the server's clock (epoch ms) at local time at, from the frames of the current connection. The
+// ServerNow estimates the server's clock (epoch ns) at local time at, from the frames of the current connection. The
 // offset is the largest ts − receive time seen on the connection: the clock skew less the fastest transit, so a frame
 // that sat in a queue on the way reads as late by however long it sat there. The estimate itself trails the server by
-// that fastest transit; ClockUncertainty bounds it, and deadlines are checked against estimate + bound. The best sample is kept for the whole
-// connection: a run of delayed frames can never make an expired deadline look open again. A server clock that steps
-// back only makes deadlines read as expired (fail closed) until the next connection. ok is false before any frame.
-func (l *Link) ServerNow(at time.Time) (ms int64, ok bool) {
+// that fastest transit (and up to TSResolution more); ClockUncertainty bounds it, and deadlines are checked against
+// estimate + bound. Local times are measured in nanoseconds on the monotonic clock, so neither a step of the wall clock
+// nor rounding moves the estimate later. The best sample is kept for the whole connection: a run of delayed frames can
+// never make an expired deadline look open again. A server clock that steps back only makes deadlines read as expired
+// (fail closed) until the next connection. ok is false before any frame.
+func (l *Link) ServerNow(at time.Time) (ns int64, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.hasSkew {
 		return 0, false
 	}
-	return l.localMS(at) + l.skew, true
+	return int64(at.Sub(l.clockBase)) + l.skew, true
 }
 
 // ClockUncertainty bounds how far ServerNow can trail the server's real clock on this connection: the fastest
-// heartbeat round trip measured on it. ServerNow trails the server by the fastest one-way transit among the frames it
-// sampled; every heartbeat_ack is one of those frames, and its one-way transit is at most its own round trip, so the
-// fastest round trip is an upper bound whatever the asymmetry of the path. ok is false until a round trip is measured
-// (the first heartbeat goes out as soon as the server's hello arrives).
+// heartbeat round trip measured on it, plus TSResolution. ServerNow trails the server by the fastest one-way transit
+// among the frames it sampled, plus how far that frame's whole-millisecond ts was rounded down; every heartbeat_ack is
+// one of those frames, and its one-way transit is at most its own round trip, so the fastest round trip plus the ts
+// resolution is an upper bound whatever the asymmetry of the path. Round trips are kept to the nanosecond. ok is false
+// until a round trip is measured (the first heartbeat goes out as soon as the server's hello arrives).
 func (l *Link) ClockUncertainty() (time.Duration, bool) {
 	if v := l.minRTT.Load(); v > 0 {
-		return time.Duration(v), true
+		return time.Duration(v) + TSResolution, true
 	}
 	return 0, false
 }

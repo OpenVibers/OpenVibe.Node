@@ -48,7 +48,7 @@ describes itself and waits for EOF without opening any hardware.
 | op          | fields                                                        | the plugin must                                        |
 |-------------|---------------------------------------------------------------|--------------------------------------------------------|
 | `hello`     | `config` {…}, `probe` bool, `halt_epoch`? (the newest a halt carried, 0.17) | answer `describe`; then set up (unless probe) |
-| `command`   | `id`, `kind`, `value`, `deadline_ms`, `operator`?, `turn_epoch`?, `provenance`? | act, answer `ack` or `nack` with the same `id` |
+| `command`   | `id`, `kind`, `value`, `deadline_ms`, `expires_at_mono_ns`? (0.18), `operator`?, `turn_epoch`?, `provenance`? | act, answer `ack` or `nack` with the same `id` |
 | `heartbeat` | `t` (core clock, ms)                                          | note the time                                          |
 | `stop`      | `cause` (0.17), `turn_epoch`? (a halt's)                      | stop every actuator; latch nothing                     |
 | `estop`     | `cause`, `reason`?, `replayed`?, `first_cause`? (0.17)         | stop every actuator and refuse motion until `resume`   |
@@ -59,7 +59,10 @@ describes itself and waits for EOF without opening any hardware.
 | `voice_answer` | `id`, `state` (working, answered, refused), `text`, `url`  | (voice plugins) Vibe's answer to a `voice_ask` event the plugin raised: speak and show it |
 
 `value` has already been validated and clamped to the owner's limits by the core ([protocol.md](protocol.md#commands)).
-`deadline_ms` is relative to receipt and already capped.
+`deadline_ms` is relative to receipt and already capped. Since Node 0.18 the core counts it down to the moment it writes
+the line, and adds `expires_at_mono_ns`: the instant the command expires on `CLOCK_MONOTONIC`, the clock every process on
+the machine shares (absent on Windows). A plugin that reads that clock when the line arrives takes off the time the line
+sat in the pipe too (answer 8); the Python runtime does.
 
 `operator` is who sent the command, as Bot's gate saw them: `{"subject": "usr_…", "role": "owner" | "operator" |
 "queue"}` (`queue` is the holder of a public robot's turn); it is absent when the core got none. Bot has already
@@ -84,8 +87,8 @@ and refuses an older command itself (`expired`).
 | `session` | the link session it arrived on (Bot's `hello`; a new id on every connection, and ids sort by time) |
 | `seq` | its frame's number on that session: strictly increasing, with gaps (other frames share the count) |
 | `issued_at_ms` | Bot's clock when it sent the command, which is when it minted the id (`cmd_<ULID>`, whose time part is the same) |
-| `expires_at_ms` | the absolute deadline on Bot's clock (motion kinds); `deadline_ms` is what is left of it at receipt |
-| `clock_uncertainty_ms` | (0.17) how far the core's estimate of Bot's clock may trail it: the connection's fastest round trip. `deadline_ms` already counts from estimate + this |
+| `expires_at_ms` | the absolute deadline on Bot's clock (motion kinds); `deadline_ms` is what is left of it when the core writes the line |
+| `clock_uncertainty_ms` | (0.17) how far the core's estimate of Bot's clock may trail it: the connection's fastest round trip, plus 1 ms for Bot's whole-millisecond stamps since 0.18, rounded up from nanoseconds. `deadline_ms` already counts from estimate + this |
 
 Python: `cmd.provenance` (a dict, or `None` from an older Node). The runtime refuses (`expired`) a command whose `seq`
 is not above the last one it handled on the same `session`.
@@ -136,8 +139,10 @@ Asked by the Generic LOOI driver's authors (2026-10-27). Each answer is what Bot
      can be: its estimate (the local monotonic clock plus the largest `ts − arrival` seen on the connection) plus that
      estimate's bound (answer 6). So time a frame spent queued on the way counts as lateness, and a delayed run of
      frames can never make a deadline look open again.
-   - It caps what is left at the robot's `max_command_ms`.
-   - The plugin gets that remainder as `deadline_ms`, and `expires_at_ms` in `provenance` unchanged.
+   - It caps what is left at the robot's `max_command_ms`, and fixes the instant it runs out on the machine's own clock:
+     receipt plus that remainder.
+   - The plugin gets what is left of it when the core writes the line, as `deadline_ms`, with that instant as
+     `expires_at_mono_ns` (0.18, answer 8), and `expires_at_ms` in `provenance` unchanged.
    - Neither a viewer nor Live can choose a later deadline.
 2. **Nothing re-stamps a command.**
    - Bot sends each device command once and never again, under any id. One with no answer by its deadline plus 1.5 s
@@ -182,12 +187,15 @@ Asked by the Generic LOOI driver's authors (2026-10-27). Each answer is what Bot
    - The core decides at arrival:
      - it refuses a command whose deadline has passed;
      - it refuses a plugin that is down or not ready at once (`plugin_down`, `not_ready`) rather than holding the command;
-     - it hands the rest straight to the plugin's stdin. A plugin that stops reading is killed, so no line waits there.
+     - it queues the rest for the plugin's stdin. A plugin that stops reading until 256 lines are waiting is killed.
+       Until then lines can wait in that queue behind a full pipe; since 0.18 that time counts against a command, and one
+       whose time runs out there is answered `expired` and never written (answer 8).
    - A plugin that does not answer within max(deadline, 1 s) is told to `stop`, and the command fails with
      `plugin_timeout`.
    - The Python runtime counts each deadline from the moment its line arrived. It refuses (`expired`) a motion command
      whose deadline passed while it waited behind a slow handler, so the driver never sees it. Before Node 0.16.1 such a
-     command still reached `handle` and was stopped on the next tick.
+     command still reached `handle` and was stopped on the next tick. Since 0.18 it also takes off the time the line sat
+     in the pipe before it was read (`expires_at_mono_ns`).
    - A driver without the runtime should do the same: note the time each line is read (on a reader thread) and refuse
      motion that is already past its `deadline_ms` when its turn comes.
 
@@ -200,8 +208,8 @@ Asked next by the same authors (2026-10-27, P7 LOOI shadow integration), and cha
      than its deadline allows.
    - **The bound.** Every `heartbeat_ack` is one of those samples, and its one-way transit is at most its own round
      trip. So the connection's fastest heartbeat round trip bounds the error, whatever the asymmetry of the path.
-     The core checks every deadline against estimate + bound (the latest Bot's clock can be), rounded up to the
-     millisecond. This is fail-closed: a command can only get less time than its deadline allows, never more.
+     The core checks every deadline against estimate + bound (the latest Bot's clock can be). This is fail-closed: a
+     command can only get less time than its deadline allows, never more. (0.18 made the arithmetic strict: answer 8.)
    - **What else holds.** Clock drift over a connection is tracked by the newest samples or reads early (fail-closed).
      The local clock is monotonic, so a wall-clock step on the device changes nothing. Bot's clock stepping back reads
      as early until the next connection; stepping forward moves the estimate with the next frame. Latency and jitter
@@ -243,6 +251,93 @@ Asked next by the same authors (2026-10-27, P7 LOOI shadow integration), and cha
      every check. Across a plugin restart the latch arrives again as `estop` `latched` with `replayed: true`, and the halt
      epoch comes in `hello`. Across a Node reconnect the link's loss is a `stop` (`link_lost`); a platform e-stop set
      while offline is applied from Bot's config before any command.
+
+Reviewed again by the same authors against v0.17.0 (2026-10-27, `632207f`), and changed in Node 0.18.0:
+
+8. **Node-to-plugin transit, the bound's rounding, and what a driver may assume.**
+   - **Transit extended a command (confirmed, fixed).** In 0.17 the core turned the deadline into `deadline_ms` when the
+     frame arrived, then queued the line for the plugin's stdin. Lines wait in that queue while the pipe is full (a
+     plugin slow to read), and the Python runtime counted `deadline_ms` from when its reader got the line. So queue and
+     pipe time were not counted: a command with 100 ms left that waited 200 ms could still move for 100 ms. Nothing in
+     0.17 prevented it. In 0.18:
+     - The core fixes the instant a command expires when it arrives: receipt plus what was left (capped at
+       `max_command_ms`).
+     - The writer stamps the line when it writes it: `deadline_ms` is the whole milliseconds left then, and
+       `expires_at_mono_ns` the instant on `CLOCK_MONOTONIC`. A command with less than 1 ms left is never written. The
+       core answers it `expired`, saying how long it waited.
+     - The Python runtime reads both clocks when a line arrives (its own clock first, then the shared one, so the time
+       left can only come out short). It refuses (`expired`) a motion command whose `expires_at_mono_ns` has passed, so
+       `handle()` never runs. Otherwise the command gets the smaller of `deadline_ms` and what that instant leaves.
+     - Time the line then waits behind a slow handler counts as before (answer 5).
+     - The tests:
+       - `TestWriterQueueDelayCountsAgainstTheDeadline` (Go) fills the pipe while the plugin sleeps 400 ms. A command
+         with 100 ms is answered `expired` and never reaches the plugin. One with 1.5 s reaches it with at most what is
+         left: its `deadline_ms`, and on the plugin's own clock.
+       - `test_a_real_pipe_delay_never_extends_a_deadline` (Python) leaves lines in an OS pipe for 200 ms. The 100 ms
+         command never reaches `handle()`, and the 1 s one gets at most 800 ms.
+       - `test_pipe_delay_counts_against_the_deadline` covers the edges with fake clocks: 0.999999 ms left is expired,
+         and pipe plus inbox delay add up.
+       - Each test fails with the correction removed.
+   - **Clock domains.** There are three:
+     - Bot's clock: the absolute deadline, read through the link's estimate and its bound (answer 6).
+     - The core's monotonic clock: Go's, so a wall-clock step changes nothing.
+     - `CLOCK_MONOTONIC`, between the core and the plugin. The core reads it with `clock_gettime`; Python reads it with
+       `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`. It is one clock for every process on the machine, and the core's
+       monotonic clock runs at the same rate.
+
+     The correction assumes the plugin runs on the same machine as the core (the core starts it, over a pipe). It also
+     assumes both read the same clock id. On Windows there is no shared clock: `expires_at_mono_ns` is absent, and only
+     the core's queue time is counted, up to the write.
+   - **The bound's rounding (confirmed, fixed).** 0.17 cut a round trip to whole microseconds before rounding up, so
+     1,000,001 ns came out as 1 ms. Two more roundings were not counted at all:
+     - Bot stamps `ts` in whole milliseconds, rounded down. A frame may have left up to 1 ms after its stamp, so the
+       estimate could trail by that much more than the round trip.
+     - The core kept receipt times in whole milliseconds.
+
+     In 0.18:
+     - The estimate is kept in nanoseconds.
+     - The bound is the fastest round trip plus 1 ms for the stamps.
+     - `timeLeft` works in nanoseconds and rounds the time left down.
+     - `clock_uncertainty_ms` and the `MaxClockUncertaintyMS` check round the bound up from nanoseconds. A bound of
+       exactly 1 s is still admitted, and 1 s + 1 ns is refused.
+     - So `clock_uncertainty_ms` reads about 1 ms higher than in 0.17.
+     - Admission is otherwise unchanged: no motion before a connection's first round trip, none over 1 s.
+     - The tests: `TestCeilMSRoundsUpFromNanoseconds` (nanosecond and microsecond boundaries),
+       `TestServerNowKeepsNanoseconds`, and the bound in `TestClockUncertaintyIsTheFastestRoundTrip`.
+   - **Stops and local authority (confirmed, no change).**
+     - Every stop the runtime makes calls `on_stop(StopInfo)`:
+       - `info.emergency` is true only for `estop`.
+       - `info.cause` says which (answer 7).
+       - `info.halt_epoch` is the newest halt epoch the runtime knows, and comes from `hello` after a restart.
+       - `info.turn_epoch` is the epoch of the halt that caused this stop.
+     - An ordinary stop (`halt`, `link_lost`, `shutdown`, `timeout`, `deadline`, `heartbeat`) only says "stop now". It
+       latches nothing in the core or the runtime, so an adapter may revoke remote motion without touching a newer local
+       owner's command.
+     - `on_resume` is information. Its default does nothing, and the runtime re-arms nothing, so P7 is not re-armed and
+       no local grant comes back.
+   - **A replayed e-stop comes before any motion.** The core keeps the latch on disk and sets it before it starts any
+     plugin.
+     - **Plugin restart.** The process gets `hello` with the latest halt epoch, then the e-stop again (`latched`,
+       `replayed: true`, `first_cause`). No command is routed to it before its `ready`, and lines reach it in the order
+       they were queued. So the replay arrives before any command, and the runtime refuses motion (`estopped`) from
+       then on.
+     - **Node reconnect.** No command is accepted until Bot's config has been applied on the new connection, which sets
+       the latch first.
+     - **Defence in depth.** The core itself refuses `drive`, `actuator`, `ptz`, `button` and `point` while latched,
+       whatever the plugin's state. `test_a_replayed_estop_is_applied_before_any_motion`, `TestCrashRestartsWithEstop` and
+       `TestLatchSetBeforeStartIsReplayedFirst` hold the order. (Before 0.18 a Node booting latched told its plugins just
+       after starting them. That was also safe, by the core's own refusal, but is now in the order written here.)
+   - **What a strict guarantee still assumes.** Each of these makes a command read as expired, never as open:
+     - Bot's clock does not step back during a connection (that reads as expired until the next one).
+     - The host is not suspended mid-command: `CLOCK_MONOTONIC` stops while suspended, and the link is lost on resume
+       anyway.
+     - The plugin is on the same machine.
+
+     Bounded but not removed:
+     - The gap between the runtime's check and the driver's own write to the hardware (the driver's code).
+     - Time inside `handle()`.
+   - **Versions.** The Python SDK package now carries the Node release (`openvibe_plugin.__version__`, `pyproject.toml`:
+     0.18.0; it said 0.1.0 before). For an exact source, pin the commit, not the version.
 
 ### Plugin → core
 

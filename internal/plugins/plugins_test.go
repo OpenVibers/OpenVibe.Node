@@ -40,13 +40,26 @@ func fakePlugin(logPath string, in io.Reader, out io.Writer) {
 	rec := func(s string) { fmt.Fprintln(f, s) }
 	w := json.NewEncoder(out)
 	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 0, 64*1024), 4<<20) // a filler line can be larger than a pipe
 	mode := os.Getenv("OPENVIBE_FAKE_MODE")
 	for sc.Scan() {
+		// What a command had left when its line was read, on the clock shared with the core.
+		mono, hasMono := monotonicNS()
 		var m map[string]any
-		json.Unmarshal(sc.Bytes(), &m)
+		d := json.NewDecoder(strings.NewReader(sc.Text()))
+		d.UseNumber()
+		d.Decode(&m)
 		op, _ := m["op"].(string)
 		if op != "heartbeat" {
-			rec(sc.Text())
+			if len(sc.Text()) > 4096 {
+				rec(fmt.Sprintf("LONG %v", m["id"]))
+			} else {
+				rec(sc.Text())
+			}
+		}
+		if exp, ok := m["expires_at_mono_ns"].(json.Number); ok && hasMono {
+			e, _ := exp.Int64()
+			rec(fmt.Sprintf("LEFT %v %d", m["id"], e-mono))
 		}
 		switch op {
 		case "hello":
@@ -77,6 +90,11 @@ func fakePlugin(logPath string, in io.Reader, out io.Writer) {
 				os.Exit(3)
 			case "hang":
 				time.Sleep(10 * time.Second)
+			case "pause":
+				// Stop reading stdin for a while, as a plugin stuck in a handler would.
+				ms, _ := m["value"].(map[string]any)["ms"].(json.Number).Int64()
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+				w.Encode(map[string]any{"op": "ack", "id": m["id"]})
 			case "slow":
 				continue
 			case "display":
@@ -287,6 +305,29 @@ func TestCrashRestartsWithEstop(t *testing.T) {
 	}
 }
 
+// A latch set before the manager starts (the Node booting with its stop latched on disk) is the first thing each
+// process hears after hello: the e-stop replayed, naming what set it, before the plugin can be routed any command.
+func TestLatchSetBeforeStartIsReplayedFirst(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "plugin.log")
+	exe, _ := os.Executable()
+	spec := Spec{Name: "fake", Argv: []string{exe}, Env: []string{"OPENVIBE_FAKE_PLUGIN=" + logPath, "OPENVIBE_FAKE_MODE="}}
+	m := NewManager([]Spec{spec}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m.EstopAll(EstopRemote, "staff: it wobbled")
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
+	t.Cleanup(func() { cancel(); m.Wait() })
+	fx := &fixture{t: t, log: logPath, m: m}
+	fx.waitState(StateReady)
+	if r := m.Get("fake").Command(context.Background(), "after", "say", nil, 300); !r.OK {
+		t.Fatalf("%+v", r)
+	}
+	l := fx.lines()
+	replay := `{"cause":"latched","first_cause":"remote","op":"estop","reason":"staff: it wobbled","replayed":true}`
+	if len(l) < 3 || !strings.Contains(l[0], `"op":"hello"`) || l[1] != replay || !strings.Contains(l[2], `"id":"after"`) {
+		t.Fatalf("lines: %v", l)
+	}
+}
+
 func TestReplyTimeout(t *testing.T) {
 	fx := start(t, "")
 	fx.waitState(StateReady)
@@ -298,6 +339,67 @@ func TestReplyTimeout(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 	fx.waitLog(`{"cause":"timeout","op":"stop"}`)
+}
+
+// Time a command waits in the queue to the plugin counts against it (Maticus, 2026-10-27). The plugin stops reading
+// for 400 ms and a line larger than the pipe fills it, so the writer is blocked and two motion commands wait in the
+// queue: the one with 100 ms is answered expired and never written; the one with 1.5 s is written with only what is
+// left (deadline_ms and expires_at_mono_ns, counted down to the moment it was written).
+func TestWriterQueueDelayCountsAgainstTheDeadline(t *testing.T) {
+	fx := start(t, "")
+	fx.waitState(StateReady)
+	p := fx.m.Get("fake")
+	ctx := context.Background()
+	held := time.Now()
+	pause := p.Begin(ctx, "hold", "pause", json.RawMessage(`{"ms":400}`), 3000)
+	fx.waitLog(`"id":"hold"`)
+	filler, _ := json.Marshal(map[string]any{"text": strings.Repeat("x", 1<<20)})
+	fill := p.Begin(ctx, "fill", "say", filler, 3000)
+	queued := time.Now()
+	late := p.BeginWith(ctx, "late", "drive", nil, queued.Add(100*time.Millisecond), nil, 0, nil)
+	ontime := p.BeginWith(ctx, "ontime", "drive", nil, queued.Add(1500*time.Millisecond), nil, 0, nil)
+	if r := late(); r.FaultCode != protocol.FaultExpired || !strings.Contains(r.Message, "never sent") {
+		t.Fatalf("late: %+v", r)
+	}
+	if r := ontime(); !r.OK {
+		t.Fatalf("ontime: %+v", r)
+	}
+	if r := pause(); !r.OK {
+		t.Fatalf("pause: %+v", r)
+	}
+	if r := fill(); !r.OK {
+		t.Fatalf("fill: %+v", r)
+	}
+	// Nothing could be written before the plugin read again, 400 ms after it read "hold" (which was after held).
+	maxLeft := queued.Add(1500 * time.Millisecond).Sub(held.Add(400 * time.Millisecond))
+	var deadlineMS int64 = -1
+	sawLeft := false
+	for _, l := range fx.lines() {
+		if strings.Contains(l, `"id":"late"`) || strings.HasPrefix(l, "LEFT late") {
+			t.Fatalf("the expired command reached the plugin: %s", l)
+		}
+		if strings.Contains(l, `"id":"ontime"`) {
+			var m struct {
+				DeadlineMS int64 `json:"deadline_ms"`
+			}
+			json.Unmarshal([]byte(l), &m)
+			deadlineMS = m.DeadlineMS
+		}
+		if strings.HasPrefix(l, "LEFT ontime ") {
+			var ns int64
+			fmt.Sscanf(strings.TrimPrefix(l, "LEFT ontime "), "%d", &ns)
+			sawLeft = true
+			if ns <= 0 || time.Duration(ns) > maxLeft {
+				t.Fatalf("the plugin saw %v left on the shared clock; at most %v can be", time.Duration(ns), maxLeft)
+			}
+		}
+	}
+	if deadlineMS < 1 || time.Duration(deadlineMS)*time.Millisecond > maxLeft {
+		t.Fatalf("ontime was written with deadline_ms %d; at most %v was left", deadlineMS, maxLeft)
+	}
+	if _, ok := monotonicNS(); ok != sawLeft {
+		t.Fatalf("expires_at_mono_ns sent %v, shared clock %v", sawLeft, ok)
+	}
 }
 
 func TestFaultState(t *testing.T) {

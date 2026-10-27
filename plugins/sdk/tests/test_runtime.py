@@ -3,13 +3,15 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from openvibe_plugin import Deferred, Fault, Plugin, Runtime, StopInfo  # noqa: E402
+import openvibe_plugin  # noqa: E402
+from openvibe_plugin import SHARED_CLOCK, Deferred, Fault, Plugin, Runtime, StopInfo  # noqa: E402
 
 
 class FakeClock:
@@ -26,6 +28,7 @@ class Recorder(Plugin):
 
     def __init__(self):
         self.calls = []
+        self.handled = []
         self.moving = False
 
     def describe(self, config):
@@ -36,6 +39,7 @@ class Recorder(Plugin):
         self.calls.append("setup")
 
     def handle(self, cmd):
+        self.handled.append(cmd)
         if cmd.kind == "drive":
             self.moving = True
             return
@@ -48,11 +52,20 @@ class Recorder(Plugin):
         self.moving = False
 
 
-def make(plugin=None):
+class FakeShared:
+    """The clock shared with the core, in ns (a different origin from the runtime's own, as in life)."""
+    def __init__(self):
+        self.ns = 7_000_000_000_000
+
+    def __call__(self):
+        return self.ns
+
+
+def make(plugin=None, shared=None):
     out = io.StringIO()
     clock = FakeClock()
     p = plugin or Recorder()
-    rt = Runtime(p, infile=io.StringIO(""), outfile=out, clock=clock)
+    rt = Runtime(p, infile=io.StringIO(""), outfile=out, clock=clock, shared_clock=shared)
     return rt, p, out, clock
 
 
@@ -305,6 +318,130 @@ class RuntimeTest(unittest.TestCase):
         rt.tick()
         self.assertFalse(p.moving)
         self.assertIn("deadline", rt.stop_reasons)
+
+    def test_pipe_delay_counts_against_the_deadline(self):
+        # Node 0.18 (Maticus, 2026-10-27): the core writes deadline_ms as what was left when it wrote the line, and
+        # expires_at_mono_ns as the instant on the clock it shares with this process. Time the line then sat in the pipe
+        # counts: one that expired there never reaches handle(), and one still valid gets only what is left.
+        shared = FakeShared()
+        rt, p, out, clock = make(shared=shared)
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "heartbeat", "t": 1}))
+        # Written with 100 ms left; read 200 ms later: expired in the pipe.
+        written = shared.ns
+        shared.ns += 200_000_000
+        clock.t += 0.2
+        rt.feed_line(json.dumps({"op": "command", "id": "late", "kind": "drive", "deadline_ms": 100,
+                                 "expires_at_mono_ns": written + 100_000_000}), clock.t, shared.ns)
+        last = lines(out)[-1]
+        self.assertEqual((last["op"], last["id"], last["fault_code"]), ("nack", "late", "expired"))
+        self.assertIn("before the runtime read it (100 ms late", last["message"])
+        self.assertEqual(p.handled, [])
+        self.assertFalse(p.moving)
+        # Written with 300 ms left; read 260 ms later: 40 ms left, and the motion stops when they run out.
+        written = shared.ns
+        shared.ns += 260_000_000
+        clock.t += 0.26
+        rt.feed_line(json.dumps({"op": "heartbeat", "t": 2}))
+        rt.feed_line(json.dumps({"op": "command", "id": "ontime", "kind": "drive", "deadline_ms": 300,
+                                 "expires_at_mono_ns": written + 300_000_000}), clock.t, shared.ns)
+        self.assertEqual(lines(out)[-1], {"op": "ack", "id": "ontime"})
+        cmd = p.handled[-1]
+        self.assertEqual(cmd.deadline_ms, 40)
+        self.assertAlmostEqual(cmd.deadline, clock.t + 0.040, places=9)
+        clock.t += 0.039
+        rt.tick()
+        self.assertTrue(p.moving)
+        clock.t += 0.002
+        rt.tick()
+        self.assertFalse(p.moving)
+        self.assertEqual(rt.stop_reasons[-1], "deadline")
+        # Less than a millisecond left counts as none (deadline_ms is whole milliseconds, at least 1).
+        rt.feed_line(json.dumps({"op": "command", "id": "edge", "kind": "drive", "deadline_ms": 300,
+                                 "expires_at_mono_ns": shared.ns + 999_999}), clock.t, shared.ns)
+        self.assertEqual(lines(out)[-1]["fault_code"], "expired")
+        # A line that waited in the pipe and then in the inbox: both count, the inbox on the runtime's clock as before.
+        written = shared.ns
+        rt.feed_line(json.dumps({"op": "heartbeat", "t": 3}))
+        arrived, shared_arrived = clock.t, shared.ns + 150_000_000
+        clock.t += 0.2
+        rt.feed_line(json.dumps({"op": "command", "id": "both", "kind": "drive", "deadline_ms": 300,
+                                 "expires_at_mono_ns": written + 300_000_000}), arrived, shared_arrived)
+        last = lines(out)[-1]
+        self.assertEqual((last["id"], last["fault_code"]), ("both", "expired"))
+        self.assertEqual([c.id for c in p.handled], ["ontime"])
+
+    def test_motion_kinds_only_and_deadline_ms_alone_without_a_shared_clock(self):
+        # say is not motion: its deadline is a reply window, and expires_at_mono_ns does not apply to it.
+        shared = FakeShared()
+        rt, p, out, clock = make(shared=shared)
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "command", "id": "s", "kind": "say", "deadline_ms": 300,
+                                 "expires_at_mono_ns": shared.ns - 1}), clock.t, shared.ns)
+        self.assertEqual(lines(out)[-1], {"op": "ack", "id": "s"})
+        # No clock shared with the core (Windows): deadline_ms alone, from arrival.
+        rt, p, out, clock = make()
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "heartbeat", "t": 1}))
+        rt.feed_line(json.dumps({"op": "command", "id": "d", "kind": "drive", "deadline_ms": 300,
+                                 "expires_at_mono_ns": 1}), clock.t)
+        self.assertEqual(lines(out)[-1], {"op": "ack", "id": "d"})
+        self.assertEqual(p.handled[-1].deadline_ms, 300)
+
+    @unittest.skipIf(SHARED_CLOCK is None, "no clock shared with the core on this platform")
+    def test_a_real_pipe_delay_never_extends_a_deadline(self):
+        # The real thing: an OS pipe, the real clocks, the runtime's own reader thread. Lines are written as the core
+        # writes them and left in the pipe for 200 ms before the runtime starts reading.
+        r, w = os.pipe()
+        infile = os.fdopen(r, "r", encoding="utf-8")
+        out = io.StringIO()
+        p = Recorder()
+        rt = Runtime(p, infile=infile, outfile=out)
+        now = SHARED_CLOCK()
+        msgs = [
+            {"op": "hello", "config": {}},
+            {"op": "heartbeat", "t": 1},
+            {"op": "command", "id": "late", "kind": "drive", "deadline_ms": 100, "expires_at_mono_ns": now + 100_000_000},
+            {"op": "command", "id": "ontime", "kind": "drive", "deadline_ms": 1000, "expires_at_mono_ns": now + 1_000_000_000},
+        ]
+        os.write(w, "".join(json.dumps(m) + "\n" for m in msgs).encode())
+        time.sleep(0.2)
+        t = threading.Thread(target=rt.run)
+        t.start()
+        time.sleep(0.1)
+        os.close(w)
+        t.join(5)
+        infile.close()
+        self.assertFalse(t.is_alive())
+        got = {m["id"]: m for m in lines(out) if m.get("op") in ("ack", "nack")}
+        self.assertEqual((got["late"]["op"], got["late"]["fault_code"]), ("nack", "expired"))
+        self.assertEqual(got["ontime"]["op"], "ack")
+        self.assertEqual([c.id for c in p.handled], ["ontime"])
+        # It got only what was left of its original second: at most 800 ms after 200 ms in the pipe.
+        self.assertLessEqual(p.handled[0].deadline_ms, 800)
+        self.assertGreater(p.handled[0].deadline_ms, 0)
+
+    def test_a_replayed_estop_is_applied_before_any_motion(self):
+        # A restarted process hears, in this order: hello (with the newest halt epoch), the latched e-stop replayed,
+        # and only then commands (the core routes none to it before its ready, and lines reach it in the order they
+        # were queued). No motion handler runs while the replayed latch holds; resume is information only.
+        rt, p, out, clock = make()
+        rt.feed_line(json.dumps({"op": "hello", "config": {}, "halt_epoch": 1792900000500}))
+        rt.feed_line(json.dumps({"op": "estop", "cause": "latched", "first_cause": "remote", "reason": "staff: it wobbled",
+                                 "replayed": True}))
+        rt.feed_line(json.dumps({"op": "heartbeat", "t": 1}))
+        rt.feed_line(json.dumps({"op": "command", "id": "m1", "kind": "drive", "deadline_ms": 300,
+                                 "turn_epoch": 1792900000500}))
+        self.assertEqual(lines(out)[-1], {"op": "nack", "id": "m1", "fault_code": "estopped"})
+        self.assertEqual(p.handled, [])
+        self.assertFalse(p.moving)
+        self.assertTrue(rt.stop_infos[-1].emergency and rt.stop_infos[-1].replayed and rt.stop_infos[-1].latched)
+        self.assertEqual(rt.stop_infos[-1].halt_epoch, 1792900000500)
+
+    def test_the_package_reports_the_node_release(self):
+        self.assertEqual(openvibe_plugin.__version__, "0.18.0")
+        with open(os.path.join(os.path.dirname(HERE), "pyproject.toml")) as f:
+            self.assertIn('version = "%s"' % openvibe_plugin.__version__, f.read())
 
     def test_only_motion_expires_in_the_backlog(self):
         # say has no motion deadline to miss (its deadline is a reply window): a late one still runs.
