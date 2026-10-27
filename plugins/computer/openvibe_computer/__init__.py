@@ -183,6 +183,17 @@ def _int(v, name, lo, hi, default):
     return int(max(lo, min(hi, v)))
 
 
+def node_data_dir():
+    """Where the plugin keeps what it keeps (the agent's browser profile, the desks' folders). ~/.local/share/openvibe-node
+    on Linux and macOS; on Windows %LOCALAPPDATA%\\openvibe-node, where a Windows program keeps its data (it was the
+    Linux path with mixed separators before 0.31, found by running the tests on Windows). A Windows machine that already
+    has the old folder keeps using it, so a kept sign-in is not lost."""
+    old = os.path.normpath(os.path.expanduser("~/.local/share/openvibe-node"))
+    if os.name != "nt":
+        return old
+    new = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(os.path.join("~", "AppData", "Local")), "openvibe-node")
+    return old if os.path.isdir(old) and not os.path.isdir(new) else new
+
 class Computer(Plugin):
     driver = "computer"
     version = "0.14.0"
@@ -274,9 +285,9 @@ class Computer(Plugin):
         self.desks.max_desks = _int(config.get("max_desks"), "max_desks", 1, MAX_DESKS_CAP, default_max_desks())
         self.desk_idle_s = _int(config.get("desk_idle_s"), "desk_idle_s", 60, 86400, 900)
         self.desk_profile_max_mb = _int(config.get("desk_profile_max_mb"), "desk_profile_max_mb", 16, 4096, 256)
-        self.desks.base_dir = os.path.expanduser(config.get("desk_dir") or "~/.local/share/openvibe-node/desks")
+        self.desks.base_dir = os.path.normpath(os.path.expanduser(config.get("desk_dir") or os.path.join(node_data_dir(), "desks")))
         self.browser_path = config.get("browser_path") or None
-        self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
+        self.browser_profile = os.path.normpath(os.path.expanduser(config.get("browser_profile") or os.path.join(node_data_dir(), "browser")))
         self.browser_headless = config.get("browser_headless", True) is not False
         self.browser_idle_s = _int(config.get("browser_idle_s"), "browser_idle_s", 60, 86400, 600)
         egress = str(config.get("browser_egress") or "public").strip().lower()

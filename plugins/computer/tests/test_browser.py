@@ -206,6 +206,25 @@ class PageKeysTest(unittest.TestCase):
             with self.assertRaises(BrowserError):
                 b.keys(bad)
 
+    def test_editing_shortcuts_on_a_mac(self):
+        # Chrome on a Mac runs select all, copy, paste… only when the key event names the command: ctrl+a then
+        # BackSpace deleted one letter there (2026-10-27). An agent's ctrl or cmd chord does the same on every OS.
+        b = self.browser()
+        b.platform = "darwin"
+        for chord, command in (("ctrl+a", "selectAll"), ("cmd+a", "selectAll"), ("ctrl+c", "copy"), ("ctrl+v", "paste"),
+                               ("ctrl+x", "cut"), ("ctrl+z", "undo"), ("ctrl+shift+z", "redo"), ("cmd+y", "redo")):
+            self.sent.clear()
+            b.keys(chord)
+            down = [p for p in self.sent if p["type"] in ("rawKeyDown", "keyDown") and p["key"].lower() in "acvxzy"][0]
+            self.assertEqual(down.get("commands"), [command], chord)
+        self.sent.clear()
+        b.keys("a")
+        self.assertNotIn("commands", self.sent[0], "a plain key types")
+        b.platform = "linux"
+        self.sent.clear()
+        b.keys("ctrl+a")
+        self.assertFalse(any("commands" in p for p in self.sent), "Linux and Windows run the shortcut themselves")
+
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     PAGES = {

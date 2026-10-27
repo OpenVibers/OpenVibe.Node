@@ -24,7 +24,7 @@ __all__ = ["Plugin", "Fault", "Deferred", "Command", "StopInfo", "Runtime", "run
            "RUNTIME_CAUSES", "SHARED_CLOCK", "SHARED_CLOCK_NAME", "TIMING_UNAVAILABLE", "__version__"]
 
 # The Node release this runtime ships with (pyproject.toml carries the same).
-__version__ = "0.30.0"
+__version__ = "0.31.0"
 PROTOCOL_VERSION = 1
 HEARTBEAT_TIMEOUT_S = 1.0
 DEFAULT_DEADLINE_MS = 300

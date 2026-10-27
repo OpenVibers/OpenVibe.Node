@@ -18,6 +18,7 @@ import shutil
 import tempfile
 import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -26,6 +27,23 @@ from openvibe_plugin import Fault
 WINDOW_MANAGERS = ("metacity", "openbox", "xfwm4", "fluxbox")
 DISPLAYS = range(90, 100)
 START_TIMEOUT_S = 8.0
+
+
+# A Unix socket's path: at most 108 bytes on Linux, 104 on macOS (sockaddr_un.sun_path, with its NUL).
+SOCKET_PATH_MAX = 104 if sys.platform == "darwin" else 108
+# What Chrome adds under TMPDIR for its SingletonSocket.
+CHROME_SOCKET_TAIL = "/.com.google.Chrome.XXXXXX/SingletonSocket"
+
+
+def short_tmp_root(name, base=None):
+    """Where a desk's temp folder goes: the system's temp folder, unless Chrome's SingletonSocket under it would not fit
+    a Unix socket path (macOS's TMPDIR is /var/folders/…/T/, long enough that it did not, 2026-10-27); then /tmp, which
+    every Unix has. The folder itself is made 0700 by mkdtemp either way."""
+    base = base or tempfile.gettempdir()
+    longest = len(os.path.join(base, "ov-%s-XXXXXXXX" % name)) + len(CHROME_SOCKET_TAIL)
+    if longest < SOCKET_PATH_MAX or not os.path.isdir("/tmp"):
+        return base
+    return "/tmp"
 
 
 class PrivateDesk:
@@ -382,7 +400,7 @@ class Desks:
         with self.mu:
             tmp = self.tmpdirs.get(name)
             if tmp is None or not os.path.isdir(tmp):
-                tmp = self.tmpdirs[name] = tempfile.mkdtemp(prefix="ov-%s-" % name)
+                tmp = self.tmpdirs[name] = tempfile.mkdtemp(prefix="ov-%s-" % name, dir=short_tmp_root(name))
         env["TMPDIR"] = tmp
         return env
 

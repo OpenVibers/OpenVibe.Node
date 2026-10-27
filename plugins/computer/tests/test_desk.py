@@ -279,6 +279,17 @@ class DeskPluginTest(unittest.TestCase):
         r = reply(self.out, self.cmd("desk", {"action": "stop"}))
         self.assertEqual(r["data"], {"running": False, "stopped": True, "desk": "private"})
 
+    def test_a_desk_temp_folder_fits_chromes_socket(self):
+        # macOS's TMPDIR (/var/folders/…/T/) left Chrome's SingletonSocket at 109 bytes, over the 104 a Unix socket
+        # path takes there (2026-10-27): a temp folder whose socket would not fit goes under /tmp instead.
+        from openvibe_computer.desk import CHROME_SOCKET_TAIL, SOCKET_PATH_MAX, short_tmp_root
+        mac = "/var/folders/8x/kq4w0qz12n59p3v2fdwm5hzr0000gn/T"
+        root = short_tmp_root("desk-a", base=mac)
+        fits = len(os.path.join(mac, "ov-desk-a-XXXXXXXX")) + len(CHROME_SOCKET_TAIL) < SOCKET_PATH_MAX
+        self.assertEqual(root, mac if fits else "/tmp")
+        self.assertEqual(short_tmp_root("desk-a", base="/tmp"), "/tmp")
+        self.assertEqual(short_tmp_root("desk-a", base="/var/tmp"), "/var/tmp", "a short one stays")
+
     def test_several_desks_each_with_its_own_display_temp_folder_and_browser(self):
         # Desks plan D1: two agents at once on one machine, each on a desk of its own.
         self.boot("trusted", max_desks=2)
@@ -300,8 +311,11 @@ class DeskPluginTest(unittest.TestCase):
         tmp_b = self.calls[-1][1]["TMPDIR"]
         self.assertNotEqual(tmp_a, tmp_b)
         self.assertTrue(os.path.isdir(tmp_a) and os.path.basename(tmp_a).startswith("ov-desk-a-"))
-        self.assertEqual(os.stat(tmp_a).st_mode & 0o777, 0o700)
-        self.assertLess(len(os.path.join(tmp_a, ".com.google.Chrome.XXXXXX", "SingletonSocket")), 108)
+        if os.name != "nt":   # POSIX permissions and Unix socket paths (Windows keeps them private by the profile's ACL)
+            self.assertEqual(os.stat(tmp_a).st_mode & 0o777, 0o700)
+            # Chrome's SingletonSocket fits a Unix socket path: 104 bytes on macOS, 108 on Linux.
+            from openvibe_computer.desk import SOCKET_PATH_MAX
+            self.assertLess(len(os.path.join(tmp_a, ".com.google.Chrome.XXXXXX", "SingletonSocket")), SOCKET_PATH_MAX)
         # list reports both; a desk that never started is not_ready; names are checked.
         listed = reply(self.out, self.cmd("desk", {"action": "list"}))["data"]
         self.assertEqual(([d["desk"] for d in listed["desks"]], listed["max_desks"]), (["desk-a", "desk-b"], 2))
@@ -478,7 +492,8 @@ class DeskPluginTest(unittest.TestCase):
         self.assertEqual(stop("desk-a")["profile_saved"], True)
         with open(os.path.join(os.path.dirname(kept), "ov-session-cookies.json")) as f:
             self.assertEqual(json.load(f)[0]["name"], "sid", "session cookies are kept beside the profile")
-        self.assertEqual(os.stat(os.path.join(os.path.dirname(kept), "ov-session-cookies.json")).st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(os.stat(os.path.join(os.path.dirname(kept), "ov-session-cookies.json")).st_mode & 0o777, 0o600)
         self.assertTrue(a.graceful, "closed so it writes its cookies down")
         with open(os.path.join(kept, "Cookies")) as f:
             self.assertEqual(f.read(), "one")
@@ -558,7 +573,8 @@ class DeskPluginTest(unittest.TestCase):
         self.assertIsNone(office.poll(), "still running")
         self.plugin.popen = fake
         reply(self.out, self.cmd("desk", {"action": "stop", "desk": "desk-a"}))
-        self.assertEqual(office.wait(timeout=5), -9, "ended with its desk")
+        # Killed with its desk: SIGKILL on Linux and macOS; on Windows TerminateProcess, exit code 1.
+        self.assertEqual(office.wait(timeout=5), 1 if os.name == "nt" else -9, "ended with its desk")
         # Never detached on the person's own session or a browser desk; a desk that does not run is not_ready.
         self.plugin.popen = real
         before = len(started)
