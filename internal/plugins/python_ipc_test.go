@@ -204,6 +204,7 @@ func TestPipeDelayNeverExtendsADeadline(t *testing.T) {
 func TestWriterQueueThenPipeDelay(t *testing.T) {
 	fx := startIPC(t, false, "IPC_DELAY_MS=200", "HOLD_MS=300")
 	ctx := context.Background()
+	held := mono.Now() // the plugin starts its 300 ms hold no earlier than this
 	hold := fx.p.Begin(ctx, "hold", "hold", nil, 3000)
 	filler, _ := json.Marshal(map[string]any{"text": strings.Repeat("x", 1<<20)})
 	fill := fx.p.Begin(ctx, "fill", "say", filler, 5000)
@@ -223,16 +224,19 @@ func TestWriterQueueThenPipeDelay(t *testing.T) {
 		DeadlineMS int `json:"deadline_ms"`
 	}
 	_ = json.Unmarshal(r.Data, &got)
-	// The pipe was held for 300 ms, then the line waited 200 ms more: at most 1000 ms of its 1500 can be left.
-	if got.DeadlineMS < 1 || got.DeadlineMS > 1000 {
-		t.Fatalf("combo was handled with deadline_ms %d; at most 1000 can be left", got.DeadlineMS)
+	// The pipe was held for 300 ms from when the plugin read "hold" (after held), then combo's line waited 200 ms more
+	// before the runtime got it (late was never written: its 250 ms ran out in the writer queue). So at most
+	// (queued + 1500 ms) − (held + 500 ms) can be left: about 1000 ms, plus the few ms between held and queued.
+	maxLeft := queued.Add(1500 * time.Millisecond).Sub(held.Add(500 * time.Millisecond))
+	if got.DeadlineMS < 1 || time.Duration(got.DeadlineMS)*time.Millisecond > maxLeft {
+		t.Fatalf("combo was handled with deadline_ms %d; at most %v can be left", got.DeadlineMS, maxLeft)
 	}
 	for _, id := range fx.handledIDs() {
 		if id == "late" {
 			t.Fatal("the expired command reached handle()")
 		}
 	}
-	t.Logf("%s: writer queue then pipe: late refused, combo handled with %d ms of its 1500", runtime.GOOS, got.DeadlineMS)
+	t.Logf("%s: writer queue then pipe: late refused, combo handled with %d ms of its 1500 (at most %v could be left)", runtime.GOOS, got.DeadlineMS, maxLeft)
 }
 
 // Test C: strict timing, when the shared clock is missing (on the core's side, or the runtime's read fails): timed
