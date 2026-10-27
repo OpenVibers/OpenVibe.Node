@@ -344,6 +344,7 @@ var Bundled = map[string]string{
 	"ros2":          "openvibe_ros2",
 	"computer":      "openvibe_computer",
 	"voice":         "openvibe_voice",
+	"ai":            "openvibe_ai",
 }
 
 // Default is the config written by `openvibe-node pair` when none exists: the dry-run plugin and its test pattern.

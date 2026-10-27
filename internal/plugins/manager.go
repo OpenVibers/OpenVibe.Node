@@ -25,6 +25,7 @@ var capabilityFor = map[string]string{
 	protocol.KindInput:        "input",
 	protocol.KindBrowser:      "browser",
 	protocol.KindDesk:         "desk",
+	protocol.KindAI:           "ai",
 }
 
 // deskKinds are the kinds a plugin's desks take too. A desk host (install.sh --desk-host) has no screen, mouse or

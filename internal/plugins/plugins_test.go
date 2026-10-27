@@ -70,6 +70,9 @@ func fakePlugin(logPath string, in io.Reader, out io.Writer) {
 			if mode == "deskhost" { // a desk host's computer plugin: desks and files, no screen or input of its own
 				caps = map[string]any{"desk": map[string]any{"screen": true, "input": true}, "files": map[string]any{}}
 			}
+			if mode == "aihost" { // the ai plugin: the person's own models
+				caps = map[string]any{"ai": map[string]any{"models": []string{"llama3.1:8b"}, "ready": true}}
+			}
 			w.Encode(map[string]any{"op": "describe", "driver": "fake", "version": "1", "capabilities": caps})
 			if m["probe"] == true {
 				continue
@@ -281,6 +284,20 @@ func TestRoutingOnADeskHost(t *testing.T) {
 	for _, kind := range []string{"exec", "browser", "drive"} {
 		if fx.m.Route(kind, "", "") != nil {
 			t.Fatalf("%s routed to a plugin that does not offer it", kind)
+		}
+	}
+}
+
+// Kind ai (contracts 0.219.0) reaches the plugin that offers "ai", and only it.
+func TestRoutingAIToTheModelPlugin(t *testing.T) {
+	fx := start(t, "aihost")
+	fx.waitState(StateReady)
+	if fx.m.Route("ai", "", "") == nil {
+		t.Fatal("ai not routed to the plugin that offers it")
+	}
+	for _, kind := range []string{"exec", "screen", "drive"} {
+		if fx.m.Route(kind, "", "") != nil {
+			t.Fatalf("%s routed to the ai plugin", kind)
 		}
 	}
 }
