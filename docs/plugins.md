@@ -47,7 +47,7 @@ describes itself and waits for EOF without opening any hardware.
 
 | op          | fields                                                        | the plugin must                                        |
 |-------------|---------------------------------------------------------------|--------------------------------------------------------|
-| `hello`     | `config` {…}, `probe` bool, `halt_epoch`? (the newest a halt carried, 0.17) | answer `describe`; then set up (unless probe) |
+| `hello`     | `config` {…}, `probe` bool, `halt_epoch`? (the newest a halt carried, 0.17), `shared_clock`? (`clock_monotonic`, `qpc`; 0.30), `strict_timing`? (0.30) | answer `describe`; then set up (unless probe) |
 | `command`   | `id`, `kind`, `value`, `deadline_ms`, `expires_at_mono_ns`? (0.18), `operator`?, `turn_epoch`?, `provenance`? | act, answer `ack` or `nack` with the same `id` |
 | `heartbeat` | `t` (core clock, ms)                                          | note the time                                          |
 | `stop`      | `cause` (0.17), `turn_epoch`? (a halt's)                      | stop every actuator; latch nothing                     |
@@ -60,9 +60,14 @@ describes itself and waits for EOF without opening any hardware.
 
 `value` has already been validated and clamped to the owner's limits by the core ([protocol.md](protocol.md#commands)).
 `deadline_ms` is relative to receipt and already capped. Since Node 0.18 the core counts it down to the moment it writes
-the line, and adds `expires_at_mono_ns`: the instant the command expires on `CLOCK_MONOTONIC`, the clock every process on
-the machine shares (absent on Windows). A plugin that reads that clock when the line arrives takes off the time the line
-sat in the pipe too (answer 8); the Python runtime does.
+the line, and adds `expires_at_mono_ns`: the instant the command expires on the clock every process on the machine
+shares, `CLOCK_MONOTONIC` on Linux and macOS and, since 0.30, the raw `QueryPerformanceCounter` on Windows. `hello` names
+that clock in `shared_clock` (`clock_monotonic` or `qpc`, 0.30). A plugin that reads it when the line arrives takes off
+the time the line sat in the pipe too (answers 8 and 9); the Python runtime does, on every OS.
+
+`hello` also carries `strict_timing: true` when the Node's plugin configuration sets it (0.30). A plugin under strict
+timing refuses (`timing_unavailable`) any motion command whose original expiry it cannot check on that clock, instead of
+running it on `deadline_ms` alone (answer 9).
 
 `operator` is who sent the command, as Bot's gate saw them: `{"subject": "usr_…", "role": "owner" | "operator" |
 "queue"}` (`queue` is the holder of a public robot's turn); it is absent when the core got none. Bot has already
@@ -286,8 +291,8 @@ Reviewed again by the same authors against v0.17.0 (2026-10-27, `632207f`), and 
        monotonic clock runs at the same rate.
 
      The correction assumes the plugin runs on the same machine as the core (the core starts it, over a pipe). It also
-     assumes both read the same clock id. On Windows there is no shared clock: `expires_at_mono_ns` is absent, and only
-     the core's queue time is counted, up to the write.
+     assumes both read the same clock id. In 0.18 Windows had no shared clock: `expires_at_mono_ns` was absent, and only
+     the core's queue time was counted, up to the write. 0.30 shares one there too (answer 9).
    - **The bound's rounding (confirmed, fixed).** 0.17 cut a round trip to whole microseconds before rounding up, so
      1,000,001 ns came out as 1 ms. Two more roundings were not counted at all:
      - Bot stamps `ts` in whole milliseconds, rounded down. A frame may have left up to 1 ms after its stamp, so the
@@ -339,11 +344,104 @@ Reviewed again by the same authors against v0.17.0 (2026-10-27, `632207f`), and 
    - **Versions.** The Python SDK package now carries the Node release (`openvibe_plugin.__version__`, `pyproject.toml`:
      0.18.0; it said 0.1.0 before). For an exact source, pin the commit, not the version.
 
+Reviewed by the same authors against v0.18.0 for Windows 10 (2026-10-27, `399ef83`), and changed in Node 0.30.0:
+
+9. **Windows: the original deadline across the pipe, and strict timing.**
+   - **The issue (confirmed, fixed).**
+     - In 0.18 `internal/plugins/mono_windows.go` had no clock to share, so on Windows a command carried `deadline_ms`
+       alone. The Python runtime counted it from when its reader got the line. A line that sat 200 ms in the pipe with
+       100 ms left could still reach `handle()` with 100 ms.
+     - The real-pipe test skipped itself there, so a green Windows job proved nothing about it.
+     - A second gap, found while fixing the first: the core measured its own side on Go's monotonic clock. On Windows
+       that is the interrupt time, which moves once per clock tick (15.625 ms unless a program raises the timer
+       resolution; Go no longer does, since it sleeps on high-resolution timers). The link's estimate of Bot's clock,
+       its round trips and a command's receipt could each read up to a tick off: a command could get up to about two
+       ticks more than its deadline allowed.
+   - **What we found about QueryPerformanceCounter (QPC).**
+     - QPC is one counter for the whole machine, counting from boot at a frequency fixed at boot. Every process reads
+       the same value, and a step of the wall clock does not move it (Microsoft, "Acquiring high-resolution time
+       stamps"). `QueryPerformanceCounter` and `QueryPerformanceFrequency` are documented never to fail on Windows XP
+       and later.
+     - Go's own clock is not QPC. Its monotonic reading on Windows is the interrupt time (the runtime's `nanotime1`
+       reads `KUSER_SHARED_DATA`), with its own epoch and a tick's resolution.
+     - Python's own clocks are not reliably QPC either. `time.monotonic()` is QPC only from Python 3.13; before that it
+       is `GetTickCount64` (milliseconds, a different epoch). `time.perf_counter()` reads QPC but does not document its
+       reference point.
+     - So neither side uses its language's clock. Both read the raw counter: Go through `kernel32.dll` from System32
+       (`golang.org/x/sys/windows`), Python through `ctypes.WinDLL("kernel32")`, each with the same frequency.
+     - Both convert with the same integer arithmetic: whole seconds and the remainder apart, rounded down, so it never
+       overflows: `ns = (ticks / f) × 10⁹ + (ticks mod f) × 10⁹ / f`. The values are identical in both processes, and
+       the same six vectors (up to a hundred years of uptime at 10 MHz) are checked in Go and in Python.
+   - **The fix: one precise clock, shared.**
+     - `internal/mono` is the clock the core measures every deadline on: `CLOCK_MONOTONIC` on Linux and macOS, the raw
+       QPC on Windows. It covers the link's estimate of Bot's clock, its round trips, a command's receipt, the instant
+       it expires, and the writer's check. On Windows the core no longer measures anything on the tick clock.
+     - The core fixes the instant a command expires when it arrives, as before, now on that clock. The writer sends
+       that instant unchanged as `expires_at_mono_ns` (0.18 re-derived it when writing), with `deadline_ms` the whole
+       milliseconds then left. It never writes a command with less than 1 ms left.
+     - `hello` names the clock: `shared_clock` is `qpc` on Windows and `clock_monotonic` elsewhere.
+     - The runtime compares `expires_at_mono_ns` only with a reading of the clock the core named. Another clock's
+       instant counts as absent: it is never compared, and never read as expired or as open. (A 0.18 to 0.29 core names
+       none; it sent the field only on Linux and macOS, on `CLOCK_MONOTONIC`, which the runtime reads there.)
+     - On arrival the runtime reads its own clock, then the shared one, so the time left can only come out short. It
+       refuses (`expired`) a motion command whose instant has passed, before `handle()`.
+     - Python's version does not matter: 3.9 to 3.13 read the same raw counter.
+   - **Strict timing: refuse instead of downgrading.**
+     - Asked for in any of three ways:
+       - by the plugin: `strict_timing = True` on the class;
+       - by the plugin's environment: `OPENVIBE_STRICT_TIMING=1`;
+       - by the Node's configuration: `"strict_timing": true` on the plugin, which `hello` passes on.
+     - Under strict timing, a motion command whose original expiry cannot be checked is refused with
+       `timing_unavailable`, before `handle()`. That covers:
+       - no shared clock in the runtime (a missing clock);
+       - a read that fails when the line arrives (a failed clock);
+       - a core that named a different clock;
+       - a line without `expires_at_mono_ns` (an older core, or one without the clock).
+     - The core holds the same line. A plugin configured strict, or one that describes `"timing": "strict"`, never gets
+       a motion command without its expiry: the core answers `timing_unavailable` and does not write it.
+     - A plugin that does not ask for it runs as before: without the clock, on `deadline_ms`.
+     - A restarted plugin starts over. Its new `hello` names the clock again, and the rule applies from its first line.
+   - **The tests, and where they run.**
+     - On Linux, macOS and Windows: CI runs `go test` on all three, and the Windows and macOS jobs have a verbose step
+       "deadlines across the pipe" whose log shows each of these ran there. Each starts a real Python 3.11 plugin
+       process over real OS pipes, and fails rather than skips when CI has no Python:
+       - `TestPythonRuntimeReadsTheCoresClock`: the runtime's reading of the shared clock lies between two of the
+         core's, so they read one clock across the two processes. The log prints the three readings.
+       - `TestHelloNamesTheSharedClock`.
+       - `TestPipeDelayNeverExtendsADeadline` (your A and B): the plugin waits 200 ms before reading each line. The
+         command with 100 ms is refused `expired` and never reaches `handle()`. The one with 1,000 ms reaches it with
+         at most 800.
+       - `TestWriterQueueThenPipeDelay` (D, writer queue then pipe): the plugin is held 300 ms behind a 1 MB line, then
+         reads with a 200 ms delay. The command with 250 ms is refused. The one with 1,500 ms gets at most 1,000.
+       - `TestStrictTimingRefusesWithoutTheClock` (C):
+         - the runtime's read fails: refused;
+         - the core has no clock: a strict plugin refuses, and a strict core does not send the line;
+         - a plugin that is not strict still runs.
+       - `TestPythonSDKSuiteOnThisOS`: the SDK's own `test_runtime` and `test_strict_timing` on that OS.
+       - `internal/mono`: the conversion vectors; that the clock is there, named right and monotonic; and that it
+         resolves well under a millisecond. Its log line counts Go's own clock in the same 5 ms, for comparison.
+     - In the Python suite (Python 3.9, 3.11, 3.12 and 3.13 on Linux, plus the runs above), `test_strict_timing` covers
+       D's boundaries:
+       - exactly at the deadline, 0.999999 ms left and past it: all expired;
+       - 1 ms left: handled with exactly 1;
+       - never more than `deadline_ms`;
+       - a missing, a failed and a mismatched clock;
+       - strict timing from `hello` and from the environment;
+       - a restart naming another clock.
+     - With the shared clock taken away, the 100 ms command reaches `handle()` with 99 ms, and the tests fail.
+   - **What it still assumes.**
+     - The plugin runs on the same machine, started by the Node.
+     - QPC is consistent across processes, as Windows documents.
+     - The host is not suspended mid-command. The link is lost on resume anyway, and that loss is not a promise of an
+       immediate physical stop.
+     - As before, the guarantee ends at the runtime's check. The time inside `handle()` and the driver's own write to
+       the hardware (BLE, for P7) are the driver's.
+
 ### Plugin → core
 
 | op          | fields                                                                                      |
 |-------------|---------------------------------------------------------------------------------------------|
-| `describe`  | `driver`, `version`, `protocol` (1), `capabilities` {…}, `motion_kinds` [kinds]             |
+| `describe`  | `driver`, `version`, `protocol` (1), `capabilities` {…}, `motion_kinds` [kinds], `timing`? (`strict`, 0.30: the core refuses motion it cannot stamp with `expires_at_mono_ns`) |
 | `ready`     | — setup finished, every actuator stopped                                                    |
 | `fault`     | `fault_code`, `message` — the plugin runs but cannot drive (commands get this code as nack); `ready` again when it can (the robot came back) ends the fault |
 | `ack`       | `id`                                                                                        |

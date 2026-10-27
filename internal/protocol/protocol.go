@@ -260,6 +260,9 @@ const (
 	FaultNotConnected  = "not_connected" // a bridge driver cannot reach its robot
 	FaultCliff         = "cliff"         // refused because the robot is at a cliff edge
 	FaultShuttingDown  = "shutting_down"
+	// Strict timing (0.30): the driver requires a motion command's original expiry on the clock it shares with the
+	// core, and there is none to carry it. Refused, never run on deadline_ms alone.
+	FaultTimingUnavailable = "timing_unavailable"
 )
 
 // DefaultDeadlineMS is used when a motion command carries no deadline.

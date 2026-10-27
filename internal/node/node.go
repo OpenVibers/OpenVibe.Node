@@ -29,6 +29,7 @@ import (
 	"github.com/OpenVibers/OpenVibe.Node/internal/credentials"
 	"github.com/OpenVibers/OpenVibe.Node/internal/link"
 	"github.com/OpenVibers/OpenVibe.Node/internal/localctl"
+	"github.com/OpenVibers/OpenVibe.Node/internal/mono"
 	"github.com/OpenVibers/OpenVibe.Node/internal/plugins"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 	"github.com/OpenVibers/OpenVibe.Node/internal/safety"
@@ -172,7 +173,7 @@ func New(opt Options) (*Node, error) {
 		if _, ok := cfg["frame_dir"]; !ok {
 			cfg["frame_dir"] = opt.Paths.FramesDir() + string(os.PathSeparator) + p.Name
 		}
-		specs = append(specs, plugins.Spec{Name: p.Name, Argv: opt.Config.PluginCommand(p, opt.Paths), Env: env, Dir: p.Dir, Config: cfg})
+		specs = append(specs, plugins.Spec{Name: p.Name, Argv: opt.Config.PluginCommand(p, opt.Paths), Env: env, Dir: p.Dir, Config: cfg, StrictTiming: p.StrictTiming})
 	}
 	n.mgr = plugins.NewManager(specs, opt.Log)
 
@@ -324,7 +325,7 @@ func (n *Node) Frame(f protocol.Frame) {
 	case protocol.Config:
 		n.applyConfig(m)
 	case protocol.Command:
-		n.command(m, f.TS, f.Seq, time.Now())
+		n.command(m, f.TS, f.Seq, mono.Now())
 	case protocol.Estop:
 		// latched:false is the owner's clear. It clears only the remote latch: a local (CLI or file) stop stays.
 		if m.Latched {
@@ -466,7 +467,7 @@ func (n *Node) voiceAnswer(a protocol.VoiceAnswer) {
 // arrives after its deadline is nacked and never reaches a plugin, and a plugin gets only the time that is left. What is
 // left becomes an instant on this machine (receipt + left): time the command then spends in the Node and in the queue
 // to the plugin counts against it, and the plugin is told the instant on the clock it shares with the Node (plugins.md).
-func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received time.Time) {
+func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received mono.Instant) {
 	if c.ID == "" {
 		n.log.Warn("command without id ignored", "kind", c.Kind)
 		return
@@ -504,7 +505,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 	if c.Kind == protocol.KindHalt {
 		n.noteHaltEpoch(c.RobotID, c.TurnEpoch)
 		n.mgr.HaltAll(c.TurnEpoch)
-		r := protocol.Ack{ID: c.ID, LatencyMS: time.Since(received).Milliseconds()}
+		r := protocol.Ack{ID: c.ID, LatencyMS: mono.Since(received).Milliseconds()}
 		n.dedup.Complete(entry, r)
 		n.send(r)
 		return
@@ -598,7 +599,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 		r := wait()
 		var msg protocol.Message
 		if r.OK {
-			msg = protocol.Ack{ID: c.ID, LatencyMS: time.Since(received).Milliseconds()}
+			msg = protocol.Ack{ID: c.ID, LatencyMS: mono.Since(received).Milliseconds()}
 		} else {
 			msg = protocol.Nack{ID: c.ID, FaultCode: r.FaultCode, Message: r.Message}
 		}
@@ -610,7 +611,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 // computer runs one exec, fs or screen command: no clamping, a long reply window (the server's deadline, at most
 // MaxComputerMS, else DefaultComputerMS), refused while the local stop or an e-stop is latched when it would change the
 // machine, and answered with the plugin's data. The plugin applies its owner's control level.
-func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, received time.Time, nack func(code, msg string)) {
+func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, received mono.Instant, nack func(code, msg string)) {
 	if len(c.Value) > protocol.MaxComputerValue {
 		nack(protocol.FaultBadValue, fmt.Sprintf("the value is larger than %d KB", protocol.MaxComputerValue/1024))
 		return
@@ -670,7 +671,7 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 		case r.OK && len(r.Data) > protocol.MaxAckData:
 			msg = protocol.Nack{ID: c.ID, FaultCode: protocol.FaultBadValue, Message: fmt.Sprintf("the answer is larger than %d KB", protocol.MaxAckData/1024)}
 		case r.OK:
-			msg = protocol.AckData{ID: c.ID, LatencyMS: time.Since(received).Milliseconds(), Data: r.Data}
+			msg = protocol.AckData{ID: c.ID, LatencyMS: mono.Since(received).Milliseconds(), Data: r.Data}
 		default:
 			msg = protocol.Nack{ID: c.ID, FaultCode: r.FaultCode, Message: r.Message}
 		}
@@ -709,7 +710,7 @@ func (n *Node) haltEpoch(robotID string) int64 {
 // nanoseconds, so no rounding can add time: left is exact, and unc, the bound reported in ms, is rounded up from
 // nanoseconds (Maticus, 2026-10-27: 1,000,001 ns is 2 ms). synced is false while no round trip has been measured on the
 // connection (left then counts from the bare estimate). Without a link (local commands) it is synced with no uncertainty.
-func (n *Node) timeLeft(deadlineMS, sentMS int64, received time.Time) (left time.Duration, unc int64, synced bool) {
+func (n *Node) timeLeft(deadlineMS, sentMS int64, received mono.Instant) (left time.Duration, unc int64, synced bool) {
 	end := deadlineMS * int64(time.Millisecond)
 	now := n.serverNow(sentMS, received)
 	if n.link == nil {
@@ -736,8 +737,8 @@ func latchReason(st safety.LatchState) string {
 }
 
 // serverNow is the server's clock (epoch ns) when a frame stamped sentMS was received: the link's estimate, else the
-// frame's own ts.
-func (n *Node) serverNow(sentMS int64, received time.Time) int64 {
+// frame's own ts, else the wall clock now (later than the receipt, so never more time).
+func (n *Node) serverNow(sentMS int64, received mono.Instant) int64 {
 	if n.link != nil {
 		if ns, ok := n.link.ServerNow(received); ok {
 			return ns
@@ -746,7 +747,7 @@ func (n *Node) serverNow(sentMS int64, received time.Time) int64 {
 	if sentMS > 0 {
 		return sentMS * int64(time.Millisecond)
 	}
-	return received.UnixNano()
+	return time.Now().UnixNano()
 }
 
 func (n *Node) send(m protocol.Message) {

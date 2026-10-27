@@ -47,6 +47,11 @@ held control every 150 ms). With the Python runtime (`openvibe_plugin`, [plugins
 `motion_kinds = {"drive"}`, and it enforces the deadline, the 1 s heartbeat, stdin closing, `stop`, `estop` and
 `halt` for you.
 
+The deadline is the original one on every OS, Windows included (Node 0.30): the Node passes the instant a command
+expires on the clock it shares with the driver, so time the line spends in the pipe counts against it. For live motion,
+also set `strict_timing = True` on the plugin (or `"strict_timing": true` on it in `config.json`): a command whose
+original expiry cannot be checked is then refused, never run on `deadline_ms` alone ([plugins.md](plugins.md), answer 9).
+
 The driver should send telemetry with `battery` (`{"percent": 0..100}` or `{"volts": …}`) about twice a second.
 
 ## Stopping
@@ -87,7 +92,7 @@ openvibe-node install --user-session --home "%OVHOME%"
   "server": "https://openvibe.bot",
   "device_kind": "bridge",
   "python": "C:\\Users\\you\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
-  "plugins": [{"name": "looi"}],
+  "plugins": [{"name": "looi", "strict_timing": true}],
   "video": {"source": "off"}
 }
 ```
