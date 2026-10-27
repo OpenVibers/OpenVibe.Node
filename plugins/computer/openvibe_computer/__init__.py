@@ -33,7 +33,9 @@ Command kinds and their answers (the ack's ``data``):
   ``height`` (the ``screen`` answer) and are scaled to the real screen. An acting command: refused at observe, approved
   one by one at ask. xdotool on X11, cliclick on macOS (no scroll there); none on Wayland yet. Config
   ``allow_input: false`` turns it off.
-* ``browser`` ``{"action", "url"?, "selector"?, "text"?, "key"?, "max_width"?}``: a Chromium the agent drives, in a profile
+* ``browser`` ``{"action", "url"?, "selector"?, "text"?, "key"?, "max_width"?}`` (every connection it makes, a page's own
+  scripts included, goes through the egress guard, ``egress.py``: never the machine's own network below level full): a
+  Chromium the agent drives, in a profile
   of its own (``browser_profile``), over a pipe (no port is opened). ``open`` a ``http(s)`` URL, ``click`` a CSS
   ``selector`` or the button or link whose ``text`` it shows, ``fill`` a field (``selector`` and ``text``), ``press`` a
   ``key`` (Enter, Tab, Escape, arrows …), ``back`` → ``{url, title, text, truncated, links}``; ``read`` the page the same
@@ -90,6 +92,7 @@ from openvibe_plugin import Deferred, Fault, Plugin
 
 from .browser import KEY_CODES, Browser, BrowserError, find_binary
 from .desk import MAX_DESKS_CAP, BrowserDesk, Desks, PrivateDesk, default_max_desks
+from .egress import EgressProxy, not_public
 
 LEVELS = ("observe", "ask", "trusted", "full")
 RANK = {name: i for i, name in enumerate(LEVELS)}
@@ -177,7 +180,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.12.1"
+    version = "0.13.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -219,7 +222,11 @@ class Computer(Plugin):
         self.stream_mu = threading.Lock()
         self.browser_mu = threading.Lock()
         self.browser_op_mu = threading.Lock()
-        self.browser_factory = browser_factory or (lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env))
+        self.browser_factory = browser_factory or (lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env, extra_args=self._browser_args()))
+        # Every agent browser's connections go through the egress guard (Node v0.25.0): a page's own scripts never reach
+        # the machine's own network below level full (config browser_egress: "open" turns it off).
+        self.browser_egress = "public"
+        self.egress = EgressProxy(blocked=self._egress_blocked, log=lambda *a: self.log(*a))
         self.desk_factory = desk_factory or (lambda: PrivateDesk(which=which, popen=popen))
         self.desk = desk or self.desk_factory()   # the desk named private (the first one, as before v0.9.0)
         self.desks = Desks(self.desk_factory, private=self.desk, max_desks=default_max_desks(),
@@ -266,6 +273,10 @@ class Computer(Plugin):
         self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
         self.browser_headless = config.get("browser_headless", True) is not False
         self.browser_idle_s = _int(config.get("browser_idle_s"), "browser_idle_s", 60, 86400, 600)
+        egress = str(config.get("browser_egress") or "public").strip().lower()
+        if egress not in ("public", "open"):
+            raise Fault("bad_value", "browser_egress is public (the default: never the machine's own network below level full) or open")
+        self.browser_egress = egress
 
     def describe(self, config):
         try:
@@ -286,7 +297,8 @@ class Computer(Plugin):
             caps["input"] = {"level": self.level, "tool": itool, "scroll": itool == "xdotool"}
         binary = self._browser_binary()
         if binary:
-            caps["browser"] = {"level": self.level, "browser": os.path.basename(binary), "headless": self.browser_headless}
+            caps["browser"] = {"level": self.level, "browser": os.path.basename(binary), "headless": self.browser_headless,
+                               "egress": self.browser_egress}
         kinds = self._desk_kinds()
         if kinds:
             # A browser desk's screen and input are its page's own (the browser's pipe); a whole desk's need X tools.
@@ -661,6 +673,18 @@ class Computer(Plugin):
             return False
         finally:
             shutil.rmtree(own, ignore_errors=True)   # a copy for one run of the desk
+            self._drop_empty_desk_dir(desk)
+
+    def _drop_empty_desk_dir(self, desk):
+        """A desk for one task leaves no empty folders behind (its downloads folder, then its own); a download stays."""
+        if not self.desks.base_dir:
+            return
+        base = os.path.join(self.desks.base_dir, desk)
+        for path in (os.path.join(base, "downloads"), base):
+            try:
+                os.rmdir(path)   # only when empty
+            except OSError:
+                return
 
     def _drop_desk_profiles(self):
         """The kill switch: nothing is saved, and the desks' own copies go."""
@@ -1131,6 +1155,16 @@ class Computer(Plugin):
         if not self.allow_browser or self.platform.startswith("win"):
             return None
         return find_binary(self.which, self.platform, self.browser_path)
+
+    def _egress_blocked(self, ip, port):
+        """Whether the egress guard refuses a connection: an address that is not on the public internet (the machine's
+        own network, loopback, link-local, ...), below level full; nothing when browser_egress is open."""
+        if self.browser_egress == "open" or self.effective_level() == "full":
+            return False
+        return not_public(ip)
+
+    def _browser_args(self):
+        return [] if self.browser_egress == "open" else self.egress.args()
 
     def _close_browser(self):
         # Never waits for an action in flight: closing kills the process, and the action fails at once.

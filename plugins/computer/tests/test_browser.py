@@ -95,7 +95,7 @@ class BrowserKindTest(unittest.TestCase):
 
     def test_described_with_its_level(self):
         caps = self.boot("ask")[0]["capabilities"]
-        self.assertEqual(caps["browser"], {"level": "ask", "browser": "chromium", "headless": True})
+        self.assertEqual(caps["browser"], {"level": "ask", "browser": "chromium", "headless": True, "egress": "public"})
         caps = self.boot("ask", allow_browser=False)[0]["capabilities"]
         self.assertNotIn("browser", caps)
 

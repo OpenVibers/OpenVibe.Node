@@ -121,6 +121,16 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 - **No port.** The Node starts it on the first command with `--remote-debugging-pipe`: it speaks the DevTools protocol over two file descriptors, so nothing else on the machine can drive it.
 - **Levels.** `read`, `screenshot` and `close` run at every level. `open`, `click`, `fill`, `press` and `back` are acting commands: refused at `observe`, approved one by one at `ask`. The approval says exactly what would happen: "open https://… in the browser", "type 5 characters into #q in the browser: 'hello'".
 - **Your own network.** Below level `full`, `open` refuses an address on the machine's own network (private, loopback or link-local, checked for every address the name resolves to).
+- **The egress guard** (Node v0.25.0). A page the agent opened could still reach your network with its own scripts: a
+  `fetch`, an image, a WebSocket or a redirect to your router, a printer or another computer at home. So every
+  connection every agent browser makes (on your screen and on every desk) goes through a small proxy the plugin runs on
+  `127.0.0.1`.
+  - **Checked.** Each address is resolved and checked. A name with any address that is not on the public internet is
+    refused below level `full`.
+  - **Connected to what was checked.** The connection goes to the exact address that was checked, so a name cannot
+    pass the check with one address and connect to another.
+  - **Nothing around it.** Loopback goes through the guard too, WebRTC sends no UDP around it, and QUIC is off.
+  - `browser_egress: "open"` turns the guard off, for a machine whose agent must reach a local service.
 - **Elements and receipts** (Node v0.21.0, the Desks plan's step D3). `open` and `read` list the page's interactive
   elements, one compact line each: `e7 button "Sign in"`, `e8 textbox "Email" (email)`, `e9 checkbox "Remember me"
   checked`. That is at most 120 visible links, buttons, fields, boxes and menus, named by their label, text or
@@ -254,6 +264,7 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
 | `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |
 | `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |
 | `browser_profile`    | `~/.local/share/openvibe-node/browser` | its profile folder: the agent's own, unless you choose another |
+| `browser_egress`     | `public`       | `public`: every agent browser goes through the egress guard (never your own network below level `full`); `open`: no guard |
 | `browser_headless`   | `true`         | `false`: show its window |
 | `browser_idle_s`     | 600            | close it after this long without a command |
 
