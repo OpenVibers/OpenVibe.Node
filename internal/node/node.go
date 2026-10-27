@@ -653,8 +653,6 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 	}()
 }
 
-// serverNow is the server's clock when a frame stamped sentMS was received: the link's estimate, else the frame's
-// own ts.
 // noteHaltEpoch records a halt's turn_epoch for its robot (the newest wins); haltEpoch reads it (0: none seen).
 func (n *Node) noteHaltEpoch(robotID string, epoch int64) {
 	if epoch <= 0 {
@@ -676,6 +674,8 @@ func (n *Node) haltEpoch(robotID string) int64 {
 	return n.haltEpochs[robotID]
 }
 
+// serverNow is the server's clock when a frame stamped sentMS was received: the link's estimate, else the frame's
+// own ts.
 func (n *Node) serverNow(sentMS int64, received time.Time) int64 {
 	if n.link != nil {
 		if ms, ok := n.link.ServerNow(received); ok {

@@ -120,6 +120,75 @@ So a driver needs no growing replay cache. Refuse a command if any of these is t
 The runtime does all three. A driver that wants more can also refuse an `issued_at_ms` older than the newest it has
 handled by more than `max_command_ms`.
 
+#### Deadlines, turns and stops: the platform's answers
+
+Asked by the Generic LOOI driver's authors (2026-10-27). Each answer is what Bot (`server/realtime.js`,
+`server/domain`), this core (`internal/node`, `internal/plugins`) and the Python runtime do:
+
+1. **Where a deadline comes from.** Bot's control gate sets it when it decides a command:
+   - The deadline is Bot's clock now plus the robot's `max_command_ms`: 300 ms unless the owner set less.
+   - An operator may ask for less with `ms`, never more.
+   - Only `drive`, `actuator`, `ptz` and a held button's `down` get one.
+   - The command is sent in the same step. Its id (`cmd_<ULID>`) and `issued_at_ms` are minted then, after the gate's
+     last await.
+   - The core turns the absolute instant into what is left of it. It compares the instant with its estimate of Bot's
+     clock, which is the local monotonic clock plus the largest `ts − arrival` seen on the connection. So time a frame
+     spent queued on the way counts as lateness, and a delayed run of frames can never make a deadline look open again.
+   - It caps what is left at the robot's `max_command_ms`.
+   - The plugin gets that remainder as `deadline_ms`, and `expires_at_ms` in `provenance` unchanged.
+   - Neither a viewer nor Live can choose a later deadline.
+2. **Nothing re-stamps a command.**
+   - Bot sends each device command once and never again, under any id. One with no answer by its deadline plus 1.5 s
+     is recorded `expired` and dropped.
+   - The core passes `provenance` through unchanged.
+   - An operator who repeats their own id gets the first result, and no second command reaches the robot.
+   - A retry under a new id, or a held control re-sent every 150 ms, is a **new** command. It passes the gate again at
+     that moment: whose turn it is, the epoch, the e-stop and the limits. Its id, `seq`, `issued_at_ms`, deadline and
+     `turn_epoch` are all new.
+   - So a stamp is always a fresh decision, never an old command made current.
+3. **Order across a change of driver.** A queue turn can end, its holder can leave, or the owner can take it over. Then:
+   - Bot ends the turn, moves the robot's epoch and sends its `halt` in one synchronous step.
+   - A command decided under the old turn but not yet sent is refused (`bot.not_your_turn`). There is no await between
+     that check and the send.
+   - On the one device connection, everything from turn N therefore precedes N's halt. The halt carries the new epoch,
+     and every later command carries it or a newer one.
+   - The core and the runtime refuse an older epoch after a halt (`expired`).
+   - On a takeover, the halt goes first and the owner's command follows with the new epoch.
+   - A waiting viewer who leaves causes no halt.
+   - Owners and operators of a robot without a queue have no turns. Their commands reach the driver in the order Bot
+     sent them, and the newest wins.
+   - Acks may come back in any order. Commands never reach a plugin out of order.
+4. **`stop` versus `estop`.**
+   - `stop` stops every actuator **now and latches nothing**. The next valid command moves the robot again. It comes
+     from:
+     - a `halt` (a change of driver, with its `turn_epoch`, or an operator's halt);
+     - the link to Bot dropping;
+     - the core shutting down (then stdin closes);
+     - `openvibe-node quit`;
+     - a plugin missing its reply window.
+   - `estop` stops every actuator **and latches**. The core refuses `drive`, `ptz` and `actuator` itself (`estopped`,
+     `local_stop`), and so does the runtime, until `resume`. The latch:
+     - is set by Bot's e-stop (an owner or operator presses it), by `openvibe-node stop`, or by a driver's `local_stop`;
+     - is written to disk, survives a Node restart, and is sent again at once to a plugin that restarts;
+     - is reapplied from Bot's config on every reconnect.
+   - Only the owner clears Bot's e-stop. A local stop is cleared only by `openvibe-node resume` on the machine.
+   - A `halt` still passes while latched.
+   - The driver's own stops (a motion deadline passing, a second without a heartbeat, stdin closing) are `stop`s.
+     Heartbeat loss also refuses motion until heartbeats return.
+5. **No command is held past its validity.**
+   - Bot never queues: an offline device is refused (`bot.device_offline`), and nothing is replayed after a reconnect.
+   - The core decides at arrival:
+     - it refuses a command whose deadline has passed;
+     - it refuses a plugin that is down or not ready at once (`plugin_down`, `not_ready`) rather than holding the command;
+     - it hands the rest straight to the plugin's stdin. A plugin that stops reading is killed, so no line waits there.
+   - A plugin that does not answer within max(deadline, 1 s) is told to `stop`, and the command fails with
+     `plugin_timeout`.
+   - The Python runtime counts each deadline from the moment its line arrived. It refuses (`expired`) a motion command
+     whose deadline passed while it waited behind a slow handler, so the driver never sees it. Before Node 0.16.1 such a
+     command still reached `handle` and was stopped on the next tick.
+   - A driver without the runtime should do the same: note the time each line is read (on a reader thread) and refuse
+     motion that is already past its `deadline_ms` when its turn comes.
+
 ### Plugin → core
 
 | op          | fields                                                                                      |
@@ -151,7 +220,8 @@ installed, otherwise with its built-in encoder at up to 5 frames per second. The
 A plugin must stop every actuator itself — the core dying must never leave motors running:
 
 - when its **stdin closes** (EOF), then exit;
-- when a **motion command's deadline passes** without a newer command (`deadline_ms` after receipt);
+- when a **motion command's deadline passes** without a newer command (`deadline_ms` after receipt), and refuse one
+  whose deadline passed before its turn to run (`expired`);
 - when it has **not heard a heartbeat for 1 s** (and refuse motion with `no_heartbeat` until heartbeats return);
 - on `stop`, `estop` and a `halt` command;
 - when its own sensors say so (Cozmo: cliff, pick-up).
