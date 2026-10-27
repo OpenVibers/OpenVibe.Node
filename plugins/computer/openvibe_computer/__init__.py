@@ -16,8 +16,12 @@ and deny what waits; the core refuses acting commands while either is latched to
 
 Command kinds and their answers (the ack's ``data``):
 
-* ``exec`` ``{"argv": [...], "cwd"?, "timeout_s"?, "stdin"?}`` → ``{exit_code, stdout, stderr, truncated, timed_out,
-  duration_ms}``. A program and its arguments, never a shell line; output is cut at ``max_output_bytes``.
+* ``exec`` ``{"argv": [...], "cwd"?, "timeout_s"?, "stdin"?, "desk"?, "detach"?}`` → ``{exit_code, stdout, stderr,
+  truncated, timed_out, duration_ms}``. A program and its arguments, never a shell line; output is cut at
+  ``max_output_bytes``. ``desk`` (Node v0.26) runs it in that desk's session (its display, bus and temp folder), so a
+  program with windows opens on the desk. ``detach`` (a whole desk only) starts a program that keeps running (an office
+  suite, a terminal) and answers at once ``{started, pid, desk}``; it is ended when its desk stops (at most
+  MAX_DESK_PROGRAMS per desk).
 * ``fs`` ``{"op": "list"|"stat"|"read"|"write"|"mkdir", "path", …}``: ``read`` takes ``offset``/``length`` and answers
   ``content_b64``; ``write`` takes ``content_b64`` and ``mode`` (``create``, ``overwrite`` or ``append``).
 * ``screen`` ``{"max_width"?}`` → ``{format, width, height, content_b64}`` (JPEG through Pillow when it is installed).
@@ -120,6 +124,7 @@ INPUT_ACTIONS = frozenset({"move", "click", "double_click", "right_click", "scro
 BROWSER_READS = frozenset({"read", "screenshot", "close"})
 BROWSER_ACTS = frozenset({"open", "click", "fill", "press", "back"})
 MAX_URL = 2048
+MAX_DESK_PROGRAMS = 16
 PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 SESSION_COOKIES = "ov-session-cookies.json"   # in a kept profile: the cookies that end with the browser
 # What a kept profile leaves out: caches, crash reports, locks and the last session's tabs (a desk opens on a blank page).
@@ -180,7 +185,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.13.0"
+    version = "0.14.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -238,6 +243,7 @@ class Computer(Plugin):
         self.desk_restored = set() # desks whose browser started from their kept profile (so it is saved back on stop)
         self.profile_locks = {}    # profile name -> one copy in or out at a time
         self.desk_profile_max_mb = 256
+        self.desk_programs = {}    # desk name -> programs started there with detach, ended with the desk
         self.desk_idle_s = 900
         self.browser_locks = {}    # "main" or a desk name -> one action at a time in that browser
         self.resolve = resolve or (lambda host: [ai[4][0] for ai in socket.getaddrinfo(host, None)])
@@ -285,7 +291,8 @@ class Computer(Plugin):
             return {}
         caps = {"files": {"level": self.level, "roots": self.roots, "max_read_bytes": self.max_read}}
         if self.allow_exec:
-            caps["terminal"] = {"level": self.level, "timeout_s": self.timeout_s, "max_output_bytes": self.max_output}
+            caps["terminal"] = {"level": self.level, "timeout_s": self.timeout_s, "max_output_bytes": self.max_output,
+                                "desks": bool(self._desk_kinds())}   # exec takes desk and detach (Node v0.26.0)
         tool = self._screen_tool()
         if tool:
             caps["screen"] = {"level": self.level, "tool": tool[0],
@@ -343,6 +350,7 @@ class Computer(Plugin):
         self._close_browser()
         self._end_stream("stopped on the machine")
         self._close_desk_browsers()
+        self._end_desk_programs()
         self.desks.stop_all()
         self._drop_desk_profiles()
         for cid in waiting:
@@ -369,6 +377,7 @@ class Computer(Plugin):
         for name in self.desks.running_names():
             if now - self.desk_used.get(name, now) > self.desk_idle_s:
                 self._end_desk_browser(name)
+                self._end_desk_programs(name)
                 self.desks.stop(name)
                 self.desk_used.pop(name, None)
                 self.emit_event("desk_idle_stopped", desk=name, idle_s=self.desk_idle_s)
@@ -529,6 +538,7 @@ class Computer(Plugin):
 
         def stop():
             saved = self._end_desk_browser(name)
+            self._end_desk_programs(name)
             out = self.desks.stop(name)
             return dict(out, profile_saved=saved) if saved is not None else out
         return self._act(cmd, level, stop, "stop %s (and close what runs on it)" % what, threaded=False)
@@ -905,20 +915,63 @@ class Computer(Plugin):
             raise Fault("bad_value", "stdin is a string of at most 64 KB")
         timeout = _int(v.get("timeout_s"), "timeout_s", 1, self.timeout_s, self.timeout_s)
         deadline = cmd.deadline
+        desk = v.get("desk", "main")
+        detach = v.get("detach", False)
+        if not isinstance(detach, bool):
+            raise Fault("bad_value", "detach is true or false")
+        env = None
+        if desk != "main":
+            env = self._desk_env(v)   # checks the name and that the desk runs
+            self.desk_used[desk] = self.clock()
+        if detach:
+            if desk == "main":
+                raise Fault("not_allowed", "detach is for a desk only: a program left running on your own session is never started")
+            if self.desks.kind(desk) == "browser":
+                raise Fault("unsupported", "a browser desk has no screen for a program's windows: start a whole desk (kind desktop)")
+            if stdin is not None:
+                raise Fault("bad_value", "a detached program takes no stdin")
+            where = "the private desk" if desk == "private" else "desk %s" % desk
+            return (lambda: self._start_on_desk(argv, cwd, env, desk),
+                    "start %s on %s (it keeps running until the desk stops)" % (shlex.join(argv)[:300], where))
 
         def run():
             left = deadline - self.clock() - 1.0
             if left < 1:
                 raise Fault("expired", "no time was left to run it")
-            return self._exec(argv, cwd, stdin, min(timeout, left))
+            return self._exec(argv, cwd, stdin, min(timeout, left), env=env)
 
-        return run, "run %s in %s" % (shlex.join(argv)[:300], cwd)
+        where = "" if desk == "main" else (" on the private desk" if desk == "private" else " on desk %s" % desk)
+        return run, "run %s in %s%s" % (shlex.join(argv)[:300], cwd, where)
 
-    def _exec(self, argv, cwd, stdin, timeout):
+    def _start_on_desk(self, argv, cwd, env, desk):
+        """A program that keeps running on a desk (its windows there), ended when the desk stops."""
+        running = [p for p in self.desk_programs.get(desk, []) if p.poll() is None]
+        if len(running) >= MAX_DESK_PROGRAMS:
+            raise Fault("not_ready", "%d programs already run on this desk: stop the desk, or close one there" % len(running))
+        try:
+            proc = self.popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, start_new_session=True)
+        except FileNotFoundError:
+            raise Fault("bad_value", "no program %s on this machine" % argv[0])
+        except PermissionError:
+            raise Fault("not_allowed", "%s may not be run by the Node's account" % argv[0])
+        self.desk_programs[desk] = running + [proc]
+        return {"started": True, "pid": proc.pid, "desk": desk}
+
+    def _end_desk_programs(self, desk=None):
+        """End what was started on a desk with detach (every desk's, without a name), each by its own handle."""
+        names = [desk] if desk else list(self.desk_programs)
+        for name in names:
+            for proc in self.desk_programs.pop(name, []):
+                if proc.poll() is None:
+                    self._kill(proc)
+
+    def _exec(self, argv, cwd, stdin, timeout, env=None):
         started = self.clock()
         try:
             proc = self.popen(argv, cwd=cwd, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                              **({"env": env} if env else {}))
         except FileNotFoundError:
             raise Fault("bad_value", "no program %s on this machine" % argv[0])
         except PermissionError:
