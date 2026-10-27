@@ -279,6 +279,7 @@ class DeskPluginTest(unittest.TestCase):
         r = reply(self.out, self.cmd("desk", {"action": "stop"}))
         self.assertEqual(r["data"], {"running": False, "stopped": True, "desk": "private"})
 
+    @unittest.skipIf(os.name == "nt", "Unix socket paths: desks run on Linux and macOS")
     def test_a_desk_temp_folder_fits_chromes_socket(self):
         # macOS's TMPDIR (/var/folders/…/T/) left Chrome's SingletonSocket at 109 bytes, over the 104 a Unix socket
         # path takes there (2026-10-27): a temp folder whose socket would not fit goes under /tmp instead.
@@ -500,7 +501,8 @@ class DeskPluginTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(kept, "Cache")), "caches are never kept")
         self.assertFalse(os.path.exists(a.profile), "the desk's own copy is removed")
         self.assertFalse(os.path.exists(os.path.join(self.desk_dir, "desk-a")), "and its empty folders")
-        self.assertEqual(os.stat(os.path.dirname(kept)).st_mode & 0o777, 0o700)
+        if os.name != "nt":
+            self.assertEqual(os.stat(os.path.dirname(kept)).st_mode & 0o777, 0o700)
         # Two desks at once start from the same kept profile; the last to stop wins.
         start("desk-b", profile="agent")
         start("desk-c", profile="agent")
@@ -590,7 +592,7 @@ class DeskPluginTest(unittest.TestCase):
         term = started[-1]
         self.plugin.popen = fake
         self.plugin.stop()
-        self.assertEqual(term.wait(timeout=5), -9)
+        self.assertEqual(term.wait(timeout=5), 1 if os.name == "nt" else -9)
         self.assertTrue(self.plugin.describe({"level": "trusted"})["terminal"]["desks"])
 
     def test_the_kill_switch_stops_the_desk(self):
