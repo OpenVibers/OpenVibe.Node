@@ -405,8 +405,12 @@ func TestProvenanceReachesPlugin(t *testing.T) {
 	if pa.IssuedAtMS <= 0 || pa.ExpiresAtMS != pa.IssuedAtMS+300 {
 		t.Fatalf("times: %+v", pa)
 	}
+	if pa.ClockUncertaintyMS == nil || *pa.ClockUncertaintyMS < 0 || *pa.ClockUncertaintyMS > protocol.MaxClockUncertaintyMS {
+		t.Fatalf("clock uncertainty: %+v", pa)
+	}
 	e.conn.Close()
 	e.conn = e.nextConn()
+	e.waitSynced()
 	if err := e.conn.Command(protocol.Command{ID: "p3", Kind: protocol.KindDrive, Value: drive}, 300); err != nil {
 		t.Fatal(err)
 	}
@@ -415,5 +419,45 @@ func TestProvenanceReachesPlugin(t *testing.T) {
 	}
 	if c := e.commandRecords("p3"); len(c) != 1 || c[0].Provenance == nil || c[0].Provenance.Session == pa.Session {
 		t.Fatalf("a new connection, a new session: %+v", c)
+	}
+}
+
+// Motion is timed only on a bounded clock (Maticus, 2026-10-27): before the connection's first measured round trip a
+// drive with a deadline is refused as not_ready and never reaches the plugin; once one is measured, the same drive runs,
+// with the bound in its provenance, and its window is the deadline less that bound.
+func TestMotionWaitsForABoundedClock(t *testing.T) {
+	e := startWith(t, func(s *fakebot.Server) { s.HoldHeartbeatAcks = true }, true)
+	drive := json.RawMessage(`{"throttle":0.3}`)
+	if err := e.conn.Command(protocol.Command{ID: "unsynced", Kind: protocol.KindDrive, Value: drive}, 300); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.conn.Reply("unsynced", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := r.(protocol.Nack); !ok || n.FaultCode != protocol.FaultNotReady || !strings.Contains(n.Message, "not synchronized") {
+		t.Fatalf("before a round trip: %+v", r)
+	}
+	if got := e.commandRecords("unsynced"); len(got) != 0 {
+		t.Fatalf("an unsynchronized drive reached the plugin: %+v", got)
+	}
+	// A say is not motion: it is not held for the clock.
+	if r := e.cmdID("say-unsynced", protocol.KindSay, `{"text":"hi"}`, 300); !isAck(r) {
+		t.Fatalf("say before a round trip: %+v", r)
+	}
+	e.conn.SetAutoAck(true)
+	e.waitSynced()
+	if err := e.conn.Command(protocol.Command{ID: "synced", Kind: protocol.KindDrive, Value: drive}, 300); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := e.conn.Reply("synced", 5*time.Second); err != nil || !isAck(r) {
+		t.Fatalf("after a round trip: %+v %v", r, err)
+	}
+	got := e.commandRecords("synced")
+	if len(got) != 1 || got[0].Provenance == nil || got[0].Provenance.ClockUncertaintyMS == nil {
+		t.Fatalf("records: %+v", got)
+	}
+	if unc := *got[0].Provenance.ClockUncertaintyMS; got[0].DeadlineMS > 300-int(unc) {
+		t.Fatalf("the window %d ms ignores the clock bound %d ms", got[0].DeadlineMS, unc)
 	}
 }

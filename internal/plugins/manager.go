@@ -70,10 +70,10 @@ func (m *Manager) Get(name string) *Plugin {
 	return nil
 }
 
-// StopAll tells every plugin to stop every actuator.
-func (m *Manager) StopAll() {
+// StopAll tells every plugin to stop every actuator, saying why (StopLinkLost, StopShutdown).
+func (m *Manager) StopAll(cause string) {
 	for _, p := range m.plugins {
-		p.Stop()
+		p.Stop(cause)
 	}
 }
 
@@ -84,9 +84,10 @@ func (m *Manager) HaltAll(turnEpoch int64) {
 	}
 }
 
-func (m *Manager) EstopAll() {
+// EstopAll latches every plugin's e-stop, saying why (EstopRemote, EstopLocal, EstopDriver, EstopLatched).
+func (m *Manager) EstopAll(cause, reason string) {
 	for _, p := range m.plugins {
-		p.Estop()
+		p.Estop(cause, reason)
 	}
 }
 

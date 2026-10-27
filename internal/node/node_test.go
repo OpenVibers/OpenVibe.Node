@@ -44,6 +44,10 @@ type env struct {
 	paths  config.Paths
 	cancel context.CancelFunc
 	done   chan struct{}
+	// holdAcks: the fake Bot leaves heartbeats unanswered (no measured round trip); connAt: when the current
+	// connection began (nextConn), so waitSynced only counts a round trip measured on it.
+	holdAcks bool
+	connAt   time.Time
 }
 
 // start pairs a Node running the real Python dry-run plugin with the fake Bot server and waits until the plugin is
@@ -105,11 +109,15 @@ func startWith(t *testing.T, prep func(*fakebot.Server), ready bool) *env {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { n.Run(ctx); close(done) }()
-	e := &env{t: t, srv: srv, whip: whip, node: n, record: record, paths: paths, cancel: cancel, done: done}
+	e := &env{t: t, srv: srv, whip: whip, node: n, record: record, paths: paths, cancel: cancel, done: done,
+		holdAcks: srv.HoldHeartbeatAcks}
 	t.Cleanup(e.stop)
 	e.conn = e.nextConn()
 	if ready {
 		e.waitReady()
+		if !e.holdAcks {
+			e.waitSynced()
+		}
 	}
 	return e
 }
@@ -125,11 +133,30 @@ func (e *env) stop() {
 
 func (e *env) nextConn() *fakebot.Conn {
 	e.t.Helper()
+	e.connAt = time.Now()
 	c, err := e.srv.NextConn(10 * time.Second)
 	if err != nil {
 		e.t.Fatal(err)
 	}
 	return c
+}
+
+// waitSynced waits until the current connection (the one nextConn last returned) has a measured round trip, so timed
+// motion is accepted on it: the link is up since after that connection began, and its clock has a bound.
+func (e *env) waitSynced() {
+	e.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st := e.node.link.Stats()
+		_, ok := e.node.link.ClockUncertainty()
+		if ok && st.Connected && st.Since.UnixMilli() >= e.connAt.UnixMilli()-1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatal("no round trip measured on the connection")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (e *env) waitReady() {
@@ -154,6 +181,9 @@ func (e *env) cmd(kind, value string, deadline int) protocol.Message {
 
 func (e *env) cmdID(id, kind, value string, deadline int) protocol.Message {
 	e.t.Helper()
+	if protocol.GuardedKinds[kind] && !e.holdAcks {
+		e.waitSynced() // motion is timed only on a bounded clock
+	}
 	if err := e.conn.Command(protocol.Command{ID: id, Kind: kind, Value: json.RawMessage(value)}, deadline); err != nil {
 		e.t.Fatal(err)
 	}
@@ -173,10 +203,11 @@ type rec struct {
 	DeadlineMS int             `json:"deadline_ms"`
 	WasMoving  bool            `json:"was_moving"`
 	Provenance *struct {
-		Session     string `json:"session"`
-		Seq         uint64 `json:"seq"`
-		IssuedAtMS  int64  `json:"issued_at_ms"`
-		ExpiresAtMS int64  `json:"expires_at_ms"`
+		Session            string `json:"session"`
+		Seq                uint64 `json:"seq"`
+		IssuedAtMS         int64  `json:"issued_at_ms"`
+		ExpiresAtMS        int64  `json:"expires_at_ms"`
+		ClockUncertaintyMS *int64 `json:"clock_uncertainty_ms"`
 	} `json:"provenance"`
 }
 

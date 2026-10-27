@@ -253,9 +253,9 @@ func (n *Node) Run(parent context.Context) error {
 
 	pctx, cancelPlugins := context.WithCancel(context.Background())
 	n.mgr.Start(pctx)
-	if n.latch.State().Stopped() {
-		n.log.Warn("starting with the stop latched", "remote", n.latch.State().Remote, "local", n.latch.State().Local)
-		n.mgr.EstopAll()
+	if st := n.latch.State(); st.Stopped() {
+		n.log.Warn("starting with the stop latched", "remote", st.Remote, "local", st.Local)
+		n.mgr.EstopAll(plugins.EstopLatched, latchReason(st))
 	}
 
 	var wg sync.WaitGroup
@@ -277,7 +277,7 @@ func (n *Node) Run(parent context.Context) error {
 	}
 	<-ctx.Done()
 	n.log.Info("shutting down: stopping every actuator")
-	n.mgr.StopAll()
+	n.mgr.StopAll(plugins.StopShutdown)
 	if n.worker != nil {
 		n.worker.Close()
 	}
@@ -302,7 +302,7 @@ func (n *Node) Connected() {
 
 func (n *Node) Disconnected(err error) {
 	n.log.Warn("link lost: stopping every actuator", "err", err)
-	n.mgr.StopAll()
+	n.mgr.StopAll(plugins.StopLinkLost)
 	n.mu.Lock()
 	n.configured = false
 	n.mu.Unlock()
@@ -344,7 +344,7 @@ func (n *Node) Frame(f protocol.Frame) {
 
 func (n *Node) remoteEstop(reason, by string) {
 	n.log.Warn("e-stop from the server", "by", by)
-	n.mgr.EstopAll() // at once, before the disk write
+	n.mgr.EstopAll(plugins.EstopRemote, safety.CleanReason(reason)) // at once, before the disk write
 	if _, err := n.latch.SetRemote(reason); err != nil {
 		n.log.Error("could not persist the e-stop (it is held in memory)", "err", err)
 	}
@@ -531,13 +531,29 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 		}
 	}
 	deadline := limits.Deadline(0)
+	var uncertainty *int64
 	if c.DeadlineMS > 0 {
-		left := c.DeadlineMS - n.serverNow(sentMS, received)
+		left, unc, synced := n.timeLeft(c.DeadlineMS, sentMS, received)
+		if protocol.GuardedKinds[c.Kind] {
+			// Motion is timed only on a clock Node can bound (Maticus, 2026-10-27): not before the connection's first
+			// round trip, and not on a link whose fastest round trip is slower than MaxClockUncertaintyMS.
+			if !synced {
+				nack(protocol.FaultNotReady, "the link's clock is not synchronized yet: no round trip has been measured on this connection")
+				return
+			}
+			if unc > protocol.MaxClockUncertaintyMS {
+				nack(protocol.FaultNotReady, fmt.Sprintf("the link is too slow to time motion: its fastest round trip is %d ms (at most %d)", unc, protocol.MaxClockUncertaintyMS))
+				return
+			}
+		}
 		if left <= 0 {
-			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived", -left))
+			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived (counting %d ms of clock uncertainty)", -left, unc))
 			return
 		}
 		deadline = limits.Deadline(int(min(left, int64(limits.MaxCommandMS)+1)))
+		if synced && n.link != nil {
+			uncertainty = &unc
+		}
 	}
 	value, err := limits.Clamp(c.Kind, c.Value)
 	if err != nil {
@@ -563,7 +579,7 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 		return
 	}
 	// Where it came from, unchanged, so a driver can check it without keeping old ids (Maticus, 2026-10-26, LOOI).
-	prov := &plugins.Provenance{Session: session, Seq: seq, IssuedAtMS: sentMS, ExpiresAtMS: c.DeadlineMS}
+	prov := &plugins.Provenance{Session: session, Seq: seq, IssuedAtMS: sentMS, ExpiresAtMS: c.DeadlineMS, ClockUncertaintyMS: uncertainty}
 	wait := p.BeginWith(n.ctx, c.ID, c.Kind, value, deadline, c.Operator, c.TurnEpoch, prov)
 	go func() {
 		r := wait()
@@ -608,7 +624,7 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 	}
 	window := int64(protocol.DefaultComputerMS)
 	if c.DeadlineMS > 0 {
-		window = c.DeadlineMS - n.serverNow(sentMS, received)
+		window, _, _ = n.timeLeft(c.DeadlineMS, sentMS, received)
 		if window <= 0 {
 			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived", -window))
 			return
@@ -674,6 +690,33 @@ func (n *Node) haltEpoch(robotID string) int64 {
 	return n.haltEpochs[robotID]
 }
 
+// timeLeft is how long a command stamped sentMS and received at received has before its deadline_ms, an instant on the
+// server's clock, counted from the LATEST the server's clock can be at receipt: the link's estimate plus its bound
+// (Link.ClockUncertainty, the connection's fastest round trip). unc is that bound in ms; synced is false while no round
+// trip has been measured on the connection (left then counts from the bare estimate). Without a link (local commands)
+// it is synced with no uncertainty.
+func (n *Node) timeLeft(deadlineMS, sentMS int64, received time.Time) (left, unc int64, synced bool) {
+	now := n.serverNow(sentMS, received)
+	if n.link == nil {
+		return deadlineMS - now, 0, true
+	}
+	d, ok := n.link.ClockUncertainty()
+	if !ok {
+		return deadlineMS - now, 0, false
+	}
+	// Round up: a 0.4 ms bound is still a bound.
+	unc = (d.Microseconds() + 999) / 1000
+	return deadlineMS - now - unc, unc, true
+}
+
+// latchReason is the reason a latched stop gives a driver: the remote one when the platform set it, else the local one.
+func latchReason(st safety.LatchState) string {
+	if st.Remote {
+		return st.RemoteReason
+	}
+	return st.LocalReason
+}
+
 // serverNow is the server's clock when a frame stamped sentMS was received: the link's estimate, else the frame's
 // own ts.
 func (n *Node) serverNow(sentMS int64, received time.Time) int64 {
@@ -705,7 +748,11 @@ func (n *Node) onLatch(st safety.LatchState) {
 	}
 	if st.Stopped() {
 		n.log.Warn("stop latched", "remote", st.Remote, "local", st.Local)
-		n.mgr.EstopAll()
+		cause := plugins.EstopRemote
+		if st.Local {
+			cause = plugins.EstopLocal
+		}
+		n.mgr.EstopAll(cause, latchReason(st))
 	} else {
 		n.log.Warn("stop cleared; motion allowed again")
 		n.mgr.ResumeAll()
@@ -825,11 +872,11 @@ func (n *Node) output(o plugins.Output) {
 	case plugins.OutLocalStop:
 		// A driver's own stop: everything stops at once, then the local latch is persisted with its reason. It is
 		// never a clear: nothing a plugin says releases a latch.
-		n.mgr.EstopAll()
 		reason, _ := o.Data["reason"].(string)
 		if reason = safety.CleanReason(reason); reason == "" {
 			reason = o.Plugin + " stop"
 		}
+		n.mgr.EstopAll(plugins.EstopDriver, reason)
 		if _, err := n.latch.SetLocalWith(reason); err != nil {
 			n.log.Error("a plugin latched the local stop, but the latch could not be saved", "plugin", o.Plugin, "err", err)
 		}
@@ -1224,7 +1271,7 @@ func (n *Node) control(r localctl.Request) localctl.Response {
 		n.tellTray(r.On)
 		return localctl.Response{OK: true}
 	case localctl.CmdStop:
-		n.mgr.EstopAll() // at once, then persist
+		n.mgr.EstopAll(plugins.EstopLocal, "openvibe-node stop") // at once, then persist
 		if _, err := n.latch.SetLocalWith("openvibe-node stop"); err != nil {
 			return localctl.Response{OK: true, Error: "stopped, but the latch could not be saved: " + err.Error()}
 		}
@@ -1237,7 +1284,7 @@ func (n *Node) control(r localctl.Request) localctl.Response {
 				"(sudo systemctl stop openvibe-node; on Windows, Services), or remove it with `openvibe-node uninstall`"}
 		}
 		n.log.Info("quit by its owner (openvibe-node quit)")
-		n.mgr.StopAll() // at once; Run stops everything again on the way out
+		n.mgr.StopAll(plugins.StopShutdown) // at once; Run stops everything again on the way out
 		n.quitting.Store(true)
 		go func() { time.Sleep(100 * time.Millisecond); n.quit() }() // after this answer is written
 		return localctl.Response{OK: true}

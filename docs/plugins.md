@@ -47,12 +47,12 @@ describes itself and waits for EOF without opening any hardware.
 
 | op          | fields                                                        | the plugin must                                        |
 |-------------|---------------------------------------------------------------|--------------------------------------------------------|
-| `hello`     | `config` {…}, `probe` bool                                    | answer `describe`; then set up (unless probe)          |
+| `hello`     | `config` {…}, `probe` bool, `halt_epoch`? (the newest a halt carried, 0.17) | answer `describe`; then set up (unless probe) |
 | `command`   | `id`, `kind`, `value`, `deadline_ms`, `operator`?, `turn_epoch`?, `provenance`? | act, answer `ack` or `nack` with the same `id` |
 | `heartbeat` | `t` (core clock, ms)                                          | note the time                                          |
-| `stop`      | `turn_epoch`? (a halt's)                                      | stop every actuator                                    |
-| `estop`     |                                                               | stop every actuator and refuse motion until `resume`   |
-| `resume`    |                                                               | accept motion again                                    |
+| `stop`      | `cause` (0.17), `turn_epoch`? (a halt's)                      | stop every actuator; latch nothing                     |
+| `estop`     | `cause`, `reason`?, `replayed`?, `first_cause`? (0.17)         | stop every actuator and refuse motion until `resume`   |
+| `resume`    | `cause` (`cleared`, 0.17)                                     | accept motion again; never re-arm anything of its own  |
 | `approval`  | `id`, `approved` bool                                         | the owner's answer to an `approval` event it raised    |
 | `tray`      | `attached` bool, `ttl_s`                                      | (computer plugin only) the tray shows its approvals for `ttl_s` s unless told again: its own desktop prompts may stay quiet |
 | `voice`     | `on` bool, `call_word`                                        | (plugins that describe a `voice` capability) the owner's Vibe by voice setting from Bot's config: listen for `call_word` only while `on` ([voice.md](voice.md)) |
@@ -85,6 +85,7 @@ and refuses an older command itself (`expired`).
 | `seq` | its frame's number on that session: strictly increasing, with gaps (other frames share the count) |
 | `issued_at_ms` | Bot's clock when it sent the command, which is when it minted the id (`cmd_<ULID>`, whose time part is the same) |
 | `expires_at_ms` | the absolute deadline on Bot's clock (motion kinds); `deadline_ms` is what is left of it at receipt |
+| `clock_uncertainty_ms` | (0.17) how far the core's estimate of Bot's clock may trail it: the connection's fastest round trip. `deadline_ms` already counts from estimate + this |
 
 Python: `cmd.provenance` (a dict, or `None` from an older Node). The runtime refuses (`expired`) a command whose `seq`
 is not above the last one it handled on the same `session`.
@@ -131,9 +132,10 @@ Asked by the Generic LOOI driver's authors (2026-10-27). Each answer is what Bot
    - Only `drive`, `actuator`, `ptz` and a held button's `down` get one.
    - The command is sent in the same step. Its id (`cmd_<ULID>`) and `issued_at_ms` are minted then, after the gate's
      last await.
-   - The core turns the absolute instant into what is left of it. It compares the instant with its estimate of Bot's
-     clock, which is the local monotonic clock plus the largest `ts − arrival` seen on the connection. So time a frame
-     spent queued on the way counts as lateness, and a delayed run of frames can never make a deadline look open again.
+   - The core turns the absolute instant into what is left of it. It compares the instant with the latest Bot's clock
+     can be: its estimate (the local monotonic clock plus the largest `ts − arrival` seen on the connection) plus that
+     estimate's bound (answer 6). So time a frame spent queued on the way counts as lateness, and a delayed run of
+     frames can never make a deadline look open again.
    - It caps what is left at the robot's `max_command_ms`.
    - The plugin gets that remainder as `deadline_ms`, and `expires_at_ms` in `provenance` unchanged.
    - Neither a viewer nor Live can choose a later deadline.
@@ -188,6 +190,59 @@ Asked by the Generic LOOI driver's authors (2026-10-27). Each answer is what Bot
      command still reached `handle` and was stopped on the next tick.
    - A driver without the runtime should do the same: note the time each line is read (on a reader thread) and refuse
      motion that is already past its `deadline_ms` when its turn comes.
+
+Asked next by the same authors (2026-10-27, P7 LOOI shadow integration), and changed in Node 0.17.0 to answer them:
+
+6. **The clock's error, its bound, and when motion waits for it.**
+   - **The error.** Each frame from Bot gives one sample, `ts − arrival` = the clock offset less that frame's one-way
+     transit. The estimate keeps the largest sample on the connection, so it trails Bot's real clock by the fastest
+     one-way transit among them. That is a late reading: on its own it would grant a command up to that transit more
+     than its deadline allows.
+   - **The bound.** Every `heartbeat_ack` is one of those samples, and its one-way transit is at most its own round
+     trip. So the connection's fastest heartbeat round trip bounds the error, whatever the asymmetry of the path.
+     The core checks every deadline against estimate + bound (the latest Bot's clock can be), rounded up to the
+     millisecond. This is fail-closed: a command can only get less time than its deadline allows, never more.
+   - **What else holds.** Clock drift over a connection is tracked by the newest samples or reads early (fail-closed).
+     The local clock is monotonic, so a wall-clock step on the device changes nothing. Bot's clock stepping back reads
+     as early until the next connection; stepping forward moves the estimate with the next frame. Latency and jitter
+     only make commands arrive later, so they read as expired, never as open. The window a plugin gets is also capped
+     at the robot's `max_command_ms`, and two missed heartbeats end the link (`stop`, `link_lost`).
+   - **Before a bound exists.** The first heartbeat goes out as soon as Bot's hello arrives, and its ack sets the bound
+     (one round trip, usually tens of milliseconds). Until then the core refuses `drive`, `actuator`, `ptz`, `button` and
+     `point` that carry a deadline (`not_ready`, "the link's clock is not synchronized yet"). Every new connection starts
+     unsynchronized. A link whose fastest round trip is over 1 s (`MaxClockUncertaintyMS`) times no motion either
+     (`not_ready`). Speech and other non-motion kinds are not held.
+   - **A stricter cap of your own.** The bound reaches the plugin as `provenance.clock_uncertainty_ms`. A driver may refuse
+     motion above a cap it chooses (say 150 ms for P7) without inventing another clock or replay mechanism. The deadline,
+     epoch and seq contract stays as it is.
+7. **Why a plugin is stopped (`cause`), and how a driver tells an ordinary stop from an emergency.**
+   - Every `stop` and `estop` names its cause, and `hello` carries the newest halt epoch, so the meaning holds across a
+     plugin restart and a Node reconnect.
+
+     | op | `cause` | when | latches |
+     |---|---|---|---|
+     | `stop` | `halt` | Bot's halt: a turn ended, a viewer handoff, a release, a timeout, an unbind (with `turn_epoch`) | no |
+     | `stop` | `link_lost` | the link to Bot dropped (two missed heartbeats, a close) | no |
+     | `stop` | `shutdown` | the Node is stopping (service stop, `openvibe-node quit`), or the core is stopping this process | no |
+     | `stop` | `timeout` | a command got no answer from the driver within its window | no |
+     | `estop` | `remote` | the platform's e-stop (a robot owner or staff), with its `reason` | yes, until the owner clears it |
+     | `estop` | `local` | `openvibe-node stop` on the device | yes, until `openvibe-node resume` |
+     | `estop` | `driver` | a driver's own `local_stop` (this plugin's or another's) | yes, until `openvibe-node resume` |
+     | `estop` | `latched` | the latch was already set when the Node or this process started (`replayed: true`, `first_cause` when known) | yes |
+     | `resume` | `cleared` | the owner cleared the platform's latch | clears the core's and the runtime's refusal only |
+
+   - **Python (`openvibe_plugin` 0.17).** Every stop the runtime makes calls `on_stop(info)`, and `info` is a `StopInfo`:
+     `cause`, `emergency` (true for `estop`), `latched`, `reason`, `turn_epoch`, `halt_epoch`, `replayed`, `first_cause`,
+     `motion_only`. The runtime's own causes are `setup` (the stop every setup ends with), `deadline` (motion only: stop
+     what moves on its own), `heartbeat` (the core went quiet), `handler_error` and `eof`. An older core sends no cause:
+     `stop` or `estop`. The default `on_stop` calls `stop_motion()` for a deadline and `stop()` otherwise, so existing
+     drivers behave as before. `on_resume(info)` does nothing by default.
+   - **For P7.** Override `on_stop`: stop every motor in every case. Latch P7's own STOP only when `info.emergency` is
+     true; an ordinary halt, a disconnect, a timeout or a handoff only revokes remote motion. Treat `on_resume` as
+     information. Never ARM P7, clear its physical latch or restore a remote grant there; the next command still passes
+     every check. Across a plugin restart the latch arrives again as `estop` `latched` with `replayed: true`, and the halt
+     epoch comes in `hello`. Across a Node reconnect the link's loss is a `stop` (`link_lost`); a platform e-stop set
+     while offline is applied from Bot's config before any command.
 
 ### Plugin → core
 
@@ -366,6 +421,19 @@ class Arm(Plugin):
 
 if __name__ == "__main__":
     raise SystemExit(run(Arm()))
+```
+
+A driver with a safety latch of its own tells an ordinary stop from an emergency with `on_stop` (Node 0.17; "Why a
+plugin is stopped" above):
+
+```python
+    def on_stop(self, info):              # every stop: a halt, a lost link, a deadline, an e-stop…
+        self.stop()                       # always stop every actuator first
+        if info.emergency:                # the platform's e-stop (remote, local, driver, or replayed as latched)
+            self.hardware_latch.set()     # only then latch the hardware's own STOP
+
+    def on_resume(self, info):            # the owner cleared the platform's latch: information, never a re-arm
+        self.log("platform latch cleared; the hardware latch stays until the person on site clears it")
 ```
 
 Test it with `openvibe_plugin.Runtime(plugin, infile, outfile, clock)` and a fake clock, as the bundled plugins do.

@@ -9,7 +9,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from openvibe_plugin import Deferred, Fault, Plugin, Runtime  # noqa: E402
+from openvibe_plugin import Deferred, Fault, Plugin, Runtime, StopInfo  # noqa: E402
 
 
 class FakeClock:
@@ -179,6 +179,96 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(drive("c4", 200)["op"], "nack", "a halt command's epoch counts too")
         rt.feed_line(json.dumps({"op": "stop"}))
         self.assertEqual(drive("c5", 300)["op"], "ack", "a stop without an epoch changes nothing")
+
+    def test_stop_causes_reach_on_stop(self):
+        """A driver tells an ordinary stop from an emergency (Maticus, 2026-10-27, P7): every stop still stops; only an
+        emergency latches the driver's own hardware stop; resume reports the platform's clear and re-arms nothing."""
+
+        class P7Like(Recorder):
+            def __init__(self):
+                super().__init__()
+                self.infos, self.resumes, self.physical_latch = [], [], False
+
+            def on_stop(self, info):
+                self.infos.append(info)
+                if info.emergency:
+                    self.physical_latch = True
+                self.stop()
+
+            def on_resume(self, info):
+                self.resumes.append(info)
+
+        rt, p, out, clock = make(P7Like())
+        self.hello(rt)
+        feed = lambda m: rt.feed_line(json.dumps(m))  # noqa: E731
+        feed({"op": "stop", "cause": "halt", "turn_epoch": 7})
+        feed({"op": "stop", "cause": "link_lost"})
+        self.assertEqual([(i.cause, i.emergency, i.latched) for i in p.infos],
+                         [("setup", False, False), ("halt", False, False), ("link_lost", False, False)])
+        self.assertEqual((p.infos[1].turn_epoch, p.infos[1].halt_epoch, p.infos[2].halt_epoch), (7, 7, 7))
+        self.assertFalse(p.physical_latch, "an ordinary stop latches nothing")
+        feed({"op": "estop", "cause": "remote", "reason": "staff: it wobbled"})
+        e = p.infos[-1]
+        self.assertEqual((e.cause, e.emergency, e.latched, e.reason, e.replayed), ("remote", True, True, "staff: it wobbled", False))
+        self.assertTrue(p.physical_latch)
+        feed({"op": "resume", "cause": "cleared"})
+        self.assertEqual([r.cause for r in p.resumes], ["cleared"])
+        self.assertTrue(p.physical_latch, "resume never clears the driver's own latch")
+        self.assertFalse(rt.estopped)
+        # The same emergency replayed to a restarted process, and an older core's bare ops.
+        feed({"op": "estop", "cause": "latched", "first_cause": "remote", "reason": "staff: it wobbled", "replayed": True})
+        self.assertEqual((p.infos[-1].cause, p.infos[-1].replayed, p.infos[-1].first_cause), ("latched", True, "remote"))
+        feed({"op": "stop"})
+        feed({"op": "estop"})
+        self.assertEqual([(i.cause, i.emergency) for i in p.infos[-2:]], [("stop", False), ("estop", True)])
+        self.assertEqual(p.calls.count("stop"), len(p.infos), "every stop stopped")
+        # The runtime's own stops say why too: the driver's own local stop is an emergency.
+        rt.local_stop("bumper")
+        self.assertEqual((p.infos[-1].cause, p.infos[-1].emergency, p.infos[-1].reason), ("driver", True, "bumper"))
+
+    def test_on_stop_defaults_to_stop_and_stop_motion(self):
+        """A plugin that overrides only stop() and stop_motion() behaves as before; the runtime still records why."""
+
+        class Wheels(Recorder):
+            def stop_motion(self):
+                self.calls.append("stop_motion")
+
+        rt, p, out, clock = make(Wheels())
+        self.hello(rt)
+        rt.feed_line(json.dumps({"op": "command", "id": "d", "kind": "drive", "value": {}, "deadline_ms": 300}))
+        clock.t += 1.0
+        rt.tick()
+        rt.feed_line(json.dumps({"op": "estop", "cause": "remote"}))
+        self.assertEqual(p.calls[-2:], ["stop_motion", "stop"])
+        self.assertEqual([(i.cause, i.motion_only, i.emergency) for i in rt.stop_infos[-2:]],
+                         [("deadline", True, False), ("remote", False, True)])
+        self.assertIsInstance(rt.stop_infos[-1], StopInfo)
+
+    def test_halt_epoch_from_hello_survives_a_restart(self):
+        rt, p, out, clock = make()
+        rt.feed_line(json.dumps({"op": "hello", "config": {}, "halt_epoch": 50}))
+
+        def drive(cid, epoch):
+            rt.feed_line(json.dumps({"op": "command", "id": cid, "kind": "drive", "value": {}, "deadline_ms": 300,
+                                     "turn_epoch": epoch}))
+            return lines(out)[-1]
+
+        self.assertEqual(drive("old", 40)["fault_code"], "expired")
+        self.assertEqual(drive("now", 50)["op"], "ack")
+
+    def test_clock_uncertainty_reaches_handle(self):
+        seen = []
+
+        class Keep(Recorder):
+            def handle(self, cmd):
+                seen.append(cmd.provenance)
+
+        rt, p, out, clock = make(Keep())
+        self.hello(rt)
+        for i, u in enumerate((0, 42)):
+            rt.feed_line(json.dumps({"op": "command", "id": "c%d" % i, "kind": "say", "value": {}, "deadline_ms": 300,
+                                     "provenance": {"session": "s", "seq": i + 1, "clock_uncertainty_ms": u}}))
+        self.assertEqual([s.get("clock_uncertainty_ms") for s in seen], [0, 42])
 
     def test_newer_command_extends_deadline(self):
         rt, p, out, clock = make()

@@ -110,6 +110,7 @@ type Link struct {
 
 	connected   atomic.Bool
 	lastRTT     atomic.Int64
+	minRTT      atomic.Int64 // the fastest heartbeat round trip on this connection (ns), 0 until one is measured
 	reconnects  atomic.Int64
 	lastErr     atomic.Value // string
 	connectedAt atomic.Int64
@@ -181,7 +182,8 @@ func (l *Link) localMS(at time.Time) int64 {
 
 // ServerNow estimates the server's clock (epoch ms) at local time at, from the frames of the current connection. The
 // offset is the largest ts − receive time seen on the connection: the clock skew less the fastest transit, so a frame
-// that sat in a queue on the way reads as late by however long it sat there. The best sample is kept for the whole
+// that sat in a queue on the way reads as late by however long it sat there. The estimate itself trails the server by
+// that fastest transit; ClockUncertainty bounds it, and deadlines are checked against estimate + bound. The best sample is kept for the whole
 // connection: a run of delayed frames can never make an expired deadline look open again. A server clock that steps
 // back only makes deadlines read as expired (fail closed) until the next connection. ok is false before any frame.
 func (l *Link) ServerNow(at time.Time) (ms int64, ok bool) {
@@ -191,6 +193,18 @@ func (l *Link) ServerNow(at time.Time) (ms int64, ok bool) {
 		return 0, false
 	}
 	return l.localMS(at) + l.skew, true
+}
+
+// ClockUncertainty bounds how far ServerNow can trail the server's real clock on this connection: the fastest
+// heartbeat round trip measured on it. ServerNow trails the server by the fastest one-way transit among the frames it
+// sampled; every heartbeat_ack is one of those frames, and its one-way transit is at most its own round trip, so the
+// fastest round trip is an upper bound whatever the asymmetry of the path. ok is false until a round trip is measured
+// (the first heartbeat goes out as soon as the server's hello arrives).
+func (l *Link) ClockUncertainty() (time.Duration, bool) {
+	if v := l.minRTT.Load(); v > 0 {
+		return time.Duration(v), true
+	}
+	return 0, false
 }
 
 // Connected reports whether a connection is up.
@@ -376,8 +390,10 @@ func (l *Link) session(ctx context.Context) error {
 	l.mu.Lock()
 	l.out, l.seq, l.hbSent, l.hasSkew = nil, 0, map[uint64]hbSend{}, false
 	l.mu.Unlock()
-	// A fresh connection has no measured round trip: the first heartbeat must not claim one.
+	// A fresh connection has no measured round trip: the first heartbeat must not claim one, and its clock estimate
+	// has no bound until one is measured (ClockUncertainty).
 	l.lastRTT.Store(0)
+	l.minRTT.Store(0)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	var endErr error
@@ -515,7 +531,14 @@ func (l *Link) session(ctx context.Context) error {
 			l.mu.Unlock()
 			if !sent.IsZero() {
 				// A coarse clock (Windows) can read 0 on a fast loopback; 0 means "not measured yet", so floor at 1 ns.
-				l.lastRTT.Store(int64(max(time.Since(sent), 1)))
+				rtt := int64(max(time.Since(sent), 1))
+				l.lastRTT.Store(rtt)
+				for {
+					cur := l.minRTT.Load()
+					if (cur != 0 && cur <= rtt) || l.minRTT.CompareAndSwap(cur, rtt) {
+						break
+					}
+				}
 			}
 			continue
 		case protocol.Error:
