@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -16,6 +17,15 @@ func TestDeskSandboxCommand(t *testing.T) {
 		t.Fatalf("no program: code %d, stderr %q", code, errb.String())
 	}
 	errb.Reset()
+	// Never the test process's own fds 3 and 4: they are the Go runtime's poller here.
+	in, out2, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer out2.Close()
+	deskPipe = func() (*os.File, *os.File, error) { return in, out2, nil }
+	defer func() { deskPipe = inheritedDeskPipe }()
 	home := t.TempDir()
 	code := run([]string{"desk-sandbox", "--home", home, "--memory-mb", "64", "--", "/bin/true", "--headless=new", "--home", "x"}, &out, &errb)
 	if code != 125 || !strings.Contains(errb.String(), "desk-sandbox:") {

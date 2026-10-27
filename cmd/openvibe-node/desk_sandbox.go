@@ -30,6 +30,9 @@ jobs need (root with worker.run_as, cgroup v2 delegated); --egress public needs 
 program's code; 125 when the sandbox could not be set up.
 `
 
+// deskPipe answers the desk's two pipe ends (its fds 3 and 4); tests replace it.
+var deskPipe = inheritedDeskPipe
+
 // cmdDeskSandbox is `openvibe-node desk-sandbox`; it parses its own flags, up to "--", so the program's flags (a
 // browser's) are never read as the Node's.
 func cmdDeskSandbox(args []string, stderr io.Writer) int {
@@ -61,11 +64,16 @@ func cmdDeskSandbox(args []string, stderr io.Writer) int {
 	}
 	wcfg := cfg.Worker
 	wcfg.NodeDirs = []string{paths.ConfigDir, paths.StateDir} // as the Node's own jobs: no desk sees them
+	in, out, err := deskPipe()
+	if err != nil {
+		fmt.Fprintln(stderr, "desk-sandbox:", err)
+		return 125
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
 	code, err := worker.RunDesk(ctx, wcfg, worker.DeskSpec{Argv: argv, Env: env, Binds: binds,
 		MemBytes: *memMB << 20, CPUMillis: *cpu, DiskBytes: *diskMB << 20, Pids: *pids, Egress: *egress,
-		In: os.NewFile(3, "desk in"), Out: os.NewFile(4, "desk out"), Stderr: os.Stderr})
+		In: in, Out: out, Stderr: os.Stderr})
 	if err != nil && ctx.Err() == nil {
 		fmt.Fprintln(stderr, "desk-sandbox:", err)
 		return 125
