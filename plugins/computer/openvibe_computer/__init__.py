@@ -143,7 +143,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.9.0"
+    version = "0.10.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 

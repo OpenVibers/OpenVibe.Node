@@ -160,11 +160,28 @@ class BrowserKindTest(unittest.TestCase):
         self.assertEqual(reply(self.out, self.cmd({"action": "close"}))["data"], {"done": True})
 
 
+class ReceiptTest(unittest.TestCase):
+    def test_what_an_action_changed(self):
+        from openvibe_computer.browser import receipt
+        before = {"url": "https://a/", "text": "One\nTwo\n\nThree"}
+        self.assertEqual(receipt(before, {"url": "https://a/", "text": "One\nTwo\nThree"}), {"url_changed": False, "appeared": [], "gone": 0})
+        self.assertEqual(receipt(before, {"url": "https://a/#x", "text": "One\nFour\nThree\n" + "\n".join("n%d" % i for i in range(20))}),
+                         {"url_changed": True, "appeared": ["Four"] + ["n%d" % i for i in range(7)], "gone": 1})
+        self.assertIsNone(receipt(None, {"url": "x", "text": ""}), "no receipt without a before")
+        long = receipt(before, {"url": "https://a/", "text": "x" * 500})
+        self.assertEqual(len(long["appeared"][0]), 160)
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     PAGES = {
         "/": b"<!doctype html><title>Home</title><h1>Hello</h1><a href='/two'>Second page</a>"
              b"<form action='/two'><input id='q' name='q'><button>Search</button></form>",
         "/two": b"<!doctype html><title>Two</title><p>Arrived</p>",
+        # Desks plan D3: a page whose button changes the page without going anywhere, and things that are not elements.
+        "/app": b"<!doctype html><title>App</title><p>Ready</p><button id='go' aria-label='Add a row'>+</button>"
+                b"<input type='email' placeholder='Email'><input type='checkbox' checked><a href='/two'>Second page</a>"
+                b"<button style='display:none'>Hidden</button><div id='rows'></div>"
+                b"<script>document.getElementById('go').onclick = () => { document.getElementById('rows').insertAdjacentHTML('beforeend', '<p>Row added</p>'); document.querySelector('p').remove(); };</script>",
     }
 
     def do_GET(self):
@@ -200,6 +217,20 @@ class RealBrowserTest(unittest.TestCase):
         self.assertTrue(b.press("Enter")["url"].endswith("/two?q=two+words"))
         shot = b.screenshot(640)
         self.assertEqual((shot["format"], shot["width"] <= 1280), ("jpeg", True))
+        # Desks plan D3: the page's interactive elements as refs, and a receipt for each action.
+        app = b.open(base + "/app")
+        refs = {line.split(" ", 2)[2].split('"')[1]: line.split(" ", 1)[0] for line in app["elements"]}
+        self.assertEqual(set(refs), {"Add a row", "Email", "", "Second page"}, app["elements"])
+        self.assertTrue(any(l.endswith(' "Email" (email)') for l in app["elements"]), "an input says its type")
+        self.assertTrue(any(" checkbox " in l and l.endswith(" checked") for l in app["elements"]), "a checkbox says it is checked")
+        self.assertFalse(any("Hidden" in l for l in app["elements"]), "a hidden element is not offered")
+        done = b.click(selector='[data-ov-ref="%s"]' % refs["Add a row"])
+        self.assertEqual(done["receipt"], {"url_changed": False, "appeared": ["Row added"], "gone": 1})
+        again = b.read()
+        self.assertIn('%s button "Add a row"' % refs["Add a row"], again["elements"], "the same element keeps its ref")
+        away = b.click(selector='[data-ov-ref="%s"]' % refs["Second page"])
+        self.assertTrue(away["receipt"]["url_changed"])
+        self.assertEqual(b.back()["receipt"]["url_changed"], True)
         self.assertTrue(shot["content_b64"])
         b.close()
         self.assertFalse(b.alive())
