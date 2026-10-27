@@ -357,6 +357,10 @@ class RealDeskBrowsersTest(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(profiles, ignore_errors=True))
         out = Out()
         plugin = Computer(platform="linux")
+        # CI runners' Chrome crashes inside their user-namespace policy unless its sandbox is off (as RealBrowserTest).
+        from openvibe_computer.browser import Browser
+        extra = ["--no-sandbox"] if os.environ.get("CI") else []
+        plugin.browser_factory = lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env, extra_args=extra)
         rt = Runtime(plugin, infile=io.StringIO(""), outfile=out)
         # Level full: the test site is on this machine (lower levels refuse the machine's own network).
         rt.dispatch({"op": "hello", "config": {"level": "full", "roots": [tempfile.gettempdir()], "notify": False, "max_desks": 2,
