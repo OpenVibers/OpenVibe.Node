@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OpenVibers/OpenVibe.Node/internal/config"
@@ -45,6 +46,10 @@ type Options struct {
 
 	// Tokens are a Network-paired machine's node tokens; nil builds them from Creds.
 	Tokens link.Tokens
+
+	// CanQuit lets `openvibe-node quit` end the process: true when it runs from a terminal or a sign-in start, false
+	// under a service manager, which would only start it again.
+	CanQuit bool
 
 	// For tests.
 	ReauthInterval    time.Duration
@@ -70,6 +75,9 @@ type Node struct {
 	screen screenState
 
 	ctx context.Context
+	// quit ends Run on `openvibe-node quit` (control), and quitting tells Run to answer ErrQuit.
+	quit     context.CancelFunc
+	quitting atomic.Bool
 
 	mu     sync.Mutex
 	limits safety.Limits
@@ -105,6 +113,9 @@ type Node struct {
 	inputEnded time.Time
 	trayToldAt time.Time // when the computer plugin was last told the tray shows its approvals
 }
+
+// ErrQuit is what Run returns after `openvibe-node quit`: every actuator stopped, nothing latched, the process may exit.
+var ErrQuit = errors.New("quit by its owner")
 
 // InputGuard is how long after an input command `approve` stays refused.
 const InputGuard = 2 * time.Second
@@ -227,6 +238,7 @@ func (n *Node) Run(parent context.Context) error {
 	defer cancel()
 	var fatal error
 	n.ctx = ctx
+	n.quit = cancel
 	n.started = time.Now()
 	ctlErr := make(chan error, 1)
 	go func() { ctlErr <- localctl.Serve(ctx, n.opt.Paths.SocketPath(), n.control) }()
@@ -271,6 +283,9 @@ func (n *Node) Run(parent context.Context) error {
 	cancelPlugins()
 	n.mgr.Wait()
 	wg.Wait()
+	if fatal == nil && n.quitting.Load() {
+		return ErrQuit
+	}
 	return fatal
 }
 
@@ -1210,6 +1225,18 @@ func (n *Node) control(r localctl.Request) localctl.Response {
 		if _, err := n.latch.SetLocalWith("openvibe-node stop"); err != nil {
 			return localctl.Response{OK: true, Error: "stopped, but the latch could not be saved: " + err.Error()}
 		}
+		return localctl.Response{OK: true}
+	case localctl.CmdQuit:
+		// Not a stop: nothing is latched, so the next start drives as before (Maticus, 2026-10-26: a script that
+		// stopped the Node with `stop` left it latched, and had to kill the process to end it).
+		if !n.opt.CanQuit {
+			return localctl.Response{Error: "this node runs as a system service, which would start it again: stop it there " +
+				"(sudo systemctl stop openvibe-node; on Windows, Services), or remove it with `openvibe-node uninstall`"}
+		}
+		n.log.Info("quit by its owner (openvibe-node quit)")
+		n.mgr.StopAll() // at once; Run stops everything again on the way out
+		n.quitting.Store(true)
+		go func() { time.Sleep(100 * time.Millisecond); n.quit() }() // after this answer is written
 		return localctl.Response{OK: true}
 	case localctl.CmdResume:
 		if _, err := n.latch.Resume(); err != nil {

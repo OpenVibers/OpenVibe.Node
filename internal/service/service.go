@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -21,6 +22,15 @@ const (
 // Program is the body of the service: run until ctx ends.
 type Program func(ctx context.Context) error
 
+// ErrQuit is what a Program returns when its owner ended it (`openvibe-node quit`): it has stopped everything, and
+// the process exits 0. Only a Node run from a terminal or a sign-in start takes quit (a service manager would start it
+// again), and there the wait for a signal is not ours to end (kardianos/service on Windows waits for an interrupt),
+// so the process exits here.
+var ErrQuit = errors.New("quit")
+
+// exit is os.Exit; tests replace it.
+var exit = os.Exit
+
 type program struct {
 	run    Program
 	mu     sync.Mutex
@@ -36,6 +46,11 @@ func (p *program) Start(s ks.Service) error {
 	p.mu.Unlock()
 	go func() {
 		err := p.run(ctx)
+		if errors.Is(err, ErrQuit) {
+			close(p.done)
+			exit(0)
+			return
+		}
 		p.mu.Lock()
 		p.err = err
 		p.mu.Unlock()

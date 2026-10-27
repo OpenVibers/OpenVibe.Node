@@ -1,4 +1,4 @@
-// Package localctl is the running Node's local control socket: `openvibe-node stop`, `resume`, `status`, `plugins`,
+// Package localctl is the running Node's local control socket: `openvibe-node stop`, `resume`, `quit`, `status`, `plugins`,
 // `approvals`, `approve`, `deny` and `tray` talk to it. It is a Unix domain socket (Windows 10+ supports them too) in the state directory with mode
 // 0600, so only the account running the Node and root can use it. One JSON request per connection, one JSON answer.
 package localctl
@@ -15,9 +15,11 @@ import (
 
 // Commands.
 const (
-	CmdStatus  = "status"
-	CmdStop    = "stop"
-	CmdResume  = "resume"
+	CmdStatus = "status"
+	CmdStop   = "stop"
+	CmdResume = "resume"
+	// CmdQuit ends the running Node cleanly: every actuator stops and nothing is latched (stop latches).
+	CmdQuit    = "quit"
 	CmdPlugins = "plugins"
 	// The computer plugin's approvals (control level "ask"): list what waits, approve or deny one by its id.
 	CmdApprovals = "approvals"

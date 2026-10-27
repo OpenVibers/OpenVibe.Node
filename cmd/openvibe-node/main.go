@@ -9,6 +9,7 @@
 //	openvibe-node status          show the link, the plugins, the stop latch and video
 //	openvibe-node stop            local kill switch: stop every actuator and hold it stopped
 //	openvibe-node resume          release the local kill switch (and a server e-stop)
+//	openvibe-node quit            end the running node cleanly: every actuator stops, nothing is latched
 //	openvibe-node plugins         list plugins and their capabilities
 //	openvibe-node version
 package main
@@ -21,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -56,6 +58,8 @@ Usage:
   openvibe-node status [--json]
   openvibe-node stop        stop every actuator now and hold them stopped
   openvibe-node resume      release the stop
+  openvibe-node quit        end the running node cleanly: every actuator stops and nothing is latched, so the next
+                            start drives as before (stop is the kill switch, and holds until resume)
   openvibe-node plugins [--json]
   openvibe-node approvals [--json]   what the computer plugin waits to be approved (control level "ask")
   openvibe-node approve <ID>         let it run
@@ -183,6 +187,8 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		err = cmdStop(g, stdout)
 	case "resume":
 		err = cmdResume(g, stdout)
+	case "quit":
+		err = cmdQuit(g, stdout)
 	case "plugins":
 		err = cmdPlugins(g, *asJSON, stdout)
 	case "approvals":
@@ -542,12 +548,18 @@ func cmdRun(g *globals, dryRun bool) error {
 		}
 		tokens = ts
 	}
-	n, err := node.New(node.Options{Config: cfg, Paths: g.paths, Creds: creds, Tokens: tokens, Log: g.log, Version: version})
+	n, err := node.New(node.Options{Config: cfg, Paths: g.paths, Creds: creds, Tokens: tokens, Log: g.log, Version: version, CanQuit: service.Interactive()})
 	if err != nil {
 		return err
 	}
 	g.log.Info("openvibe-node starting", "version", version, "config", g.paths.ConfigDir, "plugins", len(cfg.Plugins))
-	return service.Run(serviceOptions(g, ""), n.Run)
+	return service.Run(serviceOptions(g, ""), func(ctx context.Context) error {
+		if err := n.Run(ctx); !errors.Is(err, node.ErrQuit) {
+			return err
+		}
+		g.log.Info("openvibe-node exited: every actuator stopped, nothing latched")
+		return service.ErrQuit
+	})
 }
 
 func serviceOptions(g *globals, user string) service.Options {
@@ -599,6 +611,28 @@ func cmdStop(g *globals, stdout io.Writer) error {
 	fmt.Fprintln(stdout, "The node did not answer; the stop is latched in", g.paths.LatchFile())
 	fmt.Fprintln(stdout, "A running node obeys it within a quarter second; a starting node starts stopped. Release with `openvibe-node resume`.")
 	return nil
+}
+
+// cmdQuit ends the running Node and waits until it has exited, so a script that runs it next can start it again.
+func cmdQuit(g *globals, stdout io.Writer) error {
+	sock := g.paths.SocketPath()
+	if _, err := localctl.Call(sock, localctl.Request{Cmd: localctl.CmdQuit}, 2*time.Second); err != nil {
+		var op *net.OpError
+		if errors.As(err, &op) && op.Op == "dial" {
+			fmt.Fprintln(stdout, "No node is running here: nothing to quit.")
+			return nil
+		}
+		return err
+	}
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		c, err := net.DialTimeout("unix", sock, 200*time.Millisecond)
+		if err != nil {
+			fmt.Fprintln(stdout, "The node stopped every actuator and exited. Nothing is latched: the next start drives as before.")
+			return nil
+		}
+		c.Close()
+	}
+	return errors.New("the node took the quit but is still running after 20 s; `openvibe-node status` shows it")
 }
 
 func cmdResume(g *globals, stdout io.Writer) error {
