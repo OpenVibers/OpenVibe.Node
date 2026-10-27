@@ -215,6 +215,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Node v0.24.0: a page that opens another (a sign-in popup), and one that sets a cookie.
         "/pop": b"<!doctype html><title>Pop</title><button id='open' onclick=\"window.open('/two', 'signin', 'popup')\">Sign in</button>",
         "/cookie": b"<!doctype html><title>Cookie</title><script>if (!document.cookie.includes('kept=yes')) document.cookie = 'kept=yes; max-age=3600; path=/';</script>",
+        "/session": b"<!doctype html><title>Session</title><script>if (!document.cookie.includes('sid=')) document.cookie = 'sid=s1; path=/';</script>",
         # Desks plan D3: a page whose button changes the page without going anywhere, and things that are not elements.
         "/app": b"<!doctype html><title>App</title><p>Ready</p><button id='go' aria-label='Add a row'>+</button>"
                 b"<input type='email' placeholder='Email'><input type='checkbox' checked><a href='/two'>Second page</a>"
@@ -298,6 +299,16 @@ class RealBrowserTest(unittest.TestCase):
         self.addCleanup(again.close)
         again.open(base + "/cookie")
         self.assertIn("kept=yes", again._eval("document.cookie"))
+        # A session cookie (no expiry) ends with the browser; it is kept and put back by hand (Node v0.24.1).
+        again.open(base + "/session")
+        session = again.session_cookies()
+        self.assertEqual([c["name"] for c in session], ["sid"])
+        again.close(graceful=True)
+        third = Browser(find_binary(shutil.which, sys.platform), profile, extra_args=extra)
+        self.addCleanup(third.close)
+        third.after_start = lambda: third.restore_cookies(session)
+        third.open(base + "/two")
+        self.assertIn("sid=s1", third._eval("document.cookie"), "the session sign-in is back")
 
     def test_a_browser_desk_its_page_is_the_screen(self):
         # Desks plan D2 in a real browser: no display; the page is the desk's screen, mouse and keyboard, and live view.

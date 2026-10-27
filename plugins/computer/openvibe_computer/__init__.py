@@ -68,6 +68,7 @@ Command kinds and their answers (the ack's ``data``):
 
 import base64
 import contextlib
+import json
 import http.client
 import ipaddress
 import os
@@ -117,6 +118,7 @@ BROWSER_READS = frozenset({"read", "screenshot", "close"})
 BROWSER_ACTS = frozenset({"open", "click", "fill", "press", "back"})
 MAX_URL = 2048
 PROFILE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
+SESSION_COOKIES = "ov-session-cookies.json"   # in a kept profile: the cookies that end with the browser
 # What a kept profile leaves out: caches, crash reports, locks and the last session's tabs (a desk opens on a blank page).
 PROFILE_SKIP = shutil.ignore_patterns("Cache", "Code Cache", "GPUCache", "GrShaderCache", "GraphiteDawnCache", "ShaderCache",
                                       "DawnCache", "DawnGraphiteCache", "DawnWebGPUCache", "CacheStorage", "ScriptCache",
@@ -175,7 +177,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.12.0"
+    version = "0.12.1"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -534,6 +536,9 @@ class Computer(Plugin):
             profile = self._desk_profile_dir(desk)
             self._restore_profile(desk)
             b = self.desk_browsers[desk] = self.browser_factory(binary, profile, page, env=env)
+            kept = self._take_session_cookies(desk)
+            if kept:
+                b.after_start = lambda: self._put_cookies(desk, b, kept)
             b.download_dir = self.desks.dir(desk, "downloads")
             if page:
                 st = self.desks.status(desk)
@@ -586,11 +591,45 @@ class Computer(Plugin):
                 shutil.copytree(kept, own, symlinks=True, ignore=PROFILE_SKIP)
                 os.chmod(own, 0o700)
 
+    def _take_session_cookies(self, desk):
+        """The session cookies a desk's kept profile brought (read once, then the file goes: it is written again on save)."""
+        if desk not in self.desk_profiles:
+            return None
+        path = os.path.join(self._desk_profile_dir(desk), SESSION_COOKIES)
+        try:
+            with open(path) as f:
+                cookies = json.load(f)
+        except (OSError, ValueError):
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return cookies if isinstance(cookies, list) else None
+
+    def _put_cookies(self, desk, b, cookies):
+        try:
+            b.restore_cookies(cookies)
+        except BrowserError as e:
+            self.log("desk %s: its kept session cookies did not go back in: %s", desk, e.message)
+
     def _end_desk_browser(self, desk):
         """Close a desk's browser so it writes everything down, save its profile back when it started from a kept one
         (the last desk to stop wins), and remove the desk's own copy. → True when saved, False when not (too large or
         a failed copy), None for a desk without a kept profile."""
         b = self.desk_browsers.pop(desk, None)
+        profile = self.desk_profiles.get(desk)
+        if b is not None and profile and b.alive():
+            # Chrome drops cookies that end with the browser when it quits, and a sign-in is often one: keep them.
+            try:
+                cookies = b.session_cookies()
+                path = os.path.join(self._desk_profile_dir(desk), SESSION_COOKIES)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    json.dump(cookies, f)
+            except (BrowserError, OSError) as e:
+                self.log("desk %s: its session cookies were not kept: %s", desk, getattr(e, "message", e))
         if b is not None:
             b.close(graceful=True)
         profile = self.desk_profiles.pop(desk, None)

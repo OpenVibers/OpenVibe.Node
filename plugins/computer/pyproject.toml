@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openvibe-computer"
-version = "0.12.0"
+version = "0.12.1"
 description = "OpenVibe Node computer plugin: the machine's terminal, files and screen under the owner's control level"
 requires-python = ">=3.9"
 license = { text = "AGPL-3.0-or-later" }
