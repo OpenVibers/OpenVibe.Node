@@ -28,6 +28,10 @@ import (
 const (
 	DefaultServer = "https://openvibe.bot"
 	EnvHome       = "OPENVIBE_NODE_HOME"
+	// EnvConfigDir and EnvStateDir are the Node's directories as it gives them to its plugins, so a command a plugin
+	// runs (`openvibe-node desk-sandbox`) reads the same config as the Node that started it.
+	EnvConfigDir = "OPENVIBE_NODE_CONFIG"
+	EnvStateDir  = "OPENVIBE_NODE_STATE"
 )
 
 // Paths are the Node's directories.

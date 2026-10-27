@@ -194,9 +194,13 @@ def find_binary(which, platform, configured=None):
 
 
 class Browser:
-    def __init__(self, binary, profile, headless=True, timeout_s=15.0, popen=subprocess.Popen, extra_args=(), env=None):
+    def __init__(self, binary, profile, headless=True, timeout_s=15.0, popen=subprocess.Popen, extra_args=(), env=None,
+                 sandbox=None):
         self.binary = binary
         self.env = env   # the private desk's display and bus, or None for this process's own
+        # On a desk host serving other people (desk_isolation sandbox): the `openvibe-node desk-sandbox … --` command the
+        # browser runs under, its profile inside the sandbox (profile is then a path in there, never made here).
+        self.sandbox = list(sandbox) if sandbox else None
         self.extra_args = list(extra_args)
         self.stderr_tail = []
         self.profile = profile
@@ -235,7 +239,8 @@ class Browser:
                 self._start()
 
     def _start(self):
-        os.makedirs(self.profile, mode=0o700, exist_ok=True)
+        if not self.sandbox:
+            os.makedirs(self.profile, mode=0o700, exist_ok=True)
         to_chrome_r, to_chrome_w = os.pipe()
         from_chrome_r, from_chrome_w = os.pipe()
         argv = [self.binary, "--remote-debugging-pipe", "--user-data-dir=%s" % self.profile, "--no-first-run",
@@ -244,6 +249,8 @@ class Browser:
         if self.headless:
             argv.insert(1, "--headless=new")
         argv[1:1] = self.extra_args
+        if self.sandbox:
+            argv[:0] = self.sandbox   # fds 3 and 4 pass through the sandbox to the browser
 
         def fds():
             # In the child: Chromium reads commands on 3 and writes on 4. Both ends move above 10 first, so placing one
@@ -683,6 +690,13 @@ class Browser:
             except OSError:
                 pass
         self.out = self.inp = None
+        if proc is not None and self.sandbox and proc.poll() is None:
+            # The sandbox ends its desk and removes its cgroup, network and root on SIGTERM; killed, it would leave them.
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
         if proc is not None and proc.poll() is None:
             try:
                 if hasattr(os, "killpg"):

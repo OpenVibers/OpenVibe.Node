@@ -69,6 +69,9 @@ Usage:
                     resume; --autostart starts it when you sign in
   openvibe-node profile verify community.<name> [--server URL] [--key-id ID]
                     check a community robot profile against the signature Bot made when it was reviewed
+  openvibe-node desk-sandbox [--memory-mb N] [--cpu-millis N] [--bind PATH]... [--egress public] -- PROGRAM [ARG]...
+                    run one desk's browser confined (a desk host that serves other people; the computer plugin
+                    calls it, with --remote-debugging-pipe on fds 3 and 4)
   openvibe-node version
 
 Global flags (before or after the command):
@@ -98,6 +101,9 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		return 0
 	}
 	cmd, rest := args[0], args[1:]
+	if cmd == "desk-sandbox" { // its own flags, up to "--": a browser's flags after it are never the Node's
+		return cmdDeskSandbox(rest, stderr)
+	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	g := &globals{}

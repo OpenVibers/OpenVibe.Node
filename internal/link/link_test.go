@@ -109,7 +109,9 @@ func waitFrame(t *testing.T, r *recorder, typ string) protocol.Frame {
 }
 
 func TestConnectHelloConfigHeartbeat(t *testing.T) {
-	srv, l, rec, _, _ := setup(t, 50*time.Millisecond)
+	// 100 ms heartbeats (a 200 ms deadman): a macOS runner can stall a goroutine past a 100 ms deadman, which this
+	// test is not about.
+	srv, l, rec, _, _ := setup(t, 100*time.Millisecond)
 	c, err := srv.NextConn(3 * time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -126,8 +128,8 @@ func TestConnectHelloConfigHeartbeat(t *testing.T) {
 	if srv.CredentialSeenInURL() {
 		t.Fatal("credential in URL")
 	}
-	// Heartbeats keep the link up well past the deadman.
-	time.Sleep(300 * time.Millisecond)
+	// Heartbeats keep the link up well past the deadman (three of them).
+	time.Sleep(600 * time.Millisecond)
 	if !l.Connected() {
 		t.Fatal("dropped while heartbeats were acked")
 	}

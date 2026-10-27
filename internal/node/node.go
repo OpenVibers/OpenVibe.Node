@@ -156,6 +156,7 @@ func New(opt Options) (*Node, error) {
 	n.limits = safety.Merge(protocol.Limits{}, opt.Config.Limits.MaxSpeed, opt.Config.Limits.MaxTurn, opt.Config.Limits.MaxCommandMS)
 
 	var specs []plugins.Spec
+	exe, _ := os.Executable()
 	for _, p := range opt.Config.Plugins {
 		if p.Disabled {
 			continue
@@ -165,7 +166,10 @@ func New(opt Options) (*Node, error) {
 			env = append(env, k+"="+v)
 		}
 		sort.Strings(env)
-		env = append(env, "OPENVIBE_NODE_STATE="+opt.Paths.StateDir)
+		env = append(env, config.EnvStateDir+"="+opt.Paths.StateDir, config.EnvConfigDir+"="+opt.Paths.ConfigDir)
+		if exe != "" {
+			env = append(env, "OPENVIBE_NODE_EXE="+exe) // `openvibe-node desk-sandbox` for the computer plugin's shared desks
+		}
 		cfg := map[string]any{}
 		for k, v := range p.Config {
 			cfg[k] = v

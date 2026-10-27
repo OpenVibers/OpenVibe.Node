@@ -315,6 +315,25 @@ How `public` and `openvibe-only` are enforced (`internal/worker/egress_linux.go`
 - **`openvibe-only` is configured, not guessed.** No authoritative list of the OpenVibe network's ranges exists in
   this repository or OpenVibe.Contracts, so `egress_allow` must name them; without it the config does not load.
 
+### Desks in the sandbox (`openvibe-node desk-sandbox`, Node v0.32.0)
+
+A desk host for other people (docs/computer.md, "Desk hosts for other people") runs each desk's browser in this same
+sandbox: `openvibe-node desk-sandbox [--memory-mb N] [--cpu-millis N] [--disk-mb N] [--pids N] [--egress public]
+[--bind PATH]... [--setenv NAME=VALUE]... -- PROGRAM [ARG]...`, which the computer plugin runs. What differs from a job:
+
+- **It lives for hours and talks both ways.** Fds 3 and 4 pass through to the program (a browser's
+  `--remote-debugging-pipe`; desk-sandbox takes them only when they are pipes or sockets), and there is no wall-clock or
+  CPU-time limit: `cpu.max`, `memory.max` (swap off), `pids.max` and the size of its private `/tmp` are. No `RLIMIT_AS`
+  either: a browser maps far more address space than it uses.
+- **Its binds.** Besides the system paths, only read-only `--bind`s under `/opt`, `/usr/local` or `/etc/fonts` (its
+  install directory, the fonts' configuration), never one that shows a Node directory or a hidden host path.
+- **Its config.** It reads the worker config of the Node that started its plugin (`OPENVIBE_NODE_CONFIG`,
+  `OPENVIBE_NODE_STATE`): `run_as`, `egress` (`--egress public` needs `public` there) and `dns`. Its cgroup is made
+  beside the Node's leaf, which the Node sets up when its worker is on, so a desk host keeps `worker.enabled` (with no
+  functions, no jobs are offered).
+- **Its end.** SIGTERM (the plugin's close) kills everything in its cgroup and removes the cgroup, its network and its
+  root; it exits with the program's code, or 125 when the sandbox could not be set up (the program never ran).
+
 ## Refusals and exit reasons
 
 Refused with `nack` (keyed by the job id; the first matching row wins, after the checks every Node does, in

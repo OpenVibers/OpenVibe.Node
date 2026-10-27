@@ -66,6 +66,13 @@ Command kinds and their answers (the ack's ``data``):
   against ``max_desks``. ``describe`` lists the kinds this machine runs (``desk.kinds``). Starting and stopping act
   (refused at observe, approved at ask), ``status`` runs at every level, and the kill switch stops the desk. Whole desks
   need Linux with Xvfb, browser desks a Chromium-family browser; config ``allow_desk: false`` turns both off.
+* **A desk host for other people** (``desk_isolation: "sandbox"``, Node v0.32, Desks plan D5): every desk is a browser
+  desk whose browser runs under ``openvibe-node desk-sandbox`` (the jobs' sandbox: its own namespaces and cgroup as
+  ``worker.run_as``, ``desk_memory_mb``, ``desk_cpu_millis``, ``desk_disk_mb`` and ``desk_pids`` each, only the public
+  internet with ``desk_egress: public``), its profile and downloads inside the sandbox and gone with the desk. Nothing
+  of the machine itself is offered: ``exec``, ``fs``, ``probe``, the main screen and browser, whole desks and kept
+  profiles are refused, and so is ``screen_stream`` (the machine's one stream is its operator's; ``screen`` shows a desk). It runs on Linux with the Node as root (the one case the plugin runs as root) and the worker
+  on, at level ``trusted`` (or ``observe``): nobody is at the machine to approve.
 * ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
   etag, last_modified, body, truncated, ms}``; for ``tcp://host:port``: ``{open, ms, error?}``. Read-only, so it runs at
   every level, and only towards the machine's own network: every address the name resolves to must be private,
@@ -143,6 +150,17 @@ CLICLICK_KEYS = {"return": "return", "enter": "enter", "escape": "esc", "esc": "
                  "delete": "fwd-delete", "space": "space", "up": "arrow-up", "down": "arrow-down", "left": "arrow-left",
                  "right": "arrow-right", "home": "home", "end": "end", "page_up": "page-up", "prior": "page-up",
                  "page_down": "page-down", "next": "page-down"}
+# A desk host serving other people (desk_isolation sandbox, Desks plan D5): each desk's browser runs under
+# `openvibe-node desk-sandbox`, which replaces Chrome's own sandbox (it cannot nest inside ours) and has no /dev/shm;
+# its profile and downloads live in the sandbox's /tmp, gone with the desk; its environment is only this.
+SANDBOX_CHROME_ARGS = ("--no-sandbox", "--no-zygote", "--disable-dev-shm-usage", "--disable-gpu")
+SANDBOX_PROFILE = "/tmp/desk/profile"
+SANDBOX_DOWNLOADS = "/tmp/desk/downloads"
+SANDBOX_ENV = ("HOME=/tmp/desk", "TMPDIR=/tmp/desk", "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "DBUS_SESSION_BUS_ADDRESS=disabled:")
+# What a shared desk host's own commands may be: its browser desks and what acts on them, never the machine itself.
+# No screen_stream: the live view goes to the machine owner's one stream, which is the host's operator's, not the
+# person's whose desk it is (a desk is seen there through screen, a picture answered to the command).
+SHARED_DESK_KINDS = frozenset({"screen", "input", "browser"})
 
 
 
@@ -196,7 +214,7 @@ def node_data_dir():
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.14.0"
+    version = "0.15.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -238,10 +256,13 @@ class Computer(Plugin):
         self.stream_mu = threading.Lock()
         self.browser_mu = threading.Lock()
         self.browser_op_mu = threading.Lock()
-        self.browser_factory = browser_factory or (lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env, extra_args=self._browser_args()))
+        self.browser_factory = browser_factory or self._new_browser
         # Every agent browser's connections go through the egress guard (Node v0.25.0): a page's own scripts never reach
         # the machine's own network below level full (config browser_egress: "open" turns it off).
         self.browser_egress = "public"
+        self.desk_isolation = "none"   # or "sandbox": a desk host for other people (SANDBOX_*)
+        self.desk_limits = {"memory_mb": 1024, "cpu_millis": 1000, "disk_mb": 512, "pids": 512}
+        self.desk_egress = "public"
         self.egress = EgressProxy(blocked=self._egress_blocked, log=lambda *a: self.log(*a))
         self.desk_factory = desk_factory or (lambda: PrivateDesk(which=which, popen=popen))
         self.desk = desk or self.desk_factory()   # the desk named private (the first one, as before v0.9.0)
@@ -294,12 +315,39 @@ class Computer(Plugin):
         if egress not in ("public", "open"):
             raise Fault("bad_value", "browser_egress is public (the default: never the machine's own network below level full) or open")
         self.browser_egress = egress
+        isolation = str(config.get("desk_isolation") or "none").strip().lower()
+        if isolation not in ("none", "sandbox"):
+            raise Fault("bad_value", "desk_isolation is none (the default: desks for the machine's owner) or sandbox (a desk host for other people)")
+        if isolation == "sandbox":
+            if not self.platform.startswith("linux"):
+                raise Fault("unsupported", "desk_isolation sandbox needs Linux (namespaces and cgroup v2)")
+            if level not in ("observe", "trusted"):
+                raise Fault("bad_value", "a desk host for other people runs at level trusted (or observe): nobody is at the machine to approve")
+        self.desk_isolation = isolation
+        self.desk_limits = {"memory_mb": _int(config.get("desk_memory_mb"), "desk_memory_mb", 256, 16384, 1024),
+                            "cpu_millis": _int(config.get("desk_cpu_millis"), "desk_cpu_millis", 100, 16000, 1000),
+                            "disk_mb": _int(config.get("desk_disk_mb"), "desk_disk_mb", 64, 16384, 512),
+                            "pids": _int(config.get("desk_pids"), "desk_pids", 64, 8192, 512)}
+        desk_egress = str(config.get("desk_egress") or "public").strip().lower()
+        if desk_egress not in ("public", "none"):
+            raise Fault("bad_value", "desk_egress is public (the default: the public internet only) or none")
+        self.desk_egress = desk_egress
+
+    def _shared(self):
+        return self.desk_isolation == "sandbox"
 
     def describe(self, config):
         try:
             self._configure(config)
         except Fault:
             return {}
+        if self._shared():
+            # A desk host for other people offers its browser desks, sandboxed, and nothing of the machine itself.
+            if "browser" not in self._desk_kinds():
+                return {}
+            return {"desk": {"level": self.level, "window_manager": None, "input": True, "screen": True, "named": True,
+                             "max_desks": self.desks.max_desks, "kinds": ["browser"], "profiles": False,
+                             "isolation": "sandbox", "limits": dict(self.desk_limits), "egress": self.desk_egress}}
         caps = {"files": {"level": self.level, "roots": self.roots, "max_read_bytes": self.max_read}}
         if self.allow_exec:
             caps["terminal"] = {"level": self.level, "timeout_s": self.timeout_s, "max_output_bytes": self.max_output,
@@ -340,7 +388,9 @@ class Computer(Plugin):
 
     def setup(self, config):
         self._configure(config)
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
+        # As root only on a desk host for other people, where nothing it starts runs unconfined: every browser goes
+        # through desk-sandbox (as worker.run_as) and no command reaches the machine itself (_shared_check).
+        if hasattr(os, "geteuid") and os.geteuid() == 0 and not self._shared():
             raise Fault("not_allowed", "the computer plugin never runs as root: run the Node as your own account")
 
     # ---- safety ----------------------------------------------------------------------------------------------------
@@ -438,6 +488,8 @@ class Computer(Plugin):
         if not isinstance(v, dict):
             raise Fault("bad_value", "value must be an object")
         level = self.effective_level()
+        if self._shared():
+            self._shared_check(cmd.kind, v)
         if cmd.kind == "desk":
             return self._desk_op(cmd, v, level)
         desk_env = self._desk_env(v) if cmd.kind in ("screen", "screen_stream", "input", "browser") else None
@@ -491,6 +543,56 @@ class Computer(Plugin):
             run, summary = self._exec_op(cmd, v, level)
             return self._act(cmd, level, run, summary, threaded=True)
         raise Fault("unsupported", "kind %s not supported" % cmd.kind)
+
+    def _shared_check(self, kind, v):
+        """On a desk host for other people: browser desks (started without a kept profile) and the commands that act on
+        one; never the machine's own screen, browser, files, programs or network."""
+        if kind == "desk":
+            if v.get("action") == "start" and v.get("kind", "desktop") != "browser":
+                raise Fault("unsupported", "this desk host runs browser desks only (kind browser)")
+            if v.get("action") == "start" and v.get("profile") is not None:
+                raise Fault("unsupported", "this desk host keeps no browser profiles: a desk's sign-ins end with it")
+            return
+        if kind in SHARED_DESK_KINDS and v.get("desk", "main") != "main":
+            return
+        if kind == "screen_stream":
+            raise Fault("not_allowed", "this desk host shows a desk as pictures (screen), not live: its one stream is its operator's")
+        raise Fault("not_allowed", "this machine is a desk host for other people: only its browser desks take commands")
+
+    def _sandbox_argv(self, binary):
+        """The `openvibe-node desk-sandbox … --` a desk's browser runs under on a desk host for other people, else None."""
+        if not self._shared():
+            return None
+        node = self.env.get("OPENVIBE_NODE_EXE") or self.which("openvibe-node")
+        if not node:
+            raise Fault("unsupported", "openvibe-node was not found to sandbox the desk (the Node sets OPENVIBE_NODE_EXE)")
+        real = os.path.realpath(binary)
+        binds = []
+        if binary.startswith("/snap/") or os.path.basename(real) == "snap":
+            raise Fault("unsupported", "a sandboxed desk's browser cannot be a snap: install Google Chrome's .deb (or Chromium from a .deb)")
+        if real.startswith(("/opt/", "/usr/local/")):
+            binds.append(os.path.dirname(real))   # the install directory, read-only; the rest of /usr is the system's
+        elif not real.startswith("/usr/"):
+            raise Fault("unsupported", "a sandboxed desk's browser is installed under /usr, /opt or /usr/local (%s is not: "
+                                       "a snap cannot run there)" % real)
+        if os.path.isdir("/etc/fonts"):
+            binds.append("/etc/fonts")
+        lim = self.desk_limits
+        argv = [node, "desk-sandbox", "--memory-mb", str(lim["memory_mb"]), "--cpu-millis", str(lim["cpu_millis"]),
+                "--disk-mb", str(lim["disk_mb"]), "--pids", str(lim["pids"])]
+        if self.desk_egress == "public":
+            argv += ["--egress", "public"]
+        for b in binds:
+            argv += ["--bind", b]
+        for kv in SANDBOX_ENV:
+            argv += ["--setenv", kv]
+        return argv + ["--"]
+
+    def _new_browser(self, binary, profile, headless, env=None):
+        sandbox = self._sandbox_argv(binary)
+        if sandbox:
+            binary = os.path.realpath(binary)   # the sandbox shows the install directory, not the links that lead to it
+        return Browser(binary, profile, headless, env=env, extra_args=self._browser_args(), sandbox=sandbox)
 
     # ---- the private desk --------------------------------------------------------------------------------------------
     def _desk_env(self, v):
@@ -566,13 +668,17 @@ class Computer(Plugin):
                 raise Fault("unsupported", "no browser on this machine (Chromium, Chrome, Edge or Brave), or this machine does not allow it")
             env = env or self.desks.env(desk)
             page = self.desks.kind(desk) == "browser"
-            profile = self._desk_profile_dir(desk)
-            self._restore_profile(desk)
-            b = self.desk_browsers[desk] = self.browser_factory(binary, profile, page, env=env)
-            kept = self._take_session_cookies(desk)
-            if kept:
-                b.after_start = lambda: self._put_cookies(desk, b, kept)
-            b.download_dir = self.desks.dir(desk, "downloads")
+            if self._shared():   # its profile and downloads inside its sandbox, gone with the desk
+                b = self.desk_browsers[desk] = self.browser_factory(binary, SANDBOX_PROFILE, page, env=env)
+                b.download_dir = SANDBOX_DOWNLOADS
+            else:
+                profile = self._desk_profile_dir(desk)
+                self._restore_profile(desk)
+                b = self.desk_browsers[desk] = self.browser_factory(binary, profile, page, env=env)
+                kept = self._take_session_cookies(desk)
+                if kept:
+                    b.after_start = lambda: self._put_cookies(desk, b, kept)
+                b.download_dir = self.desks.dir(desk, "downloads")
             if page:
                 st = self.desks.status(desk)
                 b.window = b.page_size = (st.get("width") or 1280, st.get("height") or 800)
@@ -1228,6 +1334,8 @@ class Computer(Plugin):
         return not_public(ip)
 
     def _browser_args(self):
+        if self._shared():   # the sandbox's own network rules, not a proxy on 127.0.0.1 (another namespace there)
+            return list(SANDBOX_CHROME_ARGS)
         return [] if self.browser_egress == "open" else self.egress.args()
 
     def _close_browser(self):
