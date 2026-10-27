@@ -78,7 +78,7 @@ acting actions until `openvibe-node resume`. `halt` kills what runs.
 
 | kind     | value                                                                                         | answer (`ack.data`) |
 |----------|-----------------------------------------------------------------------------------------------|---------------------|
-| `exec`   | `argv` (a program and its arguments: never a shell line), `cwd`, `timeout_s`, `stdin` (≤ 64 KB) | `exit_code`, `stdout`, `stderr` (each cut at `max_output_bytes`), `truncated`, `timed_out`, `duration_ms` |
+| `exec`   | `argv` (a program and its arguments: never a shell line), `cwd`, `timeout_s`, `stdin` (≤ 64 KB), `desk`, `detach` (Node v0.26.0: see "Programs on a desk") | `exit_code`, `stdout`, `stderr` (each cut at `max_output_bytes`), `truncated`, `timed_out`, `duration_ms`; detached: `started`, `pid`, `desk` |
 | `fs`     | `op` `list` / `stat` / `read` (`offset`, `length`) / `write` (`content_b64`, `mode` `create`, `overwrite` or `append`) / `mkdir`, and an absolute `path` | `entries` (≤ 1000), the stat, `content_b64` (≤ `max_read_bytes`), `written`, `created` |
 | `probe`  | `target`: `http(s)://…` (one GET, no redirect followed) or `tcp://host:port`; `timeout_s` | `status`, `content_type`, `etag`, `last_modified`, `body` (≤ 64 KB), `ms`; or `open`, `ms` |
 | `screen` | `max_width` (default 1280)                                                                    | `format` (`jpeg` with Pillow, else `png` ≤ 300 KB), `width`, `height`, `content_b64` |
@@ -200,6 +200,21 @@ window manager.
   your session (no `DISPLAY`, session bus or X cookie). `browser` drives its page, and its page is exactly the desk's
   size (1280×800 by default).
 - `private` is always a whole desk; a whole desk is `"kind": "desktop"`, the default.
+
+### Programs on a desk (`exec` with `desk` and `detach`, Node v0.26.0)
+
+A whole desk is a whole computer, so an agent can work in real applications there, never on your screen.
+- **`"desk": "desk-<name>"`** (or `private`) runs the program in that desk's session: its display, session bus and
+  temp folder. A program with windows opens on the desk.
+- **`"detach": true`** starts a program that keeps running and answers at once with its `pid`: an office suite, a
+  terminal, an editor. It is ended when its desk stops: by its agent, by `desk_idle_s`, or by the kill switch. At most
+  16 run on one desk.
+- **Never on your own session or a browser desk.** A browser desk has no screen for windows.
+- **Desk templates** come from this: a *research desk* is a browser desk; an *office desk* is a whole desk with an
+  office suite opened on it (`libreoffice --writer report.odt`); a *dev desk* is a whole desk with a terminal and an
+  editor. On a desk host, install the applications its desks should have (`apt install libreoffice xterm`).
+- `exec` keeps its rules: the folders you allow, the level (approved one by one at `ask`), and `allow_exec`.
+  `describe` says `terminal.desks: true`.
 
 ### Kept profiles (`"profile": "<name>"`, Node v0.24.0)
 

@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -527,6 +528,54 @@ class DeskPluginTest(unittest.TestCase):
         self.assertEqual(r["fault_code"], "bad_value")
         caps = self.plugin.describe({"level": "trusted"})
         self.assertTrue(caps["desk"]["profiles"])
+
+    def test_programs_on_a_desk(self):
+        # Node v0.26.0: a program runs in a desk's session (its windows there); detach starts one that keeps running
+        # and ends with its desk. Real processes stand in for the programs: env shows where it ran, sleep keeps running.
+        self.boot("trusted", max_desks=2)
+        fake = self.plugin.popen
+        reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-a", "width": 1000, "height": 500}))
+        started = []
+
+        def real(argv, **kw):
+            self.calls.append((argv, kw.get("env")))
+            stand_in = ["env"] if kw.get("stdout") == subprocess.PIPE else ["sleep", "30"]
+            proc = subprocess.Popen(stand_in, **{k: v for k, v in kw.items() if k != "cwd"})
+            started.append(proc)
+            return proc
+        self.plugin.popen = real
+        r = reply(self.out, self.cmd("exec", {"argv": ["xterm", "-version"], "desk": "desk-a"}))
+        self.assertEqual(r["op"], "ack", r)
+        self.assertIn("DISPLAY=:92", r["data"]["stdout"], "in the desk's session")
+        r = reply(self.out, self.cmd("exec", {"argv": ["true"]}))
+        self.assertNotIn("DISPLAY=:92", r["data"]["stdout"], "without desk: the person's own session, as before")
+        # Detached on the desk: answered at once, still running, ended when the desk stops.
+        r = reply(self.out, self.cmd("exec", {"argv": ["libreoffice", "--writer"], "desk": "desk-a", "detach": True}))
+        self.assertEqual((r["data"]["started"], r["data"]["desk"]), (True, "desk-a"), r)
+        office = started[-1]
+        self.assertEqual(r["data"]["pid"], office.pid)
+        self.assertEqual(self.calls[-1][1]["DISPLAY"], ":92")
+        self.assertIsNone(office.poll(), "still running")
+        self.plugin.popen = fake
+        reply(self.out, self.cmd("desk", {"action": "stop", "desk": "desk-a"}))
+        self.assertEqual(office.wait(timeout=5), -9, "ended with its desk")
+        # Never detached on the person's own session or a browser desk; a desk that does not run is not_ready.
+        self.plugin.popen = real
+        before = len(started)
+        self.assertEqual(reply(self.out, self.cmd("exec", {"argv": ["xterm"], "detach": True}))["fault_code"], "not_allowed")
+        reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-b", "kind": "browser"}))
+        self.assertEqual(reply(self.out, self.cmd("exec", {"argv": ["xterm"], "desk": "desk-b", "detach": True}))["fault_code"], "unsupported")
+        self.assertEqual(reply(self.out, self.cmd("exec", {"argv": ["xterm"], "desk": "desk-c"}))["fault_code"], "not_ready")
+        self.assertEqual(reply(self.out, self.cmd("exec", {"argv": ["xterm"], "desk": "desk-a", "detach": "yes"}))["fault_code"], "bad_value")
+        self.assertEqual(len(started), before, "nothing refused was started")
+        # The kill switch ends every desk's programs.
+        reply(self.out, self.cmd("desk", {"action": "start", "desk": "desk-d"}))
+        reply(self.out, self.cmd("exec", {"argv": ["xterm"], "desk": "desk-d", "detach": True}))
+        term = started[-1]
+        self.plugin.popen = fake
+        self.plugin.stop()
+        self.assertEqual(term.wait(timeout=5), -9)
+        self.assertTrue(self.plugin.describe({"level": "trusted"})["terminal"]["desks"])
 
     def test_the_kill_switch_stops_the_desk(self):
         self.boot("trusted")
