@@ -36,6 +36,12 @@
 #                    as the unprivileged user openvibe-job in the worker's sandbox with public egress (the service
 #                    runs as root, which run_as and the egress need), and the OpenVibe.Codes job runner is added when
 #                    Node.js 20+ is installed system-wide. Linux only. docs/worker.md has the details.
+#   --desk-host      this machine hosts desks for its owner's agents (docs/computer.md "Desk hosts"; the Desks plan's
+#                    step D5): an old laptop, a mini PC or a spare workstation, no screen or login needed. The
+#                    service runs as its own account (openvibe-desk), the installer adds what desks need (Xvfb, a
+#                    window manager, D-Bus, xdotool, ImageMagick, Chromium) and sizes them to the machine's memory
+#                    (max_desks: one per 2 GiB); each agent task gets a desk of its own. Implies --computer trusted
+#                    (for that account's own files only); give another level with --computer.
 #   --computer LEVEL this machine's terminal, files and screen for its owner's agents (the computer plugin,
 #                    docs/computer.md), at LEVEL observe, ask, trusted or full. The service then runs as YOUR account
 #                    (the one that ran sudo), never root, and its folders are your home. Linux only; not with --worker.
@@ -72,6 +78,7 @@ LOCAL=""
 TAG="latest"
 WORKER=0
 COMPUTER=""
+DESK_HOST=0
 CLAIM_OK=1
 DRIVER_GIVEN=0
 SETUP="${OPENVIBE_SETUP_KEY:-}"
@@ -82,7 +89,7 @@ CODES_DIR=/opt/openvibe-codes
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
 	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker]"
-	echo "                  [--computer observe|ask|trusted|full] [--no-service] [--no-claim] [--setup osk_…]"
+	echo "                  [--computer observe|ask|trusted|full] [--desk-host] [--no-service] [--no-claim] [--setup osk_…]"
 	echo "                  [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh      (finds the kit, then shows a code to approve on openvibe.bot/link)"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
@@ -113,6 +120,7 @@ while [ $# -gt 0 ]; do
 	--pairing) PAIRING="${2:-}"; shift 2 ;;
 	--pairing=*) PAIRING="${1#*=}"; shift ;;
 	--worker) WORKER=1; shift ;;
+	--desk-host) DESK_HOST=1; shift ;;
 	--computer) COMPUTER="${2:-}"; shift 2 ;;
 	--computer=*) COMPUTER="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
@@ -138,7 +146,7 @@ case "$NETWORK" in ""|https://*|http://localhost*|http://127.0.0.1*) ;; *) die "
 if [ -n "$SETUP" ]; then
 	printf '%s' "$SETUP" | grep -Eq '^osk_[A-Za-z0-9_-]{43}$' || die "--setup takes the osk_… key from your card files (openvibe.bot/setup/sd-card)"
 	[ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] || die "--setup is used on its own (no --robot, --code, --network or --pairing)"
-	if [ "$CLAIM_OK" = 0 ] || [ "$WORKER" = 1 ] || [ -n "$COMPUTER" ]; then die "--setup cannot be used with --no-claim, --worker or --computer"; fi
+	if [ "$CLAIM_OK" = 0 ] || [ "$WORKER" = 1 ] || [ -n "$COMPUTER" ] || [ "$DESK_HOST" = 1 ]; then die "--setup cannot be used with --no-claim, --worker, --computer or --desk-host"; fi
 fi
 # No robot, no code, no Network pairing, not a worker or a computer: the one command (openvibe.bot/link, see the top).
 CLAIM=0
@@ -295,16 +303,23 @@ fi
 # write_worker_config <config.json> <job uid> <job gid> [<node.js> <codes dir>]: turn the job worker on in that config
 # (kept as it is otherwise, created when missing): jobs as the job user, public egress, caps sized for a coding task,
 # and, with a Node.js and a Codes install, the `openvibe-codes@1.0.0` job runner. Keys stay empty for the owner to add.
-# write_computer_config <config.json> <level> <home>: add the computer plugin at that level (replacing an earlier entry),
-# its folder the owner's home; the rest of the config is kept.
+# write_computer_config <config.json> <level> <home> [desk-host]: add the computer plugin at that level (replacing an
+# earlier entry), its folder the owner's home; the rest of the config is kept. A desk host (4th argument 1) keeps its
+# desks under <home>/desks, shows no notifications (nobody sits at it) and turns the camera off.
 write_computer_config() {
 	${SUDO:-} python3 - "$@" <<'PY'
 import json, os, sys
 path, level, home = sys.argv[1], sys.argv[2], sys.argv[3]
+desk_host = len(sys.argv) > 4 and sys.argv[4] == '1'
 with open(path) as f:
     conf = json.load(f)
 plugins = [p for p in conf.get('plugins') or [] if p.get('name') not in ('computer', 'dryrun')]
-plugins.append({'name': 'computer', 'config': {'level': level, 'roots': [home]}})
+computer = {'level': level, 'roots': [home]}
+if desk_host:
+    computer.update({'notify': False, 'allow_desk': True, 'desk_dir': os.path.join(home, 'desks'),
+                     'browser_profile': os.path.join(home, 'browser')})
+    conf['video'] = {'source': 'off'}
+plugins.append({'name': 'computer', 'config': computer})
 conf['plugins'] = plugins
 old = os.umask(0o077)
 with open(path + '.tmp', 'w') as f:
@@ -376,8 +391,9 @@ fi
 # OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY=<config.json> with --computer LEVEL and OPENVIBE_COMPUTER_HOME adds the computer
 # plugin to that config and exits (scripts/test-install-computer-config.sh).
 if [ -n "${OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY:-}" ]; then
+	[ "$DESK_HOST" = 0 ] || [ -n "$COMPUTER" ] || COMPUTER=trusted
 	case "$COMPUTER" in observe|ask|trusted|full) ;; *) die "--computer is observe, ask, trusted or full" ;; esac
-	write_computer_config "$OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY" "$COMPUTER" "${OPENVIBE_COMPUTER_HOME:?}"
+	write_computer_config "$OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY" "$COMPUTER" "${OPENVIBE_COMPUTER_HOME:?}" "$DESK_HOST"
 	exit 0
 fi
 
@@ -633,7 +649,22 @@ say "installed $BIN_DIR/openvibe-node ($("$BIN_DIR/openvibe-node" version))"
 SVC_USER=""
 if [ "$WORKER" = 1 ] && [ "$OS" != linux ]; then die "--worker is for Linux"; fi
 COMPUTER_HOME=""
-if [ -n "$COMPUTER" ]; then
+if [ "$DESK_HOST" = 1 ]; then
+	# A desk host: the desks run as an account of their own, never the person's, so an agent there never reaches the
+	# owner's files, browser or sessions. --computer still sets the level (trusted by default).
+	[ "$OS" = linux ] || die "--desk-host is for Linux (desks are Xvfb displays)"
+	[ "$WORKER" = 0 ] || die "--desk-host and --worker cannot share a machine yet (the worker's service runs as root)"
+	[ -n "$COMPUTER" ] || COMPUTER=trusted
+	SVC_USER=openvibe-desk
+	COMPUTER_HOME=/var/lib/openvibe-desk
+	if ! id "$SVC_USER" >/dev/null 2>&1; then
+		$SUDO useradd --system --create-home --home-dir "$COMPUTER_HOME" --shell /usr/sbin/nologin --user-group "$SVC_USER" 2>/dev/null ||
+			$SUDO adduser --system --home "$COMPUTER_HOME" --shell /usr/sbin/nologin --group "$SVC_USER"
+	fi
+	$SUDO mkdir -p "$COMPUTER_HOME/desks"
+	$SUDO chown -R "$SVC_USER": "$COMPUTER_HOME"
+	$SUDO chmod 700 "$COMPUTER_HOME"
+elif [ -n "$COMPUTER" ]; then
 	case "$COMPUTER" in observe|ask|trusted|full) ;; *) die "--computer is observe, ask, trusted or full" ;; esac
 	[ "$OS" = linux ] || die "--computer is for Linux in this installer (docs/computer.md: run the Node in your own session elsewhere)"
 	[ "$WORKER" = 0 ] || die "--computer and --worker cannot share a machine yet (the worker's service runs as root)"
@@ -642,6 +673,7 @@ if [ -n "$COMPUTER" ]; then
 	COMPUTER_HOME=$(getent passwd "$SVC_USER" | cut -d: -f6)
 	if [ -z "$COMPUTER_HOME" ] || [ ! -d "$COMPUTER_HOME" ]; then die "no home folder for $SVC_USER"; fi
 fi
+case "$COMPUTER" in ""|observe|ask|trusted|full) ;; *) die "--computer is observe, ask, trusted or full" ;; esac
 if [ "$OS" = linux ] && [ "$SERVICE" = 1 ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ]; then
 	SVC_USER=openvibe-node
 	if ! id "$SVC_USER" >/dev/null 2>&1; then
@@ -714,6 +746,20 @@ if [ -n "$COMPUTER" ]; then
 	$SUDO "$PIP" install --quiet "$STATE/plugins/computer[screen]" 2>/dev/null || $SUDO "$PIP" install --quiet "$STATE/plugins/computer"
 	[ "$DRIVER" = none ] && VIDEO='"source": "off"'
 fi
+if [ "$DESK_HOST" = 1 ]; then
+	# What a desk needs: a display (Xvfb), a window manager, its own D-Bus, input (xdotool), screenshots (ImageMagick),
+	# fonts, and a Chromium-family browser.
+	if command -v apt-get >/dev/null 2>&1; then
+		say "installing what desks need (Xvfb, openbox, D-Bus, xdotool, ImageMagick, fonts, Chromium)"
+		$SUDO apt-get install -y xvfb openbox dbus-x11 xdotool imagemagick fonts-dejavu-core fonts-noto-color-emoji >/dev/null 2>&1 ||
+			say "warning: apt-get could not install every desk tool; install xvfb openbox dbus-x11 xdotool imagemagick yourself"
+		if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
+			$SUDO apt-get install -y chromium >/dev/null 2>&1 || say "tip: no Chromium package here: install Google Chrome (a .deb from google.com/chrome) for the desks' browser"
+		fi
+	else
+		say "install Xvfb, openbox, D-Bus, xdotool, ImageMagick and Chromium with your package manager: desks need them"
+	fi
+fi
 if [ ! -f "$CONF/config.json" ]; then
 	$SUDO sh -c "umask 077; cat > '$CONF/config.json'" <<EOF
 {
@@ -729,7 +775,14 @@ else
 	# The one command sets up the robot it found: the driver's plugins, kind and video replace the old ones.
 	[ "$CLAIM" = 0 ] || set_driver_config "$CONF/config.json"
 fi
-if [ -n "$COMPUTER" ]; then
+if [ "$DESK_HOST" = 1 ]; then
+	write_computer_config "$CONF/config.json" "$COMPUTER" "$COMPUTER_HOME" 1
+	mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+	desks=$(( mem_kb / 2097152 )); [ "$desks" -ge 1 ] || desks=1; [ "$desks" -le 8 ] || desks=8
+	say "this machine is a desk host: up to $desks desks at once for your agents, each its own screen, browser and files"
+	say "(max_desks in $CONF/config.json changes it). On https://openvibe.bot/machines turn on \"Let my agent use this"
+	say "computer\" for it: your agents' tasks then each get a desk of their own here."
+elif [ -n "$COMPUTER" ]; then
 	write_computer_config "$CONF/config.json" "$COMPUTER" "$COMPUTER_HOME"
 	say "the computer plugin is on at level $COMPUTER for $SVC_USER (folder $COMPUTER_HOME); change it in $CONF/config.json"
 	# The tray starts when they sign in: what waits for approval with Approve and Deny, the stop and resume.

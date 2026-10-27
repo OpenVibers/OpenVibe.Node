@@ -156,6 +156,24 @@ An agent can work on a desk of its own instead of your screen (plan track K: Vib
 - **Needs** Linux with `Xvfb` (Debian/Ubuntu: `apt install xvfb`), `xdotool` for input and ImageMagick `import` or `scrot`
   for screenshots. Not offered elsewhere; `allow_desk: false` turns it off.
 
+### Desk hosts (`--desk-host`, Node v0.20.0)
+
+An old laptop, a mini PC or a spare workstation can host desks for your agents: no screen, keyboard or login needed.
+```
+curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_… --code … --desk-host
+```
+- **Its own account.** The Node runs as `openvibe-desk` (home `/var/lib/openvibe-desk`), never as a person. An agent
+  there never reaches anyone's own files, browser or sessions. The computer plugin runs at `trusted` for that account's
+  folder only (`--computer` sets another level).
+- **What desks need.** On apt systems the installer adds Xvfb, openbox, D-Bus, xdotool, ImageMagick, fonts and
+  Chromium. Elsewhere it lists them.
+- **Sized to the machine.** `max_desks` defaults to one desk per 2 GiB of memory (1 to 8), and the installer says how
+  many. Each agent task gets a desk of its own (OpenVibe.Actor with OpenVibe.Bot, Node v0.19.0): its own screen,
+  browser profile, downloads and temp folder. A task beyond `max_desks` is told the machine is busy (its desk does not
+  start); it never shares another task's desk.
+- **Then** turn on "Let my agent use this computer" for the machine on openvibe.bot/machines. Watch any desk live from
+  there, and take it over the same way.
+
 ## Config
 
 | key                  | default        | meaning |
