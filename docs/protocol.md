@@ -344,7 +344,8 @@ this mapping:
 
 `bad_frame`, `bad_value`, `unsupported`, `not_allowed`, `estopped`, `local_stop`, `expired`, `no_heartbeat`,
 `not_ready`, `plugin_down`, `plugin_timeout`, `hardware`, `firmware_unsupported`, `not_connected`, `cliff`,
-`picked_up`, `shutting_down`. Plugins may add their own; they are passed through.
+`picked_up`, `shutting_down`, `timing_unavailable` (0.30: a driver under strict timing could not check a motion command's
+original expiry, [plugins.md](plugins.md) answer 9). Plugins may add their own; they are passed through.
 
 ### Heartbeat, deadman, reconnect
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/OpenVibers/OpenVibe.Node/internal/credentials"
 	"github.com/OpenVibers/OpenVibe.Node/internal/fakebot"
+	"github.com/OpenVibers/OpenVibe.Node/internal/mono"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 )
 
@@ -493,32 +494,33 @@ func TestReplacedReconnects(t *testing.T) {
 // ServerNow reads the server's clock from the frames' ts: the skew less the fastest transit.
 func TestServerNow(t *testing.T) {
 	l := New(Options{URL: "ws://127.0.0.1:1/device"}, newRecorder())
-	if _, ok := l.ServerNow(time.Now()); ok {
+	if _, ok := l.ServerNow(mono.Now()); ok {
 		t.Fatal("an estimate before any frame")
 	}
-	ms := func(at time.Time) int64 {
+	ms := func(at mono.Instant) int64 {
 		ns, _ := l.ServerNow(at)
 		return ns / int64(time.Millisecond)
 	}
-	l.observe(10_000, time.UnixMilli(9_900))  // server 100 ms ahead, fast frame
-	l.observe(10_000, time.UnixMilli(10_500)) // a frame that sat 600 ms in a queue
-	if _, ok := l.ServerNow(time.UnixMilli(20_000)); !ok || ms(time.UnixMilli(20_000)) != 20_100 {
-		t.Fatalf("server now %d %v", ms(time.UnixMilli(20_000)), ok)
+	local := func(ms int64) mono.Instant { return mono.Instant(ms * int64(time.Millisecond)) }
+	l.observe(10_000, local(9_900))  // server 100 ms ahead, fast frame
+	l.observe(10_000, local(10_500)) // a frame that sat 600 ms in a queue
+	if _, ok := l.ServerNow(local(20_000)); !ok || ms(local(20_000)) != 20_100 {
+		t.Fatalf("server now %d %v", ms(local(20_000)), ok)
 	}
 	// A long run of frames that each sat 500 ms on the way never displaces the timely one: an expired deadline must
 	// not read as open again.
 	for i := 0; i < 100; i++ {
-		l.observe(int64(30_000+i*10), time.UnixMilli(int64(30_000+i*10)+400))
+		l.observe(int64(30_000+i*10), local(int64(30_000+i*10)+400))
 	}
-	if got := ms(time.UnixMilli(40_000)); got != 40_100 {
+	if got := ms(local(40_000)); got != 40_100 {
 		t.Fatalf("delayed frames moved the estimate: %d", got)
 	}
 	// A new connection starts a new estimate.
 	l.mu.Lock()
 	l.hasSkew = false
 	l.mu.Unlock()
-	l.observe(50_000, time.UnixMilli(50_000))
-	if got := ms(time.UnixMilli(60_000)); got != 60_000 {
+	l.observe(50_000, local(50_000))
+	if got := ms(local(60_000)); got != 60_000 {
 		t.Fatalf("estimate across connections: %d", got)
 	}
 }
@@ -527,7 +529,7 @@ func TestServerNow(t *testing.T) {
 // by those 0.6 ms, not by a whole millisecond either way.
 func TestServerNowKeepsNanoseconds(t *testing.T) {
 	l := New(Options{URL: "ws://127.0.0.1:1/device"}, newRecorder())
-	base := time.Unix(1_000, 0)
+	base := mono.Instant(1_000 * int64(time.Second))
 	l.observe(5_000_000, base)
 	// A later frame that left 0.6 ms closer: the server is 0.6 ms further ahead than the first sample said.
 	l.observe(5_000_001, base.Add(400*time.Microsecond))

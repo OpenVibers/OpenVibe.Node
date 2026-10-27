@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OpenVibers/OpenVibe.Node/internal/mono"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 )
 
@@ -48,6 +49,10 @@ type Spec struct {
 	Env    []string // extra KEY=VALUE entries
 	Dir    string
 	Config map[string]any
+	// StrictTiming: a motion command is never written to this plugin without its expiry on the clock they share
+	// (expires_at_mono_ns); with no shared clock it is answered timing_unavailable instead. Also set by the plugin's
+	// describe ("timing": "strict"), and passed to it in hello so its runtime refuses the same way.
+	StrictTiming bool
 }
 
 // Describe is the plugin's first message.
@@ -57,6 +62,8 @@ type Describe struct {
 	Protocol     int            `json:"protocol"`
 	Capabilities map[string]any `json:"capabilities"`
 	MotionKinds  []string       `json:"motion_kinds"`
+	// Timing "strict": the plugin requires every motion command's original expiry on the shared clock (Spec.StrictTiming).
+	Timing string `json:"timing,omitempty"`
 }
 
 // Reply is a plugin's answer to one command.
@@ -174,41 +181,76 @@ type line struct {
 type timed struct {
 	id      string
 	msg     map[string]any
-	expires time.Time // on this process's monotonic clock
-	queued  time.Time
+	expires mono.Instant // on the machine's precise clock, the one the plugin shares
+	queued  mono.Instant
+	motion  bool // a guarded or motion kind: strict timing applies to it
 }
 
-// render is the command's line as it is written now, or ok false when less than a millisecond is left.
-func (c *timed) render() (b []byte, ok bool) {
-	// The shared clock is read before the time left, so expires_at_mono_ns can only come out early.
-	mono, hasMono := monotonicNS()
-	left := time.Until(c.expires)
+// render is the command's line as it is written now, or the fault it is refused with instead: expired when less than a
+// millisecond is left, timing_unavailable when strict timing applies to it and there is no clock shared with the plugin
+// (or it could not be read) to carry its original expiry.
+func (c *timed) render(strict bool) (b []byte, refused string) {
+	left := mono.Until(c.expires)
 	if left < time.Millisecond {
-		return nil, false
+		return nil, protocol.FaultExpired
+	}
+	_, hasMono := monotonicNS()
+	if strict && c.motion && !hasMono {
+		return nil, protocol.FaultTimingUnavailable
 	}
 	c.msg["deadline_ms"] = int64(left / time.Millisecond)
 	if hasMono {
-		c.msg["expires_at_mono_ns"] = mono + int64(left)
+		// The instant itself: the core keeps it on the clock it shares with the plugin, so it is passed exactly.
+		c.msg["expires_at_mono_ns"] = int64(c.expires)
 	}
 	b, err := json.Marshal(c.msg)
 	if err != nil {
-		return nil, false
+		return nil, protocol.FaultExpired
 	}
-	return append(b, '\n'), true
+	return append(b, '\n'), ""
 }
 
-// expired answers a timed command that was never written: its time ran out in the queue to the plugin.
-func (p *Plugin) expired(c *timed) {
+// refuse answers a timed command that was never written: its time ran out in the queue to the plugin (expired), or
+// strict timing could not carry its original expiry to the plugin (timing_unavailable).
+func (p *Plugin) refuse(c *timed, code string) {
 	p.mu.Lock()
 	ch := p.pending[c.id]
 	p.mu.Unlock()
 	if ch == nil {
 		return
 	}
+	msg := fmt.Sprintf("its deadline passed while it waited %d ms in the queue to the driver; it was never sent", mono.Since(c.queued).Milliseconds())
+	if code == protocol.FaultTimingUnavailable {
+		msg = "strict timing: this machine has no clock shared with the driver to carry the command's original expiry, so it was not sent"
+	}
 	select {
-	case ch <- Reply{FaultCode: protocol.FaultExpired, Message: fmt.Sprintf("its deadline passed while it waited %d ms in the queue to the driver; it was never sent", time.Since(c.queued).Milliseconds())}:
+	case ch <- Reply{FaultCode: code, Message: msg}:
 	default:
 	}
+}
+
+// strictTiming is whether motion commands to this plugin need the shared clock: its configuration or its describe.
+func (p *Plugin) strictTiming() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.spec.StrictTiming || (p.desc != nil && p.desc.Timing == "strict")
+}
+
+// motionKind is whether kind moves something on this plugin: a guarded kind or one of its describe's motion kinds.
+func (p *Plugin) motionKind(kind string) bool {
+	if protocol.GuardedKinds[kind] {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.desc != nil {
+		for _, k := range p.desc.MotionKinds {
+			if k == kind {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // send queues one line for the plugin. A plugin that stops reading its stdin is killed: it can no longer be told to
@@ -339,7 +381,7 @@ func (p *Plugin) BeginAs(ctx context.Context, id, kind string, value json.RawMes
 // BeginTurn is BeginAs with the robot's control epoch the command was decided under (protocol.Command.TurnEpoch), sent
 // to the plugin as turn_epoch when it is set, so a driver can refuse a command older than the newest turn halt itself.
 func (p *Plugin) BeginTurn(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator, turnEpoch int64) func() Reply {
-	return p.begin(ctx, id, kind, value, deadlineMS, time.Time{}, op, turnEpoch, nil)
+	return p.begin(ctx, id, kind, value, deadlineMS, 0, op, turnEpoch, nil)
 }
 
 // Provenance is where a command came from, passed unchanged from Bot to the driver as `provenance` (plugins.md): the
@@ -361,12 +403,12 @@ type Provenance struct {
 // BeginWith is BeginTurn for a command that expires at an instant on this machine (the Node's receipt of it plus the
 // time its deadline left), with its provenance (nil: none). The plugin gets what is left when the line is written to
 // it, never more, and a command whose time runs out before then is answered expired without reaching the plugin.
-func (p *Plugin) BeginWith(ctx context.Context, id, kind string, value json.RawMessage, expires time.Time, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
+func (p *Plugin) BeginWith(ctx context.Context, id, kind string, value json.RawMessage, expires mono.Instant, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
 	return p.begin(ctx, id, kind, value, 0, expires, op, turnEpoch, prov)
 }
 
 // begin queues a command: with deadline_ms as given when expires is zero, else timed (BeginWith).
-func (p *Plugin) begin(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, expires time.Time, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
+func (p *Plugin) begin(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, expires mono.Instant, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
 	now := func(r Reply) func() Reply { return func() Reply { return r } }
 	p.mu.Lock()
 	if p.state != StateReady && kind != protocol.KindHalt {
@@ -406,10 +448,10 @@ func (p *Plugin) begin(ctx context.Context, id, kind string, value json.RawMessa
 		msg["provenance"] = prov
 	}
 	var err error
-	if expires.IsZero() {
+	if expires == 0 {
 		err = p.send(msg)
 	} else {
-		err = p.enqueue(line{cmd: &timed{id: id, msg: msg, expires: expires, queued: time.Now()}})
+		err = p.enqueue(line{cmd: &timed{id: id, msg: msg, expires: expires, queued: mono.Now(), motion: p.motionKind(kind)}})
 	}
 	if err != nil {
 		done()
@@ -418,8 +460,8 @@ func (p *Plugin) begin(ctx context.Context, id, kind string, value json.RawMessa
 	return func() Reply {
 		defer done()
 		wait := time.Duration(deadlineMS) * time.Millisecond
-		if !expires.IsZero() {
-			wait = time.Until(expires)
+		if expires != 0 {
+			wait = mono.Until(expires)
 		}
 		if wait < MinReplyTimeout {
 			wait = MinReplyTimeout
@@ -531,9 +573,9 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 	write := func(l line) error {
 		b := l.b
 		if l.cmd != nil {
-			var ok bool
-			if b, ok = l.cmd.render(); !ok {
-				p.expired(l.cmd)
+			var refused string
+			if b, refused = l.cmd.render(p.strictTiming()); refused != "" {
+				p.refuse(l.cmd, refused)
 				return nil
 			}
 		}
@@ -574,6 +616,13 @@ func (p *Plugin) runOnce(ctx context.Context) error {
 	}()
 
 	hello := map[string]any{"op": "hello", "config": nonNil(p.spec.Config), "probe": false}
+	// The clock expires_at_mono_ns is on: the runtime checks it reads the same one before trusting the field.
+	if _, ok := monotonicNS(); ok {
+		hello["shared_clock"] = sharedClockName
+	}
+	if p.spec.StrictTiming {
+		hello["strict_timing"] = true
+	}
 	if haltEpoch > 0 {
 		hello["halt_epoch"] = haltEpoch
 	}

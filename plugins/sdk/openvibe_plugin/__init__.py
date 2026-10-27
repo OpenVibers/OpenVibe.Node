@@ -21,10 +21,10 @@ import time
 
 __all__ = ["Plugin", "Fault", "Deferred", "Command", "StopInfo", "Runtime", "run", "clamp", "MOTION_KINDS",
            "HEARTBEAT_TIMEOUT_S", "DEFAULT_DEADLINE_MS", "PROTOCOL_VERSION", "STOP_CAUSES", "EMERGENCY_CAUSES",
-           "RUNTIME_CAUSES", "SHARED_CLOCK", "__version__"]
+           "RUNTIME_CAUSES", "SHARED_CLOCK", "SHARED_CLOCK_NAME", "TIMING_UNAVAILABLE", "__version__"]
 
 # The Node release this runtime ships with (pyproject.toml carries the same).
-__version__ = "0.29.0"
+__version__ = "0.30.0"
 PROTOCOL_VERSION = 1
 HEARTBEAT_TIMEOUT_S = 1.0
 DEFAULT_DEADLINE_MS = 300
@@ -42,10 +42,54 @@ def _monotonic_ns():
     return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
 
-# The clock this process shares with the core: CLOCK_MONOTONIC, one clock for every process on the machine, which a
-# step of the wall clock does not move. A command's expires_at_mono_ns is an instant on it (Node 0.18). None where
-# there is none to share (Windows): deadline_ms alone then, which the core counts down to the moment it wrote the line.
-SHARED_CLOCK = _monotonic_ns if hasattr(time, "clock_gettime_ns") and hasattr(time, "CLOCK_MONOTONIC") else None
+def _qpc_ns(ticks, freq):
+    """A QueryPerformanceCounter reading in nanoseconds, rounded down: whole seconds and the remainder apart, exactly as
+    Node computes it (internal/plugins/clock.go qpcNS), so the two values compare exactly."""
+    return (ticks // freq) * 1000000000 + (ticks % freq) * 1000000000 // freq
+
+
+def _qpc_clock():
+    """A reader of the raw QueryPerformanceCounter in ns (Windows), or None. Raw, through kernel32: Python's own
+    time.monotonic is GetTickCount64 before 3.13 and perf_counter's reference point is not specified, so neither is
+    relied on to match Node."""
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32")
+        f = ctypes.c_int64()
+        if not k32.QueryPerformanceFrequency(ctypes.byref(f)) or f.value <= 0:
+            return None
+        freq = f.value
+    except (AttributeError, OSError, ImportError):
+        return None
+
+    def read():
+        t = ctypes.c_int64()
+        if not k32.QueryPerformanceCounter(ctypes.byref(t)):
+            raise OSError("QueryPerformanceCounter failed")
+        return _qpc_ns(t.value, freq)
+    return read
+
+
+def _shared_clock():
+    """(name, reader) of the clock this process shares with the core, as hello names it (Node 0.30), or (None, None).
+    CLOCK_MONOTONIC on Unix; the raw QueryPerformanceCounter on Windows: one clock for every process on the machine,
+    which a step of the wall clock does not move. A command's expires_at_mono_ns is an instant on it (Node 0.18)."""
+    if sys.platform == "win32":
+        read = _qpc_clock()
+        return ("qpc", read) if read else (None, None)
+    if hasattr(time, "clock_gettime_ns") and hasattr(time, "CLOCK_MONOTONIC"):
+        return "clock_monotonic", _monotonic_ns
+    return None, None
+
+
+SHARED_CLOCK_NAME, SHARED_CLOCK = _shared_clock()
+
+# The fault a strict-timing runtime answers a motion command with when its original expiry cannot be checked.
+TIMING_UNAVAILABLE = "timing_unavailable"
+
+
+def _truthy(v):
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class Fault(Exception):
@@ -207,6 +251,11 @@ class Plugin:
     # Seconds between attempts to set up again after setup raised (the hardware or the robot's computer was not up
     # yet). None: a failed setup stays failed until the core restarts the plugin.
     retry_setup_s = None
+    # Strict timing (Node 0.30): a motion command whose original expiry cannot be checked on the clock shared with the
+    # core (none on this machine, a failed read, a different clock, or a core that sent none) is refused before handle()
+    # with timing_unavailable, never run on deadline_ms alone. The deployment can also require it: OPENVIBE_STRICT_TIMING=1
+    # in the plugin's environment, or strict_timing in the Node's plugin configuration (hello).
+    strict_timing = False
 
     runtime = None  # set by Runtime
 
@@ -312,7 +361,7 @@ class Runtime:
     """Drives one Plugin from a line-oriented input and output. Tests construct it with in-memory streams."""
 
     def __init__(self, plugin, infile=None, outfile=None, clock=time.monotonic,
-                 heartbeat_timeout_s=HEARTBEAT_TIMEOUT_S, shared_clock=SHARED_CLOCK):
+                 heartbeat_timeout_s=HEARTBEAT_TIMEOUT_S, shared_clock=SHARED_CLOCK, shared_clock_name=SHARED_CLOCK_NAME):
         self.plugin = plugin
         plugin.runtime = self
         self.infile = infile if infile is not None else sys.stdin
@@ -320,6 +369,11 @@ class Runtime:
         self.clock = clock
         # The clock shared with the core (SHARED_CLOCK, ns), read with clock when each line arrives; None: not shared.
         self.shared_clock = shared_clock
+        self.shared_clock_name = shared_clock_name if shared_clock is not None else None
+        # The clock the core named in hello (Node 0.30), and whether it is ours: expires_at_mono_ns is trusted only then.
+        self.core_clock = None
+        self.clock_agrees = True
+        self.strict_timing = bool(getattr(plugin, "strict_timing", False)) or _truthy(os.environ.get("OPENVIBE_STRICT_TIMING"))
         self.heartbeat_timeout_s = heartbeat_timeout_s
         self.lock = threading.RLock()
         self.out_lock = threading.Lock()
@@ -403,6 +457,18 @@ class Runtime:
                 self.send(dict(op="telemetry", **t))
 
     # Input.
+    def _timing_gap(self, msg, shared_at):
+        """Why a motion command's original expiry cannot be checked, in words."""
+        if self.shared_clock is None:
+            return "this machine has no clock this runtime shares with the core"
+        if not self.clock_agrees:
+            return "the core's clock (%s) is not this runtime's (%s)" % (self.core_clock, self.shared_clock_name)
+        if not isinstance(msg.get("expires_at_mono_ns"), int) or isinstance(msg.get("expires_at_mono_ns"), bool):
+            return "the core sent no expiry on the shared clock (expires_at_mono_ns)"
+        if shared_at is None:
+            return "the shared clock could not be read when the command arrived"
+        return "the command's expiry could not be checked"
+
     def shared_now(self):
         """The shared clock now (ns), or None."""
         if self.shared_clock is None:
@@ -481,6 +547,13 @@ class Runtime:
     def on_hello(self, msg):
         self.config = msg.get("config") or {}
         self.probe = bool(msg.get("probe"))
+        # The clock the core put expires_at_mono_ns on. A different one than ours (or ours missing) is never compared
+        # with: the field then counts as absent, and strict timing refuses motion.
+        core_clock = msg.get("shared_clock")
+        self.core_clock = core_clock if isinstance(core_clock, str) else None
+        self.clock_agrees = self.core_clock is None or self.core_clock == self.shared_clock_name
+        if msg.get("strict_timing") is True:
+            self.strict_timing = True
         # The newest halt epoch the core has seen (Node v0.17.0): a restarted process keeps refusing older turns.
         epoch = _epoch(msg.get("halt_epoch"))
         if epoch and epoch > self.halt_epoch:
@@ -490,9 +563,12 @@ class Runtime:
         except Exception as e:
             caps = {}
             self.plugin.log("describe failed: %r", e)
-        self.send({"op": "describe", "driver": self.plugin.driver, "version": self.plugin.version,
-                   "protocol": PROTOCOL_VERSION, "capabilities": caps,
-                   "motion_kinds": sorted(self.plugin.motion_kinds)})
+        describe = {"op": "describe", "driver": self.plugin.driver, "version": self.plugin.version,
+                    "protocol": PROTOCOL_VERSION, "capabilities": caps, "motion_kinds": sorted(self.plugin.motion_kinds)}
+        if self.strict_timing:
+            # The core refuses too, before writing: a motion command never leaves it without its original expiry.
+            describe["timing"] = "strict"
+        self.send(describe)
         if self.probe:
             return
         self._setup()
@@ -531,7 +607,8 @@ class Runtime:
         dl = max(1, min(dl, MAX_DEADLINE_MS if moves else MAX_LONG_DEADLINE_MS))
         # What the command had left when its line arrived, on the clock shared with the core (Node 0.18): deadline_ms
         # was counted down to the moment the core wrote the line, so this takes off the time it then sat in the pipe.
-        left = _left_ms(msg.get("expires_at_mono_ns"), shared_at) if moves else None
+        # Only on the clock the core named (hello, Node 0.30): another clock's instant is never compared with ours.
+        left = _left_ms(msg.get("expires_at_mono_ns"), shared_at if self.clock_agrees else None) if moves else None
         if left is not None and left >= 1:
             dl = min(dl, left)
         cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"), msg.get("operator"), msg.get("turn_epoch"),
@@ -554,6 +631,11 @@ class Runtime:
                            "message": "a replay: seq %d is not above %d on this session" % (prov["seq"], self.last_seq)})
                 return
             self.last_session, self.last_seq = prov["session"], prov["seq"]
+        # Strict timing: a motion command whose original expiry cannot be checked here never reaches the driver.
+        if moves and self.strict_timing and left is None:
+            self.send({"op": "nack", "id": cid, "fault_code": TIMING_UNAVAILABLE,
+                       "message": "strict timing: " + self._timing_gap(msg, shared_at)})
+            return
         # A motion command whose time ran out in the pipe, before its line was read, never reaches the driver.
         if left is not None and left < 1:
             self.send({"op": "nack", "id": cid, "fault_code": "expired",

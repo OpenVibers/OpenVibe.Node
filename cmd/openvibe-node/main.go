@@ -246,7 +246,7 @@ func pluginSpecs(cfg *config.Config, paths config.Paths) []plugins.Spec {
 		for k, v := range p.Env {
 			env = append(env, k+"="+v)
 		}
-		out = append(out, plugins.Spec{Name: p.Name, Argv: cfg.PluginCommand(p, paths), Env: env, Dir: p.Dir, Config: p.Config})
+		out = append(out, plugins.Spec{Name: p.Name, Argv: cfg.PluginCommand(p, paths), Env: env, Dir: p.Dir, Config: p.Config, StrictTiming: p.StrictTiming})
 	}
 	return out
 }

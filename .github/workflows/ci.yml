@@ -76,6 +76,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # The deadline across the real pipe to a Python plugin, the clock it shares with the core, strict timing and the
+      # Python SDK's own suite, verbose so the log shows each ran on this OS (and its clock readings), never skipped.
+      - name: deadlines across the pipe (verbose)
+        run: go test -count=1 -v -run "TestQPC|TestTheClock|TestUntilAndSince|TestPython|TestHelloNamesTheSharedClock|TestPipeDelay|TestWriterQueue|TestStrictTiming" ./internal/mono ./internal/plugins
       - run: go test -count=1 ./...
 
   python:

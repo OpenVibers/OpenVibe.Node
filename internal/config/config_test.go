@@ -66,6 +66,26 @@ func TestPluginCommand(t *testing.T) {
 	}
 }
 
+// strict_timing on a plugin is read from config.json (the LOOI bridge's, docs/hardware-looi.md), and is off by default.
+func TestPluginStrictTiming(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	body := `{"server": "https://openvibe.bot", "plugins": [{"name": "looi", "strict_timing": true}, {"name": "dryrun"}]}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Plugins) != 2 || !c.Plugins[0].StrictTiming || c.Plugins[1].StrictTiming {
+		t.Fatalf("%+v", c.Plugins)
+	}
+	// looi needs no command: the Node runs the driver installed into its Python (install.sh --driver looi).
+	if got := c.PluginCommand(c.Plugins[0], HomePaths(t.TempDir())); len(got) != 3 || got[2] != "openvibe_looi" {
+		t.Fatalf("%v", got)
+	}
+}
+
 // TestWorkerVMLimitRequired: RLIMIT_AS is always set: max_vm_bytes has no "none" value and defaults when zero.
 func TestWorkerVMLimitRequired(t *testing.T) {
 	c := Default()

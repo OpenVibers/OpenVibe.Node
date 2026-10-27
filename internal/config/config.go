@@ -317,6 +317,10 @@ type PluginConfig struct {
 	Dir      string            `json:"dir,omitempty"`
 	Config   map[string]any    `json:"config,omitempty"` // sent to the plugin in hello
 	Disabled bool              `json:"disabled,omitempty"`
+	// StrictTiming: every motion command must reach this plugin with its original expiry on the clock they share, else
+	// it is refused (timing_unavailable), never downgraded to deadline_ms alone. For deployments that require it
+	// (Windows 10 robots: the shared clock is QueryPerformanceCounter from Node v0.30.0).
+	StrictTiming bool `json:"strict_timing,omitempty"`
 }
 
 // VideoConfig selects the camera source published over WHIP.
@@ -335,7 +339,9 @@ type VideoConfig struct {
 	WHIPURL string `json:"whip_url,omitempty"`
 }
 
-// Bundled lists the plugins that ship with the Node.
+// Bundled lists the plugins the Node runs as <python> -m <module> without a command: the ones that ship with it, and
+// looi, whose driver is installed into the same Python on its own (docs/hardware-looi.md; install.sh --driver looi
+// writes {"name": "looi"}, which was refused as "needs a command" until 0.30).
 var Bundled = map[string]string{
 	"dryrun":        "openvibe_dryrun",
 	"adeept_adr036": "openvibe_adeept_adr036",
@@ -345,6 +351,7 @@ var Bundled = map[string]string{
 	"computer":      "openvibe_computer",
 	"voice":         "openvibe_voice",
 	"ai":            "openvibe_ai",
+	"looi":          "openvibe_looi",
 }
 
 // Default is the config written by `openvibe-node pair` when none exists: the dry-run plugin and its test pattern.

@@ -34,6 +34,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/OpenVibers/OpenVibe.Node/internal/credentials"
+	"github.com/OpenVibers/OpenVibe.Node/internal/mono"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 )
 
@@ -85,7 +86,7 @@ const HelloAllowance = 10 * time.Second
 // hbSend is one heartbeat the link sent: its monotonic send time and the t it carried, so an ack can be matched
 // back either by the echoed t (Bot) or by the body seq (older servers).
 type hbSend struct {
-	at time.Time
+	at mono.Instant
 	t  int64
 }
 
@@ -107,7 +108,7 @@ type Link struct {
 	// hasSkew is false until a frame arrives.
 	skew      int64
 	hasSkew   bool
-	clockBase time.Time
+	clockBase mono.Instant
 
 	connected   atomic.Bool
 	lastRTT     atomic.Int64
@@ -162,7 +163,7 @@ func (l *Link) timing() (time.Duration, time.Duration) {
 }
 
 // observe records one server frame's ts, read at local time at.
-func (l *Link) observe(ts int64, at time.Time) {
+func (l *Link) observe(ts int64, at mono.Instant) {
 	if ts <= 0 {
 		return
 	}
@@ -172,7 +173,7 @@ func (l *Link) observe(ts int64, at time.Time) {
 		l.clockBase, l.skew, l.hasSkew = at, ts*int64(time.Millisecond), true
 		return
 	}
-	l.skew = max(l.skew, ts*int64(time.Millisecond)-int64(at.Sub(l.clockBase)))
+	l.skew = max(l.skew, ts*int64(time.Millisecond)-int64(at-l.clockBase))
 }
 
 // TSResolution is the resolution of the server's ts: Bot stamps whole milliseconds (Date.now(), rounded down), so a
@@ -187,13 +188,13 @@ const TSResolution = time.Millisecond
 // nor rounding moves the estimate later. The best sample is kept for the whole connection: a run of delayed frames can
 // never make an expired deadline look open again. A server clock that steps back only makes deadlines read as expired
 // (fail closed) until the next connection. ok is false before any frame.
-func (l *Link) ServerNow(at time.Time) (ns int64, ok bool) {
+func (l *Link) ServerNow(at mono.Instant) (ns int64, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.hasSkew {
 		return 0, false
 	}
-	return int64(at.Sub(l.clockBase)) + l.skew, true
+	return int64(at-l.clockBase) + l.skew, true
 }
 
 // ClockUncertainty bounds how far ServerNow can trail the server's real clock on this connection: the fastest
@@ -254,7 +255,7 @@ func (l *Link) Send(m protocol.Message) error {
 				delete(l.hbSent, s)
 			}
 		}
-		l.hbSent[l.seq] = hbSend{at: now, t: hb.T}
+		l.hbSent[l.seq] = hbSend{at: mono.Now(), t: hb.T}
 	}
 	b, err := protocol.Encode(l.seq, now.UnixMilli(), m)
 	if err != nil {
@@ -492,6 +493,7 @@ func (l *Link) session(ctx context.Context) error {
 			}
 			return endErr
 		}
+		rxAt := mono.Now() // the frame's arrival on the precise clock, for the estimate of Bot's
 		rx := time.Now()
 		lastRx.Store(rx.UnixNano())
 		f, err := protocol.Decode(data)
@@ -503,7 +505,7 @@ func (l *Link) session(ctx context.Context) error {
 			}
 			continue
 		}
-		l.observe(f.TS, rx)
+		l.observe(f.TS, rxAt)
 		switch m := f.Msg.(type) {
 		case protocol.HeartbeatAck:
 			// Bot's envelope seq is its own counter, so the ack is matched to a stored send time by the echoed t
@@ -514,7 +516,7 @@ func (l *Link) session(ctx context.Context) error {
 				echo = *m.Echo
 			}
 			l.mu.Lock()
-			var sent time.Time
+			var sent mono.Instant
 			if echo > 0 {
 				for s, hb := range l.hbSent {
 					if hb.t == echo {
@@ -524,16 +526,16 @@ func (l *Link) session(ctx context.Context) error {
 					}
 				}
 			}
-			if sent.IsZero() && m.Seq != 0 {
+			if sent == 0 && m.Seq != 0 {
 				if hb, ok := l.hbSent[m.Seq]; ok {
 					sent = hb.at
 					delete(l.hbSent, m.Seq)
 				}
 			}
 			l.mu.Unlock()
-			if !sent.IsZero() {
-				// A coarse clock (Windows) can read 0 on a fast loopback; 0 means "not measured yet", so floor at 1 ns.
-				rtt := int64(max(time.Since(sent), 1))
+			if sent != 0 {
+				// 0 means "not measured yet", so a round trip is at least 1 ns.
+				rtt := int64(max(mono.Since(sent), 1))
 				l.lastRTT.Store(rtt)
 				for {
 					cur := l.minRTT.Load()

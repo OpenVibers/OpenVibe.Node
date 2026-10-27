@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenVibers/OpenVibe.Node/internal/mono"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 )
 
@@ -387,12 +388,12 @@ func TestWriterQueueDelayCountsAgainstTheDeadline(t *testing.T) {
 	fx.waitState(StateReady)
 	p := fx.m.Get("fake")
 	ctx := context.Background()
-	held := time.Now()
+	held := mono.Now()
 	pause := p.Begin(ctx, "hold", "pause", json.RawMessage(`{"ms":400}`), 3000)
 	fx.waitLog(`"id":"hold"`)
 	filler, _ := json.Marshal(map[string]any{"text": strings.Repeat("x", 1<<20)})
 	fill := p.Begin(ctx, "fill", "say", filler, 3000)
-	queued := time.Now()
+	queued := mono.Now()
 	late := p.BeginWith(ctx, "late", "drive", nil, queued.Add(100*time.Millisecond), nil, 0, nil)
 	ontime := p.BeginWith(ctx, "ontime", "drive", nil, queued.Add(1500*time.Millisecond), nil, 0, nil)
 	if r := late(); r.FaultCode != protocol.FaultExpired || !strings.Contains(r.Message, "never sent") {

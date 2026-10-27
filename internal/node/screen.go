@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OpenVibers/OpenVibe.Node/internal/credentials"
+	"github.com/OpenVibers/OpenVibe.Node/internal/mono"
 	"github.com/OpenVibers/OpenVibe.Node/internal/plugins"
 	"github.com/OpenVibers/OpenVibe.Node/internal/protocol"
 	"github.com/OpenVibers/OpenVibe.Node/internal/safety"
@@ -66,7 +67,7 @@ type screenValue struct {
 
 // screenCommand answers screen_stream: the plugin is asked first (it applies the owner's level and has the capture
 // tool), and only once it said yes does the core publish.
-func (n *Node) screenCommand(c protocol.Command, entry *safety.Entry, received time.Time, nack func(code, msg string)) {
+func (n *Node) screenCommand(c protocol.Command, entry *safety.Entry, received mono.Instant, nack func(code, msg string)) {
 	var v screenValue
 	if err := json.Unmarshal(c.Value, &v); err != nil {
 		nack(protocol.FaultBadValue, "value must be {action, …}")
@@ -82,7 +83,7 @@ func (n *Node) screenCommand(c protocol.Command, entry *safety.Entry, received t
 			go wait()
 		}
 		data, _ := json.Marshal(map[string]any{"streaming": false, "stopped": stopped})
-		r := protocol.AckData{ID: c.ID, LatencyMS: time.Since(received).Milliseconds(), Data: data}
+		r := protocol.AckData{ID: c.ID, LatencyMS: mono.Since(received).Milliseconds(), Data: data}
 		n.dedup.Complete(entry, r)
 		n.send(r)
 		return
@@ -133,7 +134,7 @@ func (n *Node) screenCommand(c protocol.Command, entry *safety.Entry, received t
 			_ = json.Unmarshal(r.Data, &got)
 			until := n.startScreen(v.WHIPURL, key, seconds, fps, p.Name(), got.SID)
 			data, _ := json.Marshal(map[string]any{"streaming": true, "seconds": seconds, "fps": fps, "until_ms": until.UnixMilli()})
-			msg = protocol.AckData{ID: c.ID, LatencyMS: time.Since(received).Milliseconds(), Data: data}
+			msg = protocol.AckData{ID: c.ID, LatencyMS: mono.Since(received).Milliseconds(), Data: data}
 		} else {
 			msg = protocol.Nack{ID: c.ID, FaultCode: r.FaultCode, Message: r.Message}
 		}
