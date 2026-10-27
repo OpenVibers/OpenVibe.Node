@@ -212,6 +212,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         "/": b"<!doctype html><title>Home</title><h1>Hello</h1><a href='/two'>Second page</a>"
              b"<form action='/two'><input id='q' name='q'><button>Search</button></form>",
         "/two": b"<!doctype html><title>Two</title><p>Arrived</p>",
+        # Node v0.24.0: a page that opens another (a sign-in popup), and one that sets a cookie.
+        "/pop": b"<!doctype html><title>Pop</title><button id='open' onclick=\"window.open('/two', 'signin', 'popup')\">Sign in</button>",
+        "/cookie": b"<!doctype html><title>Cookie</title><script>if (!document.cookie.includes('kept=yes')) document.cookie = 'kept=yes; max-age=3600; path=/';</script>",
         # Desks plan D3: a page whose button changes the page without going anywhere, and things that are not elements.
         "/app": b"<!doctype html><title>App</title><p>Ready</p><button id='go' aria-label='Add a row'>+</button>"
                 b"<input type='email' placeholder='Email'><input type='checkbox' checked><a href='/two'>Second page</a>"
@@ -269,6 +272,32 @@ class RealBrowserTest(unittest.TestCase):
         self.assertTrue(shot["content_b64"])
         b.close()
         self.assertFalse(b.alive())
+
+    def test_a_popup_is_followed_and_a_cookie_kept(self):
+        # Node v0.24.0: a page this page opens comes to the front (the agent and a person watching see it), the page
+        # it came from when it closes; and a browser closed gracefully keeps the cookie it was given.
+        srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        base = "http://127.0.0.1:%d" % srv.server_address[1]
+        profile = __import__("tempfile").mkdtemp(prefix="ov-browser-")
+        self.addCleanup(lambda: shutil.rmtree(profile, ignore_errors=True))
+        extra = ["--no-sandbox"] if os.environ.get("CI") else []
+        b = Browser(find_binary(shutil.which, sys.platform), profile, extra_args=extra)
+        self.addCleanup(b.close)
+        self.assertEqual(b.open(base + "/pop")["title"], "Pop")
+        opened = b.click(selector="#open")
+        self.assertEqual((opened["title"], opened["receipt"]["page"]), ("Two", "opened"), opened.get("receipt"))
+        b._eval("window.close()")
+        back = b.read()
+        self.assertEqual(back["title"], "Pop", "the page it came from is in front again")
+        # A cookie survives a graceful close.
+        b.open(base + "/cookie")
+        b.close(graceful=True)
+        again = Browser(find_binary(shutil.which, sys.platform), profile, extra_args=extra)
+        self.addCleanup(again.close)
+        again.open(base + "/cookie")
+        self.assertIn("kept=yes", again._eval("document.cookie"))
 
     def test_a_browser_desk_its_page_is_the_screen(self):
         # Desks plan D2 in a real browser: no display; the page is the desk's screen, mouse and keyboard, and live view.

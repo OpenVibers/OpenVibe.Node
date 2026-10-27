@@ -130,6 +130,11 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 - **Receipts.** `click`, `press` and `back` answer with a `receipt` of what they changed: `url_changed`, the first lines
   that `appeared` (up to 8) and how many lines are `gone`. An agent knows at once whether its click did anything,
   without another read.
+- **Popups and new tabs** (Node v0.24.0). A page the page opens, such as a "Sign in with Google" popup or a link to a
+  new tab, comes to the front. The agent reads and acts on it, and a browser desk shows it, with `"page": "opened"` in
+  the receipt. When it closes (a sign-in popup closes itself), the page it came from is in front again
+  (`"page": "closed"`). Pages are followed at most 5 deep, and only pages opened from the followed ones. The agent's
+  clicks count as a person's (user activation), so a site may open its sign-in popup from them.
 - **Closing.** It closes after `browser_idle_s` without a command and at the kill switch.
 - **Platforms.** Linux and macOS; not offered on Windows yet.
 
@@ -186,6 +191,22 @@ window manager.
   size (1280×800 by default).
 - `private` is always a whole desk; a whole desk is `"kind": "desktop"`, the default.
 
+### Kept profiles (`"profile": "<name>"`, Node v0.24.0)
+
+Each agent task gets a desk of its own, and with it a fresh browser. A **kept profile** carries the person's sign-ins
+from desk to desk: `{"action": "start", "desk": "desk-<name>", "profile": "agent"}`. OpenVibe.Actor starts every
+task's desk from the profile `agent`.
+- **Sign in once.** The desk's browser starts from a copy of the kept profile: its cookies and site storage. When the
+  person signs in on an agent's desk (a "Needs you" step), the next task is already signed in.
+- **Saved when the desk stops.** The browser is asked to quit first, so it writes its cookies down. The desk's profile
+  is then saved back (`profile_saved` in the answer), and the desk's own copy is removed, so a desk per task leaves
+  nothing behind. When two desks with the same profile stop, the last one wins.
+- **Not kept:** caches, crash reports, locks and the last session's tabs. A profile larger than `desk_profile_max_mb`
+  (256 MB) is not saved, and an event `desk_profile_too_big` says so. The kill switch saves nothing.
+- **Where.** `browser_profile` + `-kept-<name>`, 0700, on this machine only. Profiles that move between machines are
+  the Desks plan's step D7, later.
+- The private desk keeps its own profile, as before. `describe` says `desk.profiles: true`.
+
 ### Desk hosts (`--desk-host`, Node v0.20.0)
 
 An old laptop, a mini PC or a spare workstation can host desks for your agents: no screen, keyboard or login needed.
@@ -225,6 +246,7 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
 | `max_desks`          | memory / 2 GiB, 1 to 8 | how many whole desks run at once (1 to 10); a browser desk counts as half |
 | `desk_idle_s`        | `900`          | a desk no command used this long is stopped (60 to 86400) |
 | `desk_dir`           | `~/.local/share/openvibe-node/desks` | each desk's own temp and downloads folders |
+| `desk_profile_max_mb` | `256`         | a kept profile larger than this is not saved (16 to 4096) |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
 | `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |
 | `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |
