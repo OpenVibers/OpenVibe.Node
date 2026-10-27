@@ -66,8 +66,11 @@ func fakePlugin(logPath string, in io.Reader, out io.Writer) {
 			if mode == "mute" {
 				continue
 			}
-			w.Encode(map[string]any{"op": "describe", "driver": "fake", "version": "1",
-				"capabilities": map[string]any{"drive": map[string]any{}, "actuator": map[string]any{"names": []string{"lift"}}}})
+			caps := map[string]any{"drive": map[string]any{}, "actuator": map[string]any{"names": []string{"lift"}}}
+			if mode == "deskhost" { // a desk host's computer plugin: desks and files, no screen or input of its own
+				caps = map[string]any{"desk": map[string]any{"screen": true, "input": true}, "files": map[string]any{}}
+			}
+			w.Encode(map[string]any{"op": "describe", "driver": "fake", "version": "1", "capabilities": caps})
 			if m["probe"] == true {
 				continue
 			}
@@ -262,6 +265,23 @@ func TestRouting(t *testing.T) {
 	}
 	if fx.m.Route("drive", "nope", "") != nil {
 		t.Fatal("unknown target routed")
+	}
+}
+
+// A desk host offers no screen or input of its own, only its desks': screen, screen_stream and input still reach the
+// plugin with desks (it acts on the desk named, or refuses the machine's own screen); other kinds are not routed there.
+func TestRoutingOnADeskHost(t *testing.T) {
+	fx := start(t, "deskhost")
+	fx.waitState(StateReady)
+	for _, kind := range []string{"screen", "screen_stream", "input", "desk", "fs"} {
+		if fx.m.Route(kind, "", "") == nil {
+			t.Fatalf("%s not routed on a desk host", kind)
+		}
+	}
+	for _, kind := range []string{"exec", "browser", "drive"} {
+		if fx.m.Route(kind, "", "") != nil {
+			t.Fatalf("%s routed to a plugin that does not offer it", kind)
+		}
 	}
 }
 

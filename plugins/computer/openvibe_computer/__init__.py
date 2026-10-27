@@ -48,9 +48,14 @@ Command kinds and their answers (the ack's ``data``):
   its own display, bus, browser profile (``browser_profile`` + ``-<name>``), temp folder and downloads folder, so two
   agents working at once never see or drive each other's screen. ``max_desks`` (default: one per 2 GiB of memory, 1 to
   8) caps how many run at once; ``list`` reports the running ones. A desk no command used for ``desk_idle_s`` (15
-  minutes by default) is stopped, so a desk an agent left behind (it crashed or restarted mid-task) ends by itself. Starting and stopping
-  act (refused at observe, approved at ask), ``status`` runs at every level, and the kill switch stops the desk. Linux
-  with Xvfb; config ``allow_desk: false`` turns it off.
+  minutes by default) is stopped, so a desk an agent left behind (it crashed or restarted mid-task) ends by itself.
+  ``"kind": "browser"`` on start (Node v0.23, Desks plan D2) makes a **browser desk**: a headless browser alone, with no
+  display, about half the cost of a whole desk (``kind: desktop``, the default), on Linux or macOS. Its page is its
+  screen: ``screen``, ``input`` (mouse, wheel, keys and text, sent to the page) and ``screen_stream`` (frames of the page)
+  on it go through the browser's pipe, and ``browser`` drives that same page. A browser desk counts as half a desk
+  against ``max_desks``. ``describe`` lists the kinds this machine runs (``desk.kinds``). Starting and stopping act
+  (refused at observe, approved at ask), ``status`` runs at every level, and the kill switch stops the desk. Whole desks
+  need Linux with Xvfb, browser desks a Chromium-family browser; config ``allow_desk: false`` turns both off.
 * ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
   etag, last_modified, body, truncated, ms}``; for ``tcp://host:port``: ``{open, ms, error?}``. Read-only, so it runs at
   every level, and only towards the machine's own network: every address the name resolves to must be private,
@@ -78,7 +83,7 @@ import urllib.parse
 from openvibe_plugin import Deferred, Fault, Plugin
 
 from .browser import KEY_CODES, Browser, BrowserError, find_binary
-from .desk import MAX_DESKS_CAP, Desks, PrivateDesk, default_max_desks
+from .desk import MAX_DESKS_CAP, BrowserDesk, Desks, PrivateDesk, default_max_desks
 
 LEVELS = ("observe", "ask", "trusted", "full")
 RANK = {name: i for i, name in enumerate(LEVELS)}
@@ -144,7 +149,7 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.10.1"
+    version = "0.11.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
@@ -189,7 +194,8 @@ class Computer(Plugin):
         self.browser_factory = browser_factory or (lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env))
         self.desk_factory = desk_factory or (lambda: PrivateDesk(which=which, popen=popen))
         self.desk = desk or self.desk_factory()   # the desk named private (the first one, as before v0.9.0)
-        self.desks = Desks(self.desk_factory, private=self.desk, max_desks=default_max_desks())
+        self.desks = Desks(self.desk_factory, private=self.desk, max_desks=default_max_desks(),
+                           browser_factory=lambda: BrowserDesk(clock=time.time, base_env=self.env))
         self.allow_desk = True
         self.desk_browsers = {}    # desk name -> the agent's browser on that desk (its own profile, shown there)
         self.desk_used = {}        # desk name -> when a command last used it (clock), for desk_idle_s
@@ -248,10 +254,26 @@ class Computer(Plugin):
         binary = self._browser_binary()
         if binary:
             caps["browser"] = {"level": self.level, "browser": os.path.basename(binary), "headless": self.browser_headless}
-        if self.allow_desk and self.platform.startswith("linux") and self.desks.available():
-            caps["desk"] = {"level": self.level, "window_manager": self.desks.window_manager(), "input": bool(self.which("xdotool")),
-                            "screen": bool(self._x11_tool()), "named": True, "max_desks": self.desks.max_desks}
+        kinds = self._desk_kinds()
+        if kinds:
+            # A browser desk's screen and input are its page's own (the browser's pipe); a whole desk's need X tools.
+            whole, page = "desktop" in kinds, "browser" in kinds
+            caps["desk"] = {"level": self.level, "window_manager": self.desks.window_manager() if whole else None,
+                            "input": page or (whole and bool(self.which("xdotool"))),
+                            "screen": page or (whole and bool(self._x11_tool())),
+                            "named": True, "max_desks": self.desks.max_desks, "kinds": kinds}
         return caps
+
+    def _desk_kinds(self):
+        """The kinds of desk this machine runs: desktop (Linux with Xvfb) and browser (a Chromium-family browser)."""
+        if not self.allow_desk:
+            return []
+        kinds = []
+        if self.platform.startswith("linux") and self.desks.available():
+            kinds.append("desktop")
+        if self._browser_binary():
+            kinds.append("browser")
+        return kinds
 
     def setup(self, config):
         self._configure(config)
@@ -356,6 +378,10 @@ class Computer(Plugin):
         desk_name = v.get("desk") if desk_env else None
         if desk_name:
             self.desk_used[desk_name] = self.clock()
+        page = bool(desk_name) and self.desks.kind(desk_name) == "browser"   # a browser desk: its page is its screen
+        if cmd.kind == "screen" and page:
+            width = _int(v.get("max_width"), "max_width", 320, 3840, 1280)
+            return self._start(cmd, lambda: self._page_shot(desk_name, width))
         if cmd.kind == "screen":
             tool = self._x11_tool() if desk_env else self._screen_tool()
             if not tool:
@@ -363,7 +389,7 @@ class Computer(Plugin):
             width = _int(v.get("max_width"), "max_width", 320, 3840, 1280)
             return self._start(cmd, lambda: self._screen(tool, width, env=desk_env))
         if cmd.kind == "screen_stream":
-            return self._screen_stream(v, env=desk_env, desk=desk_name)
+            return self._screen_stream(v, env=desk_env, desk=desk_name, page=page)
         if cmd.kind == "fs":
             op = v.get("op")
             if op in READ_OPS:
@@ -380,10 +406,13 @@ class Computer(Plugin):
         if cmd.kind == "input":
             if not self.allow_input:
                 raise Fault("unsupported", "this machine does not allow mouse and keyboard input")
-            tool = ("xdotool" if self.which("xdotool") else None) if desk_env else self._input_tool()
+            if page:
+                tool = "page"
+            else:
+                tool = ("xdotool" if self.which("xdotool") else None) if desk_env else self._input_tool()
             if not tool:
                 raise Fault("unsupported", "no input tool on this machine (xdotool on X11, cliclick on macOS)")
-            run, summary = self._input_op(tool, v, env=desk_env)
+            run, summary = self._input_op(tool, v, env=desk_env, desk=desk_name)
             return self._act(cmd, level, self._driving(run), summary, threaded=True)
         if cmd.kind == "browser":
             run, summary, acting = self._browser_op(v, level, env=desk_env, desk=desk_name)
@@ -419,13 +448,23 @@ class Computer(Plugin):
         if action not in ("start", "stop"):
             raise Fault("bad_value", "action is start, stop, status or list")
         self.desk_used[name] = self.clock()
-        if not self.allow_desk or not self.platform.startswith("linux"):
-            raise Fault("unsupported", "this machine does not offer a private desk (Linux with Xvfb, allow_desk on)")
+        if not self.allow_desk:
+            raise Fault("unsupported", "this machine does not offer desks (allow_desk is off)")
         what = "a private desk" if name == "private" else "desk %s" % name
         if action == "start":
+            kind = v.get("kind", "desktop")
+            if kind not in ("desktop", "browser"):
+                raise Fault("bad_value", "kind is desktop or browser")
+            kinds = self._desk_kinds()
+            if kind not in kinds:
+                if kind == "browser":
+                    raise Fault("unsupported", "a browser desk needs Chromium, Chrome, Edge or Brave on this machine")
+                raise Fault("unsupported", "a whole desk needs Linux with Xvfb%s" % (": this machine runs browser desks (kind browser)" if kinds else ""))
             width = _int(v.get("width"), "width", 640, 3840, 1280)
             height = _int(v.get("height"), "height", 480, 2160, 800)
-            return self._act(cmd, level, lambda: self.desks.start(name, width, height),
+            if kind == "browser":
+                what = "a browser desk" if name == "private" else "browser desk %s" % name
+            return self._act(cmd, level, lambda: self.desks.start(name, width, height, kind),
                              "start %s (%d×%d) where your agent works without touching your screen" % (what, width, height),
                              threaded=True)
 
@@ -433,6 +472,49 @@ class Computer(Plugin):
             self._close_desk_browser(name)
             return self.desks.stop(name)
         return self._act(cmd, level, stop, "stop %s (and close what runs on it)" % what, threaded=False)
+
+    def _desk_browser(self, desk, binary=None, env=None):
+        """The agent's browser on a desk, started on first use: shown on a whole desk's display, headless on a browser
+        desk (its window the desk's size: its page is the desk's screen). Its own profile, downloads and temp folder."""
+        with self.browser_mu:
+            b = self.desk_browsers.get(desk)
+            if b is not None and b.alive():
+                return b
+            binary = binary or self._browser_binary()
+            if not binary:
+                raise Fault("unsupported", "no browser on this machine (Chromium, Chrome, Edge or Brave), or this machine does not allow it")
+            env = env or self.desks.env(desk)
+            page = self.desks.kind(desk) == "browser"
+            profile = self.browser_profile + ("-desk" if desk == "private" else "-" + desk)
+            b = self.desk_browsers[desk] = self.browser_factory(binary, profile, page, env=env)
+            b.download_dir = self.desks.dir(desk, "downloads")
+            if page:
+                st = self.desks.status(desk)
+                b.window = b.page_size = (st.get("width") or 1280, st.get("height") or 800)
+            return b
+
+    def _desk_lock(self, desk):
+        with self.browser_mu:
+            return self.browser_locks.setdefault(desk, threading.Lock())
+
+    def _on_page(self, desk, act):
+        """act(browser) on a browser desk's page, one action at a time on that desk; a browser error is a fault."""
+        b = self._desk_browser(desk)
+        try:
+            with self._desk_lock(desk):
+                b.page()
+                return act(b)
+        except BrowserError as e:
+            raise Fault(e.code, e.message)
+
+    def _page_shot(self, desk, width):
+        """A picture of a browser desk's page (not under its action lock: a look never waits for a click)."""
+        b = self._desk_browser(desk)
+        try:
+            b.page()
+            return b.screenshot(width)
+        except BrowserError as e:
+            raise Fault(e.code, e.message)
 
     def _close_desk_browser(self, name):
         b = self.desk_browsers.pop(name, None)
@@ -956,14 +1038,9 @@ class Computer(Plugin):
         lock_key = desk if env else "main"
 
         def browser():
+            if env:   # on a desk: its own browser (shown on a whole desk, headless on a browser desk)
+                return self._desk_browser(desk, binary, env)
             with self.browser_mu:
-                if env:   # on a desk: shown there (never headless), in a profile and a downloads folder of its own
-                    b = self.desk_browsers.get(desk)
-                    if b is None or not b.alive():
-                        profile = self.browser_profile + ("-desk" if desk == "private" else "-" + desk)
-                        b = self.desk_browsers[desk] = self.browser_factory(binary, profile, False, env=env)
-                        b.download_dir = self.desks.dir(desk, "downloads")
-                    return b
                 if self.browser is None or not self.browser.alive():
                     self.browser = self.browser_factory(binary, self.browser_profile, self.browser_headless)
                 return self.browser
@@ -1018,9 +1095,10 @@ class Computer(Plugin):
             return "xdotool"
         return None
 
-    def _input_op(self, tool, v, env=None):
+    def _input_op(self, tool, v, env=None, desk=None):
         """(run, summary) for one input action; nothing touches the screen until run() (after approval at ask). With env,
-        on the private desk (its display; points scale to the desk's own size)."""
+        on a desk (its display; points scale to the desk's own size). tool "page": a browser desk's page, through the
+        browser's pipe (points scale to the page's size)."""
         action = v.get("action")
         if action not in INPUT_ACTIONS:
             raise Fault("bad_value", "action is one of %s" % ", ".join(sorted(INPUT_ACTIONS)))
@@ -1039,7 +1117,7 @@ class Computer(Plugin):
             dy = _int(v.get("dy"), "dy", -20, 20, None)
             if not dy:
                 raise Fault("bad_value", "scroll needs dy (clicks, -20 to 20, not 0)")
-            if tool != "xdotool":
+            if tool not in ("xdotool", "page"):
                 raise Fault("unsupported", "scrolling needs xdotool (Linux X11)")
         if action == "type":
             text = v.get("text")
@@ -1051,7 +1129,9 @@ class Computer(Plugin):
                 raise Fault("bad_value", "keys is one key or chord, for example Return or ctrl+s")
 
         def run():
-            at = (self._desk_scale(point) if env else self._scale(tool, point)) if point else None
+            if tool == "page":
+                return self._on_page(desk, lambda b: self._page_input(b, action, point, v))
+            at = (self._desk_scale(point, desk) if env else self._scale(tool, point)) if point else None
             argv = self._input_argv(tool, action, at, v)
             proc = self.popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
                               **({"env": env} if env else {}))
@@ -1067,7 +1147,7 @@ class Computer(Plugin):
                 out["x"], out["y"] = at
             return out
 
-        where = " on the private desk" if env else ""
+        where = (" on the private desk" if desk == "private" else " on desk %s" % desk) if env else ""
         if action == "type":
             text = v["text"]
             shown = text if len(text) <= 120 else text[:120] + "…"
@@ -1081,12 +1161,38 @@ class Computer(Plugin):
             summary = "%s at %d, %d%s%s" % (action.replace("_", " "), x, y, " of a %d×%d picture of the screen" % (w, h) if w else "", where)
         return run, summary
 
-    def _desk_scale(self, point):
+    def _desk_scale(self, point, desk="private"):
+        """A point in a picture of the desk, on the desk's own display (the desk the command names, at its size)."""
         x, y, w, h = point
-        st = self.desk.status()
-        if not w or not st.get("running"):
+        st = self.desks.status(desk or "private")
+        if not w or not st.get("running") or not st.get("width"):
             return x, y
         return min(st["width"] - 1, round(x * st["width"] / w)), min(st["height"] - 1, round(y * st["height"] / h))
+
+    @staticmethod
+    def _page_input(b, action, point, v):
+        """One input action on a browser desk's page. A point in a picture of the page scales to the page's own size;
+        a scroll without a point is at the page's middle."""
+        vw, vh = b.viewport()
+        if point:
+            x, y, w, h = point
+            if w:
+                x, y = round(x * vw / w), round(y * vh / h)
+            x, y = min(max(0, x), vw - 1), min(max(0, y), vh - 1)
+        else:
+            x, y = vw // 2, vh // 2
+        if action in POINT_ACTIONS:
+            out = b.mouse(action, x, y)
+        elif action == "scroll":
+            out = b.wheel(x, y, v["dy"])
+        elif action == "type":
+            out = b.insert(v["text"])
+        else:
+            out = b.keys(v["keys"])
+        out = dict(out, action=action)
+        if point:
+            out["x"], out["y"] = x, y
+        return out
 
     def _screen_size(self, tool):
         """The screen's size in the units the input tool uses: pixels for xdotool, points for cliclick (a Retina
@@ -1212,7 +1318,7 @@ class Computer(Plugin):
     def _stream_capable(self, tool):
         return self._have_pillow() or self._native_jpeg(tool, "x.jpg") is not None
 
-    def _screen_stream(self, v, env=None, desk=None):
+    def _screen_stream(self, v, env=None, desk=None, page=False):
         action = v.get("action")
         if action == "stop":
             return {"streaming": False, "stopped": self._end_stream("stopped by its owner")}
@@ -1222,17 +1328,17 @@ class Computer(Plugin):
             raise Fault("unsupported", "this machine does not show its screen live (allow_screen_stream is off)")
         if self.runtime is not None and self.runtime.estopped:
             raise Fault("local_stop", "stopped on the machine")
-        tool = self._x11_tool() if env else self._screen_tool()
+        tool = ("page", None) if page else (self._x11_tool() if env else self._screen_tool())
         if not tool:
             raise Fault("unsupported", "no screen capture tool on this machine")
-        if not self._stream_capable(tool):
+        if not page and not self._stream_capable(tool):
             raise Fault("unsupported", "%s only writes PNG: install Pillow (pip install pillow) to show the screen live" % tool[0])
         seconds = _int(v.get("seconds"), "seconds", 30, 1800, 600)
         fps = _int(v.get("fps"), "fps", 1, 5, 2)
         self._end_stream("replaced")
         frames = tempfile.mkdtemp(prefix="openvibe-screen-stream-")  # 0700, this account only
         stream = {"sid": os.urandom(8).hex(), "until": self.clock() + seconds, "fps": fps, "tool": tool, "dir": frames,
-                  "stop": threading.Event(), "env": env}
+                  "stop": threading.Event(), "env": env, "desk": desk}
         with self.stream_mu:
             self.stream = stream
         threading.Thread(target=self._stream_loop, args=(stream,), name="computer-screen-stream", daemon=True).start()
@@ -1261,7 +1367,7 @@ class Computer(Plugin):
                     break
                 path = os.path.join(stream["dir"], "frame-%d.jpg" % (n % 3))  # the core reads each one at once
                 try:
-                    self._stream_frame(stream["tool"], path, env=stream.get("env"))
+                    self._stream_frame(stream["tool"], path, env=stream.get("env"), desk=stream.get("desk"))
                     n += 1
                     failures = 0
                     self.emit_video(path, stream="screen")
@@ -1279,8 +1385,16 @@ class Computer(Plugin):
             # The core ends the stream with the same id (a newer one that replaced it carries its own).
             self.emit_event("screen_stream_ended", sid=stream["sid"], reason=stream.get("reason") or reason, frames=n)
 
-    def _stream_frame(self, tool, path, env=None):
-        """One JPEG frame of the screen at path, at most STREAM_WIDTH wide when Pillow can resize it."""
+    def _stream_frame(self, tool, path, env=None, desk=None):
+        """One JPEG frame of the screen at path, at most STREAM_WIDTH wide when Pillow can resize it. On a browser desk,
+        a picture of its page from the browser itself (JPEG and scaled there: no capture tool, no Pillow)."""
+        if tool[0] == "page":
+            # Not under the desk's action lock: the live view keeps moving while an action waits for a page to load.
+            try:
+                self._desk_browser(desk).frame(path, STREAM_WIDTH, STREAM_QUALITY)
+            except BrowserError as e:
+                raise Fault(e.code, e.message)
+            return
         if self._have_pillow():
             fd, png = tempfile.mkstemp(prefix="openvibe-screen-", suffix=".png")
             os.close(fd)

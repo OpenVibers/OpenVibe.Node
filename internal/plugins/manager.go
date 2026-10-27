@@ -27,6 +27,11 @@ var capabilityFor = map[string]string{
 	protocol.KindDesk:         "desk",
 }
 
+// deskKinds are the kinds a plugin's desks take too. A desk host (install.sh --desk-host) has no screen, mouse or
+// keyboard of its own, only its desks', so its computer plugin offers no "screen" or "input": these kinds then reach
+// the plugin that offers "desk", which acts on the desk a command names and refuses the machine's own screen itself.
+var deskKinds = map[string]bool{protocol.KindScreen: true, protocol.KindScreenStream: true, protocol.KindInput: true}
+
 // Manager supervises every configured plugin.
 type Manager struct {
 	log     *slog.Logger
@@ -139,6 +144,15 @@ func (m *Manager) Route(kind, target, actuator string) *Plugin {
 		}
 		if fallback == nil {
 			fallback = p
+		}
+	}
+	if fallback == nil && deskKinds[kind] {
+		for _, p := range m.plugins {
+			if info := p.Info(); info.Describe != nil {
+				if _, ok := info.Describe.Capabilities["desk"]; ok {
+					return p
+				}
+			}
 		}
 	}
 	return fallback
