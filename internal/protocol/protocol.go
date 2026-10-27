@@ -179,7 +179,9 @@ const (
 	// machine's private OpenRestream stream); no operator sends them. The computer plugin captures the frames, the
 	// core publishes them; a latched stop ends it and refuses a start.
 	KindScreenStream = "screen_stream"
-	// KindDesk starts, stops or reports a private desk on the machine (contracts 0.214.0): {"action": "start"|"stop"|
+	// KindDesk starts, stops, reports or lists desks on the machine (contracts 0.214.0; named desks, Node v0.19.0):
+	// {"action": "start"|"stop"|"status"|"list", "desk"?: "private"|"desk-<name>", …}. Older form, kept:
+	// {"action": "start"|"stop"|
 	// "status", "width"?, "height"?}, an Xvfb display of its own where an agent works without touching the owner's
 	// screen; screen, screen_stream, input and browser take "desk": "private" to act there. Starting and stopping act.
 	KindDesk = "desk"
@@ -225,7 +227,7 @@ func ComputerActs(kind string, value json.RawMessage) bool {
 			Action string `json:"action"`
 		}
 		_ = json.Unmarshal(value, &v)
-		return v.Action != "status"
+		return v.Action != "status" && v.Action != "list"
 	}
 	return false
 }

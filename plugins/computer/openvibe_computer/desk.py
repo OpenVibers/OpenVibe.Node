@@ -13,6 +13,7 @@ Brought in from the owner's desktop-mcp (``desks.py``), plan track K step 2 (Vib
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -175,3 +176,125 @@ class PrivateDesk:
                     proc.kill()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# A desk's name: `private` (the first desk, as before) or `desk-<name>` (Desks plan D1: several desks on one machine,
+# one per agent task). Lower case, digits and dashes, so a name is also a safe path part.
+DESK_NAME = re.compile(r"^(private|desk-[a-z0-9][a-z0-9-]{0,23})$")
+MAX_DESKS_CAP = len(DISPLAYS)
+
+
+def default_max_desks(meminfo="/proc/meminfo"):
+    """How many desks this machine runs at once by default: one per 2 GiB of memory, 1 to 8 (a desk with a browser
+    open uses about 0.5 to 1.5 GiB)."""
+    try:
+        with open(meminfo) as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return max(1, min(8, int(line.split()[1]) // (2 * 1024 * 1024)))
+    except (OSError, ValueError, IndexError):
+        pass
+    return 2
+
+
+class Desks:
+    """The machine's desks by name, each a PrivateDesk with a display, a bus and (in the plugin) a browser of its own.
+
+    Two desks never share a display, a bus, a browser profile or a temp folder, so two agents working at once cannot
+    see or drive each other's screen. At most `max_desks` run at once; starting one more is refused, never queued.
+    Starts are serialized, so two desks starting together cannot pick the same display number.
+    """
+
+    def __init__(self, factory, private=None, max_desks=2, base_dir=None):
+        self.factory = factory
+        self.max_desks = max_desks
+        self.base_dir = base_dir
+        self.mu = threading.Lock()
+        self.desks = {}
+        if private is not None:
+            self.desks["private"] = private
+
+    @staticmethod
+    def check(name):
+        if not isinstance(name, str) or not DESK_NAME.match(name):
+            raise Fault("bad_value", "desk is main, private or desk-<name> (lower-case letters, digits and dashes, at most 29 characters)")
+        return name
+
+    def _desk(self, name, create=False):
+        d = self.desks.get(name)
+        if d is None and create:
+            d = self.desks[name] = self.factory()
+        return d
+
+    def available(self):
+        d = self.desks.get("private") or self.factory()
+        return d.available()
+
+    def window_manager(self):
+        d = self.desks.get("private") or self.factory()
+        return d.window_manager()
+
+    def running_names(self):
+        with self.mu:
+            return [n for n, d in self.desks.items() if d.running()]
+
+    def start(self, name, width=1280, height=800):
+        self.check(name)
+        with self.mu:
+            d = self._desk(name, create=True)
+            if not d.running():
+                busy = [n for n, other in self.desks.items() if n != name and other.running()]
+                if len(busy) >= self.max_desks:
+                    raise Fault("not_ready", "this machine already runs %d desks (%s), its limit (max_desks): stop one first"
+                                % (len(busy), ", ".join(sorted(busy))))
+            st = d.start(width, height)
+        return dict(st, desk=name)
+
+    def stop(self, name):
+        self.check(name)
+        with self.mu:
+            d = self.desks.get(name)
+        if d is None:
+            return {"running": False, "stopped": False, "desk": name}
+        return dict(d.stop(), desk=name)
+
+    def stop_all(self):
+        with self.mu:
+            desks = list(self.desks.items())
+        return [n for n, d in desks if d.stop().get("stopped")]
+
+    def status(self, name):
+        self.check(name)
+        with self.mu:
+            d = self.desks.get(name)
+        if d is None:
+            return {"running": False, "available": self.available(), "desk": name}
+        return dict(d.status(), desk=name)
+
+    def list(self):
+        with self.mu:
+            desks = sorted(self.desks.items())
+        running = [dict(d.status(), desk=n) for n, d in desks if d.running()]
+        return {"desks": running, "max_desks": self.max_desks, "available": self.available()}
+
+    def env(self, name):
+        """The environment for a tool or app on that desk: its display and bus, and a temp folder of its own."""
+        self.check(name)
+        with self.mu:
+            d = self.desks.get(name)
+        if d is None:
+            raise Fault("not_ready", "start the desk first (desk start, desk %s)" % name)
+        env = d.env()
+        if self.base_dir:
+            tmp = os.path.join(self.base_dir, name, "tmp")
+            os.makedirs(tmp, mode=0o700, exist_ok=True)
+            env["TMPDIR"] = tmp
+        return env
+
+    def dir(self, name, part):
+        """A folder of the desk's own (downloads, …), 0700, under base_dir; None without one."""
+        if not self.base_dir:
+            return None
+        path = os.path.join(self.base_dir, self.check(name), part)
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        return path
