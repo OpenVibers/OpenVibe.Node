@@ -103,8 +103,38 @@ jobs:
       - run: python -m pytest -q plugins/ros2/tests
       - run: python -m pytest -q plugins/computer/tests
       - run: python -m pytest -q plugins/voice/tests
+      - run: python -m pytest -q plugins/ai/tests
       - name: packages install
-        run: pip install ./plugins/sdk ./plugins/dryrun ./plugins/adeept_adr036 ./plugins/cozmo ./plugins/relay ./plugins/ros2 ./plugins/computer ./plugins/voice
+        run: pip install ./plugins/sdk ./plugins/dryrun ./plugins/adeept_adr036 ./plugins/cozmo ./plugins/relay ./plugins/ros2 ./plugins/computer ./plugins/voice ./plugins/ai
+
+  # The bundled drivers where people run them: a LOOI or Cozmo bridge is often a Windows PC, a desk a Mac (owner,
+  # 2026-10-27: "work well across multi-platform"). Every plugin's tests and packages, on Windows and macOS.
+  python-other-os:
+    name: plugins (${{ matrix.os }}, python 3.11)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest pillow numpy
+      # One run per plugin (their test files share names), every one reported before the job fails.
+      - name: each plugin's tests
+        shell: bash
+        run: |
+          failed=""
+          for d in sdk dryrun adeept_adr036 cozmo relay ros2 computer voice ai; do
+            echo "::group::$d"
+            python -m pytest -q "plugins/$d/tests" || failed="$failed $d"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then echo "failed on ${{ matrix.os }}:$failed"; exit 1; fi
+      - name: packages install
+        run: pip install ./plugins/sdk ./plugins/dryrun ./plugins/adeept_adr036 ./plugins/cozmo ./plugins/relay ./plugins/ros2 ./plugins/computer ./plugins/voice ./plugins/ai
 
   shell:
     name: shellcheck
