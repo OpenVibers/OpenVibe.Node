@@ -121,6 +121,15 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 - **No port.** The Node starts it on the first command with `--remote-debugging-pipe`: it speaks the DevTools protocol over two file descriptors, so nothing else on the machine can drive it.
 - **Levels.** `read`, `screenshot` and `close` run at every level. `open`, `click`, `fill`, `press` and `back` are acting commands: refused at `observe`, approved one by one at `ask`. The approval says exactly what would happen: "open https://… in the browser", "type 5 characters into #q in the browser: 'hello'".
 - **Your own network.** Below level `full`, `open` refuses an address on the machine's own network (private, loopback or link-local, checked for every address the name resolves to).
+- **Elements and receipts** (Node v0.21.0, the Desks plan's step D3). `open` and `read` list the page's interactive
+  elements, one compact line each: `e7 button "Sign in"`, `e8 textbox "Email" (email)`, `e9 checkbox "Remember me"
+  checked`. That is at most 120 visible links, buttons, fields, boxes and menus, named by their label, text or
+  placeholder. Each element keeps its ref (`data-ov-ref`) while it stays on the page, so `click` or `fill` with the
+  selector `[data-ov-ref="e7"]` acts on exactly that element. An agent works from the page's own structure first and
+  needs a screenshot only when that is not enough.
+- **Receipts.** `click`, `press` and `back` answer with a `receipt` of what they changed: `url_changed`, the first lines
+  that `appeared` (up to 8) and how many lines are `gone`. An agent knows at once whether its click did anything,
+  without another read.
 - **Closing.** It closes after `browser_idle_s` without a command and at the kill switch.
 - **Platforms.** Linux and macOS; not offered on Windows yet.
 

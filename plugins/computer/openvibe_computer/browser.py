@@ -22,6 +22,8 @@ import time
 MAX_TEXT = 20000
 STARTUP_S = 45.0
 MAX_LINKS = 60
+MAX_ELEMENTS = 120
+MAX_APPEARED = 8
 KEY_CODES = {
     "Enter": (13, "\r"), "Tab": (9, "\t"), "Escape": (27, ""), "Backspace": (8, ""), "Delete": (46, ""),
     "ArrowUp": (38, ""), "ArrowDown": (40, ""), "ArrowLeft": (37, ""), "ArrowRight": (39, ""),
@@ -33,14 +35,57 @@ MAC_APPS = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser")
 
+# The page as text, its links, and its interactive elements as refs (Desks plan D3: act on refs from the page's own
+# structure before ever reaching for a screenshot). An element keeps its ref (data-ov-ref) for as long as it stays on
+# the page, so a ref from one read still names the same element after the page changed around it. Each element is one
+# compact line, `e7 button "Sign in"`, which costs a model a fraction of a screenshot.
 SUMMARY_JS = """(() => {
   const text = (document.body ? document.body.innerText : '').replace(/\\n{3,}/g, '\\n\\n');
   const links = [...document.querySelectorAll('a[href]')]
     .filter((a) => /^https?:/.test(a.href))
     .slice(0, %d)
     .map((a) => ({ text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 100), href: a.href }));
-  return { url: location.href, title: document.title, text: text.slice(0, %d), truncated: text.length > %d, links };
-})()""" % (MAX_LINKS, MAX_TEXT, MAX_TEXT)
+  const SEL = 'a[href], button, input:not([type=hidden]), select, textarea, summary, [contenteditable=""], [contenteditable=true],'
+    + ' [role=button], [role=link], [role=checkbox], [role=radio], [role=tab], [role=menuitem], [role=switch], [role=option], [role=combobox]';
+  const shown = (el) => { const r = el.getClientRects(); if (!r.length) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; };
+  const roleOf = (el) => el.getAttribute('role') || ({ A: 'link', BUTTON: 'button', SELECT: 'select', TEXTAREA: 'textbox', SUMMARY: 'button' })[el.tagName]
+    || (el.tagName === 'INPUT' ? ({ checkbox: 'checkbox', radio: 'radio', submit: 'button', button: 'button', reset: 'button', range: 'slider', file: 'file' })[el.type] || 'textbox' : 'textbox');
+  const labelOf = (el) => (el.labels && el.labels.length ? el.labels[0].innerText : '');
+  const valueName = (el) => (['checkbox', 'radio'].includes(el.type) ? '' : el.value);
+  const nameOf = (el) => (el.getAttribute('aria-label') || labelOf(el) || el.innerText || valueName(el) || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || el.getAttribute('name') || '').replace(/\\s+/g, ' ').trim().slice(0, 80);
+  window.__ovRef = window.__ovRef || 0;
+  const elements = [];
+  for (const el of document.querySelectorAll(SEL)) {
+    if (elements.length >= %d) break;
+    if (!shown(el)) continue;
+    if (!el.dataset.ovRef) el.dataset.ovRef = 'e' + (++window.__ovRef);
+    const role = roleOf(el);
+    let line = el.dataset.ovRef + ' ' + role + ' ' + JSON.stringify(nameOf(el));
+    if (role === 'textbox' && el.tagName === 'INPUT' && el.type && el.type !== 'text') line += ' (' + el.type + ')';
+    if (el.checked) line += ' checked';
+    if (el.disabled) line += ' disabled';
+    if (role === 'textbox' && el.value) line += ' value=' + JSON.stringify(String(el.value).slice(0, 40));
+    elements.push(line);
+  }
+  return { url: location.href, title: document.title, text: text.slice(0, %d), truncated: text.length > %d, links, elements };
+})()""" % (MAX_LINKS, MAX_ELEMENTS, MAX_TEXT, MAX_TEXT)
+
+# What the page says before an action, to tell what the action changed (its receipt).
+BEFORE_JS = """(() => ({ url: location.href, text: (document.body ? document.body.innerText : '').slice(0, 60000) }))()"""
+
+
+def receipt(before, after):
+    """What an action changed (Desks plan D3), from the page before and after it: whether it went to another address,
+    the first lines that appeared (MAX_APPEARED), and how many lines went away. An agent reads at once whether its click
+    did anything, without another read or a screenshot."""
+    if not isinstance(before, dict):
+        return None
+    old = [l.strip() for l in str(before.get("text") or "").splitlines() if l.strip()]
+    new = [l.strip() for l in str(after.get("text") or "").splitlines() if l.strip()]
+    old_set, new_set = set(old), set(new)
+    appeared = [l[:160] for l in new if l not in old_set][:MAX_APPEARED]
+    gone = len([l for l in old_set if l not in new_set])
+    return {"url_changed": before.get("url") != after.get("url"), "appeared": appeared, "gone": gone}
 
 CLICK_JS = """((selector, text) => {
   let el = null;
@@ -258,13 +303,27 @@ class Browser:
         self._need()
         return self.summary()
 
+    def _before(self):
+        try:
+            return self._eval(BEFORE_JS)
+        except BrowserError:
+            return None
+
+    def _with_receipt(self, before):
+        after = self.summary()
+        r = receipt(before, after)
+        if r is not None:
+            after["receipt"] = r
+        return after
+
     def click(self, selector=None, text=None):
         self._need()
+        before = self._before()
         self._mark()
         if not self._eval(CLICK_JS % (json.dumps(selector), json.dumps(text or ""))):
             raise BrowserError("bad_value", "nothing on the page matches %s" % (selector or repr(text)))
         self._settle()
-        return self.summary()
+        return self._with_receipt(before)
 
     def fill(self, selector, text):
         self._need()
@@ -276,19 +335,21 @@ class Browser:
     def press(self, key):
         self._need()
         code, text = KEY_CODES[key]
+        before = self._before()
         self._mark()
         base = {"key": key, "code": key if key != "Space" else "Space", "windowsVirtualKeyCode": code, "nativeVirtualKeyCode": code}
         self.call("Input.dispatchKeyEvent", dict(base, type="keyDown", **({"text": text} if text else {})))
         self.call("Input.dispatchKeyEvent", dict(base, type="keyUp"))
         self._settle()
-        return self.summary()
+        return self._with_receipt(before)
 
     def back(self):
         self._need()
+        before = self._before()
         self._mark()
         self._eval("history.back()")
         self._settle()
-        return self.summary()
+        return self._with_receipt(before)
 
     def screenshot(self, max_width=1280):
         self._need()
