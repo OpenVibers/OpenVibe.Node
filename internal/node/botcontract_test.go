@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -376,5 +377,43 @@ func TestStaleTurnNeverReachesPlugin(t *testing.T) {
 	}
 	if len(e.commandRecords("stale")) != 0 || len(e.commandRecords("current")) != 1 {
 		t.Fatalf("records: %+v", e.records())
+	}
+}
+
+// Provenance (Maticus, 2026-10-26, for the LOOI driver): each command reaches the driver with the link session it came
+// on (Bot's hello), its frame's seq (strictly increasing on that session), Bot's send time and its absolute deadline,
+// so a driver can refuse a replay with constant state. A new connection has a new session.
+func TestProvenanceReachesPlugin(t *testing.T) {
+	e := start(t)
+	drive := json.RawMessage(`{"throttle":0.3}`)
+	for _, id := range []string{"p1", "p2"} {
+		if err := e.conn.Command(protocol.Command{ID: id, Kind: protocol.KindDrive, Value: drive}, 300); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := e.conn.Reply(id, 5*time.Second); err != nil || !isAck(r) {
+			t.Fatalf("%s: %+v %v", id, r, err)
+		}
+	}
+	a, b := e.commandRecords("p1"), e.commandRecords("p2")
+	if len(a) != 1 || len(b) != 1 || a[0].Provenance == nil || b[0].Provenance == nil {
+		t.Fatalf("records: %+v", e.records())
+	}
+	pa, pb := a[0].Provenance, b[0].Provenance
+	if !strings.HasPrefix(pa.Session, "sess_") || pa.Session != pb.Session || pb.Seq <= pa.Seq {
+		t.Fatalf("session and seq: %+v %+v", pa, pb)
+	}
+	if pa.IssuedAtMS <= 0 || pa.ExpiresAtMS != pa.IssuedAtMS+300 {
+		t.Fatalf("times: %+v", pa)
+	}
+	e.conn.Close()
+	e.conn = e.nextConn()
+	if err := e.conn.Command(protocol.Command{ID: "p3", Kind: protocol.KindDrive, Value: drive}, 300); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := e.conn.Reply("p3", 5*time.Second); err != nil || !isAck(r) {
+		t.Fatalf("p3: %+v %v", r, err)
+	}
+	if c := e.commandRecords("p3"); len(c) != 1 || c[0].Provenance == nil || c[0].Provenance.Session == pa.Session {
+		t.Fatalf("a new connection, a new session: %+v", c)
 	}
 }

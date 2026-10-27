@@ -103,6 +103,7 @@ type Node struct {
 	configured bool
 
 	robotIDs []string // the robots this device serves, from the connection's hello
+	session  string   // the connection's session id, from its hello: each command's provenance
 
 	// approvals waiting on the machine (the computer plugin at level "ask"), by command id: what
 	// `openvibe-node approvals` lists and `approve`/`deny` answer.
@@ -295,7 +296,7 @@ func (n *Node) Run(parent context.Context) error {
 // has been applied (applyConfig), so they report the latch the owner may have set while the link was down.
 func (n *Node) Connected() {
 	n.mu.Lock()
-	n.configured, n.robotIDs = false, nil
+	n.configured, n.robotIDs, n.session = false, nil, ""
 	n.mu.Unlock()
 }
 
@@ -311,13 +312,13 @@ func (n *Node) Frame(f protocol.Frame) {
 	switch m := f.Msg.(type) {
 	case protocol.Hello:
 		n.mu.Lock()
-		n.robotIDs = m.RobotIDs
+		n.robotIDs, n.session = m.RobotIDs, m.SessionID
 		n.mu.Unlock()
 		n.log.Info("server hello", "device", m.DeviceID, "robots", m.RobotIDs, "session", m.SessionID)
 	case protocol.Config:
 		n.applyConfig(m)
 	case protocol.Command:
-		n.command(m, f.TS, time.Now())
+		n.command(m, f.TS, f.Seq, time.Now())
 	case protocol.Estop:
 		// latched:false is the owner's clear. It clears only the remote latch: a local (CLI or file) stop stays.
 		if m.Latched {
@@ -457,7 +458,7 @@ func (n *Node) voiceAnswer(a protocol.VoiceAnswer) {
 // commands in arrival order; the reply is awaited on its own goroutine. deadline_ms is an absolute instant on the
 // server's clock: it is compared with the link's estimate of that clock at receipt (serverNow), so a command that
 // arrives after its deadline is nacked and never reaches a plugin, and a plugin gets only the time that is left.
-func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
+func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received time.Time) {
 	if c.ID == "" {
 		n.log.Warn("command without id ignored", "kind", c.Kind)
 		return
@@ -490,11 +491,11 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		return
 	}
 	n.mu.Lock()
-	limits, allowed, configured := n.limits, n.allowed, n.configured
+	limits, allowed, configured, session := n.limits, n.allowed, n.configured, n.session
 	n.mu.Unlock()
 	if c.Kind == protocol.KindHalt {
 		n.noteHaltEpoch(c.RobotID, c.TurnEpoch)
-		n.mgr.StopAll()
+		n.mgr.HaltAll(c.TurnEpoch)
 		r := protocol.Ack{ID: c.ID, LatencyMS: time.Since(received).Milliseconds()}
 		n.dedup.Complete(entry, r)
 		n.send(r)
@@ -561,7 +562,9 @@ func (n *Node) command(c protocol.Command, sentMS int64, received time.Time) {
 		nack(protocol.FaultUnsupported, "no driver on this device handles "+c.Kind)
 		return
 	}
-	wait := p.BeginTurn(n.ctx, c.ID, c.Kind, value, deadline, c.Operator, c.TurnEpoch)
+	// Where it came from, unchanged, so a driver can check it without keeping old ids (Maticus, 2026-10-26, LOOI).
+	prov := &plugins.Provenance{Session: session, Seq: seq, IssuedAtMS: sentMS, ExpiresAtMS: c.DeadlineMS}
+	wait := p.BeginWith(n.ctx, c.ID, c.Kind, value, deadline, c.Operator, c.TurnEpoch, prov)
 	go func() {
 		r := wait()
 		var msg protocol.Message

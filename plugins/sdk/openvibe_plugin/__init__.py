@@ -62,10 +62,16 @@ class Command:
     "queue" | …}, or None when the core passed none. turn_epoch is the robot's control epoch Bot decided it under (an
     int, or None from older Bots): it rises when a queue turn ends, is left or is paused for an owner takeover, and the
     core already refuses a command older than the newest halt's, so a driver may also keep the newest it saw and refuse
-    anything older (defence in depth)."""
-    __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target", "operator", "turn_epoch")
+    anything older (defence in depth).
 
-    def __init__(self, id, kind, value, deadline_ms, now, target=None, operator=None, turn_epoch=None):
+    provenance is where it came from, unchanged from Bot (a dict, or None from older Nodes): "session" (the link
+    session it arrived on; a new one on every connection), "seq" (the frame's number on that session, strictly
+    increasing with gaps), "issued_at_ms" (Bot's clock when it sent the command and minted its id) and "expires_at_ms"
+    (the absolute deadline on Bot's clock, motion kinds only). Bot sends a command once and never again; the runtime
+    already refuses one whose seq is not above the last on its session (plugins.md, "Provenance")."""
+    __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target", "operator", "turn_epoch", "provenance")
+
+    def __init__(self, id, kind, value, deadline_ms, now, target=None, operator=None, turn_epoch=None, provenance=None):
         self.id = id
         self.kind = kind
         self.value = value if value is not None else {}
@@ -74,9 +80,24 @@ class Command:
         self.target = target
         self.operator = operator if isinstance(operator, dict) else None
         self.turn_epoch = turn_epoch if isinstance(turn_epoch, int) and not isinstance(turn_epoch, bool) and turn_epoch > 0 else None
+        self.provenance = _provenance(provenance)
 
     def __repr__(self):
         return "Command(id=%r, kind=%r, value=%r, deadline_ms=%r)" % (self.id, self.kind, self.value, self.deadline_ms)
+
+
+def _provenance(p):
+    """The core's provenance dict with only well-typed fields, or None."""
+    if not isinstance(p, dict):
+        return None
+    out = {}
+    if isinstance(p.get("session"), str) and p["session"]:
+        out["session"] = p["session"]
+    for k in ("seq", "issued_at_ms", "expires_at_ms"):
+        v = p.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            out[k] = v
+    return out or None
 
 
 def clamp(v, lo, hi):
@@ -216,6 +237,12 @@ class Runtime:
         self.setup_retry_at = None
         self.closed = False
         self.stop_reasons = []  # for tests: why stop() was called, in order
+        # The newest turn_epoch a halt carried ("stop" with turn_epoch); a command from an older turn is refused.
+        self.halt_epoch = 0
+        # The link session of the last command handled, and its seq: a command on that session whose seq is not above
+        # it is a replay (Bot never sends one; this holds even if something did).
+        self.last_session = None
+        self.last_seq = 0
 
     # Output.
     def send(self, obj):
@@ -286,6 +313,9 @@ class Runtime:
         elif op == "command":
             self.on_command(msg, at)
         elif op == "stop":
+            epoch = msg.get("turn_epoch")
+            if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > self.halt_epoch:
+                self.halt_epoch = epoch
             self.safe_stop("stop")
         elif op == "estop":
             self.estopped = True
@@ -365,11 +395,25 @@ class Runtime:
             dl = DEFAULT_DEADLINE_MS
         moves = kind in GUARDED_KINDS or kind in self.plugin.motion_kinds
         dl = max(1, min(dl, MAX_DEADLINE_MS if moves else MAX_LONG_DEADLINE_MS))
-        cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"), msg.get("operator"), msg.get("turn_epoch"))
+        cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"), msg.get("operator"), msg.get("turn_epoch"),
+                      msg.get("provenance"))
         if kind == "halt":
+            if cmd.turn_epoch and cmd.turn_epoch > self.halt_epoch:
+                self.halt_epoch = cmd.turn_epoch
             self.safe_stop("halt")
             self.send({"op": "ack", "id": cid})
             return
+        if cmd.turn_epoch and cmd.turn_epoch < self.halt_epoch:
+            self.send({"op": "nack", "id": cid, "fault_code": "expired",
+                       "message": "from a turn that ended: epoch %d is older than the newest halt's %d" % (cmd.turn_epoch, self.halt_epoch)})
+            return
+        prov = cmd.provenance or {}
+        if prov.get("session") and prov.get("seq"):
+            if prov["session"] == self.last_session and prov["seq"] <= self.last_seq:
+                self.send({"op": "nack", "id": cid, "fault_code": "expired",
+                           "message": "a replay: seq %d is not above %d on this session" % (prov["seq"], self.last_seq)})
+                return
+            self.last_session, self.last_seq = prov["session"], prov["seq"]
         if not self.ready:
             self.send({"op": "nack", "id": cid, "fault_code": "not_ready"})
             return

@@ -76,7 +76,7 @@ class DryRun(Plugin):
             raise Fault("unsupported", "kind %s" % cmd.kind)
         if self.log_commands:
             self.log("dryrun: %s %s (deadline %d ms)", cmd.kind, json.dumps(v, sort_keys=True), cmd.deadline_ms)
-        self.record("command", id=cmd.id, kind=cmd.kind, value=v, deadline_ms=cmd.deadline_ms)
+        self.record("command", id=cmd.id, kind=cmd.kind, value=v, deadline_ms=cmd.deadline_ms, provenance=cmd.provenance)
 
     def stop(self):
         if self.state["throttle"] or self.state["steer"]:

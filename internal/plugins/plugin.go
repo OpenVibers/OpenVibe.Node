@@ -185,6 +185,16 @@ func (p *Plugin) send(msg map[string]any) error {
 // Stop tells the plugin to stop every actuator.
 func (p *Plugin) Stop() { _ = p.send(map[string]any{"op": "stop"}) }
 
+// Halt is Stop for a halt command: it carries the halt's turn_epoch (when Bot sent one), the newest epoch a driver
+// should take commands from.
+func (p *Plugin) Halt(turnEpoch int64) {
+	if turnEpoch <= 0 {
+		p.Stop()
+		return
+	}
+	_ = p.send(map[string]any{"op": "stop", "turn_epoch": turnEpoch})
+}
+
 // Estop latches the plugin's e-stop (the core also refuses motion itself).
 func (p *Plugin) Estop() {
 	p.mu.Lock()
@@ -253,6 +263,23 @@ func (p *Plugin) BeginAs(ctx context.Context, id, kind string, value json.RawMes
 // BeginTurn is BeginAs with the robot's control epoch the command was decided under (protocol.Command.TurnEpoch), sent
 // to the plugin as turn_epoch when it is set, so a driver can refuse a command older than the newest turn halt itself.
 func (p *Plugin) BeginTurn(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator, turnEpoch int64) func() Reply {
+	return p.BeginWith(ctx, id, kind, value, deadlineMS, op, turnEpoch, nil)
+}
+
+// Provenance is where a command came from, passed unchanged from Bot to the driver as `provenance` (plugins.md): the
+// link session it arrived on (Bot's hello; a new one on every connection, and session ids sort by time), the frame's
+// seq on that session (strictly increasing, with gaps), Bot's clock when it sent the command (and minted its id), and
+// the absolute deadline on that clock for a motion kind. Bot sends a command once and never again under any id, so
+// a driver can refuse a replay with constant state: the same session with a seq not above the last one it handled.
+type Provenance struct {
+	Session     string `json:"session,omitempty"`
+	Seq         uint64 `json:"seq,omitempty"`
+	IssuedAtMS  int64  `json:"issued_at_ms,omitempty"`
+	ExpiresAtMS int64  `json:"expires_at_ms,omitempty"`
+}
+
+// BeginWith is BeginTurn with the command's provenance (nil: none).
+func (p *Plugin) BeginWith(ctx context.Context, id, kind string, value json.RawMessage, deadlineMS int, op *protocol.Operator, turnEpoch int64, prov *Provenance) func() Reply {
 	now := func(r Reply) func() Reply { return func() Reply { return r } }
 	p.mu.Lock()
 	if p.state != StateReady && kind != protocol.KindHalt {
@@ -287,6 +314,9 @@ func (p *Plugin) BeginTurn(ctx context.Context, id, kind string, value json.RawM
 	}
 	if turnEpoch > 0 {
 		msg["turn_epoch"] = turnEpoch
+	}
+	if prov != nil {
+		msg["provenance"] = prov
 	}
 	if err := p.send(msg); err != nil {
 		done()

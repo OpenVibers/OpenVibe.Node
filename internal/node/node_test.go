@@ -172,6 +172,12 @@ type rec struct {
 	Value      json.RawMessage `json:"value"`
 	DeadlineMS int             `json:"deadline_ms"`
 	WasMoving  bool            `json:"was_moving"`
+	Provenance *struct {
+		Session     string `json:"session"`
+		Seq         uint64 `json:"seq"`
+		IssuedAtMS  int64  `json:"issued_at_ms"`
+		ExpiresAtMS int64  `json:"expires_at_ms"`
+	} `json:"provenance"`
 }
 
 func (e *env) records() []rec {
