@@ -117,7 +117,7 @@ text and keys are passed to the tool as arguments, never through a shell, and `k
 `-` and `_`.
 
 **The browser** (`browser`) is a Chromium-family browser (Chromium, Chrome, Edge or Brave) the agent drives:
-- **Its own profile.** It runs in a folder of its own (`browser_profile`, by default `~/.local/share/openvibe-node/browser`), so the agent never sees the sessions of your own browser unless you point it at one. Sign it in to a site yourself (`browser_headless: false` shows its window) if you want the agent to work there as you.
+- **Its own profile.** It runs in a folder of its own (`browser_profile`, by default `~/.local/share/openvibe-node/browser`; on Windows `%LOCALAPPDATA%\openvibe-node\browser`), so the agent never sees the sessions of your own browser unless you point it at one. Sign it in to a site yourself (`browser_headless: false` shows its window) if you want the agent to work there as you.
 - **No port.** The Node starts it on the first command with `--remote-debugging-pipe`: it speaks the DevTools protocol over two file descriptors, so nothing else on the machine can drive it.
 - **Levels.** `read`, `screenshot` and `close` run at every level. `open`, `click`, `fill`, `press` and `back` are acting commands: refused at `observe`, approved one by one at `ask`. The approval says exactly what would happen: "open https://… in the browser", "type 5 characters into #q in the browser: 'hello'".
 - **Your own network.** Below level `full`, `open` refuses an address on the machine's own network (private, loopback or link-local, checked for every address the name resolves to).
@@ -273,12 +273,12 @@ curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_
 | `allow_desk`         | `true`         | `false`: never start a private desk (no `desk` capability) |
 | `max_desks`          | memory / 2 GiB, 1 to 8 | how many whole desks run at once (1 to 10); a browser desk counts as half |
 | `desk_idle_s`        | `900`          | a desk no command used this long is stopped (60 to 86400) |
-| `desk_dir`           | `~/.local/share/openvibe-node/desks` | each desk's own temp and downloads folders |
+| `desk_dir`           | `~/.local/share/openvibe-node/desks` (Windows: `%LOCALAPPDATA%\openvibe-node\desks`) | each desk's own temp and downloads folders |
 | `desk_profile_max_mb` | `256`         | a kept profile larger than this is not saved (16 to 4096) |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
 | `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |
 | `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |
-| `browser_profile`    | `~/.local/share/openvibe-node/browser` | its profile folder: the agent's own, unless you choose another |
+| `browser_profile`    | `~/.local/share/openvibe-node/browser` (Windows: `%LOCALAPPDATA%\openvibe-node\browser`) | its profile folder: the agent's own, unless you choose another |
 | `browser_egress`     | `public`       | `public`: every agent browser goes through the egress guard (never your own network below level `full`); `open`: no guard |
 | `browser_headless`   | `true`         | `false`: show its window |
 | `browser_idle_s`     | 600            | close it after this long without a command |

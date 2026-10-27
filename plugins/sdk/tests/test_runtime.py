@@ -439,7 +439,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(rt.stop_infos[-1].halt_epoch, 1792900000500)
 
     def test_the_package_reports_the_node_release(self):
-        self.assertEqual(openvibe_plugin.__version__, "0.30.0")
+        self.assertEqual(openvibe_plugin.__version__, "0.31.0")
         with open(os.path.join(os.path.dirname(HERE), "pyproject.toml")) as f:
             self.assertIn('version = "%s"' % openvibe_plugin.__version__, f.read())
 

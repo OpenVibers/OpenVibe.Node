@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -55,6 +56,20 @@ PAGE_MODIFIERS = {
     "command": (4, ("Meta", "MetaLeft", 91)), "win": (4, ("Meta", "MetaLeft", 91)),
     "shift": (8, ("Shift", "ShiftLeft", 16)),
 }
+
+
+def mac_edit_command(bits, name, platform=None):
+    """The editing command a chord means in a text field on macOS, or None. Chrome on a Mac runs select all, copy,
+    paste, cut, undo and redo from the system's key bindings, which synthetic key events never reach: the event has to
+    name the command (CDP's `commands`, as Puppeteer does). An agent sends the chord it knows (ctrl+a on Linux and
+    Windows, cmd+a on a Mac), so on a Mac both work: a browser desk behaves the same on every OS (2026-10-27, found by
+    running the plugin's tests on macOS: ctrl+a then BackSpace deleted one letter)."""
+    if (platform or sys.platform) != "darwin" or not bits & 6:   # ctrl or meta held
+        return None
+    k = name.lower()
+    if k == "z":
+        return "redo" if bits & 8 else "undo"
+    return {"a": "selectAll", "c": "copy", "x": "cut", "v": "paste", "y": "redo"}.get(k)
 
 
 def page_key(name, shift=False):
@@ -352,6 +367,14 @@ class Browser:
                         slot[0].set()
                 elif "method" in msg:
                     with self.mu:
+                        if msg["method"] == "Target.detachedFromTarget":
+                            # Its page closed (a popup that closes itself): a call still waiting on it is never answered
+                            # (Chrome on macOS stays silent), so it fails at once and _eval reads the page in front again.
+                            gone = (msg.get("params") or {}).get("sessionId")
+                            for waiting in self.waiting.values():
+                                if gone and waiting[2] == gone and waiting[1] is None:
+                                    waiting[1] = {"error": {"message": "Session closed: its page closed"}}
+                                    waiting[0].set()
                         self.events.append(msg["method"])
                         if msg["method"] in ("Target.targetCreated", "Target.targetDestroyed"):
                             self.tab_events = (self.tab_events + [(msg["method"], msg.get("params") or {})])[-50:]
@@ -362,14 +385,15 @@ class Browser:
                 slot[0].set()
 
     def call(self, method, params=None, session=True, timeout_s=None):
+        sid = self.session if session else None
         with self.mu:
             self.next_id += 1
             mid = self.next_id
-            slot = [threading.Event(), None]
+            slot = [threading.Event(), None, sid]   # the page's session it went to: answered at once if that page closes
             self.waiting[mid] = slot
         msg = {"id": mid, "method": method, "params": params or {}}
-        if session and self.session:
-            msg["sessionId"] = self.session
+        if sid:
+            msg["sessionId"] = sid
         try:
             with self.write_mu:
                 self.out.write(json.dumps(msg).encode("utf-8") + b"\0")
@@ -585,6 +609,9 @@ class Browser:
         down = {"type": "keyDown" if typed else "rawKeyDown", "key": k, "code": code, "windowsVirtualKeyCode": vk, "modifiers": bits}
         if typed:
             down["text"] = down["unmodifiedText"] = typed
+        command = mac_edit_command(bits, parts[-1], getattr(self, "platform", None))
+        if command:
+            down["commands"] = [command]
         self.call("Input.dispatchKeyEvent", down)
         self.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": k, "code": code, "windowsVirtualKeyCode": vk, "modifiers": bits})
         for bit, (mk, mcode, mvk) in reversed(mods):

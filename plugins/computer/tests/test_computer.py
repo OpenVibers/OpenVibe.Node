@@ -79,7 +79,7 @@ class ComputerTest(unittest.TestCase):
     def boot(self, level="observe", **config):
         self.dir = tempfile.mkdtemp(prefix="ov-computer-")
         self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
-        with open(os.path.join(self.dir, "notes.txt"), "w") as f:
+        with open(os.path.join(self.dir, "notes.txt"), "w", newline="\n") as f:   # the same bytes on Windows
             f.write("hello computer\n")
         os.mkdir(os.path.join(self.dir, "sub"))
         self.out = Out()
