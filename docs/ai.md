@@ -61,4 +61,7 @@ computer's models** for the machine on openvibe.bot/machines.
 - At most 200 messages of 64 KB each. A model the machine does not offer is refused (`bad_value`), and so is a request
   while another runs (`not_ready`).
 - When no model server answers, the command is `not_ready` and `describe` says `ai.ready: false`.
+- Its telemetry (Node v0.29.0) says whether a model is answering now (`ai_busy`). Once one has answered, it also gives
+  how fast the last model answered here (`ai_model`, `ai_tokens_per_s`): the reply's tokens over the whole answer's
+  time, averaged with the earlier answers, the latest counting most. openvibe.bot/machines shows it beside the models.
 - It never acts on the machine, so it also runs while the machine's stop is latched.

@@ -110,6 +110,17 @@ class AiPluginTest(unittest.TestCase):
         self.assertEqual(path, "/v1/chat/completions")
         self.assertEqual((body["max_tokens"], body["temperature"], body["stream"]), (50, 0.2, False))
 
+    def test_it_says_how_fast_each_model_answers_here(self):
+        self.boot()
+        self.assertEqual(self.p.poll(), {"sensors": {"ai_busy": 0}}, "nothing measured before the first answer")
+        ticks = iter([10.0, 10.5, 20.0, 21.0])   # the first answer takes 0.5 s, the second 1 s
+        self.p.clock = lambda: next(ticks)
+        self.ask({"model": "llama3.1:8b", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(self.p.poll()["sensors"], {"ai_busy": 0, "ai_model": "llama3.1:8b", "ai_tokens_per_s": 8.0},
+                         "4 reply tokens in half a second")
+        self.ask({"model": "llama3.1:8b", "messages": [{"role": "user", "content": "again"}]})
+        self.assertEqual(self.p.poll()["sensors"]["ai_tokens_per_s"], round(8.0 * 0.7 + 4.0 * 0.3, 1), "the latest counts most")
+
     def test_a_config_can_offer_fewer_models_and_cap_the_reply(self):
         caps = self.boot(models=["qwen2.5:7b"], max_tokens=100)[0]["capabilities"]["ai"]
         self.assertEqual(caps["models"], ["qwen2.5:7b"])
