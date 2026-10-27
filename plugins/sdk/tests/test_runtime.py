@@ -125,6 +125,61 @@ class RuntimeTest(unittest.TestCase):
                                  "turn_epoch": "soon"}))
         self.assertEqual(seen, [1792900000123, None, None])
 
+    def test_provenance_reaches_handle(self):
+        seen = []
+
+        class Prov(Recorder):
+            def handle(self, cmd):
+                seen.append(cmd.provenance)
+
+        rt, p, out, clock = make(Prov())
+        self.hello(rt)
+        prov = {"session": "sess_01J9", "seq": 7, "issued_at_ms": 1792900000000, "expires_at_ms": 1792900000300}
+        rt.feed_line(json.dumps({"op": "command", "id": "c1", "kind": "drive", "value": {}, "deadline_ms": 300,
+                                 "provenance": prov}))
+        rt.feed_line(json.dumps({"op": "command", "id": "c2", "kind": "drive", "value": {}, "deadline_ms": 300}))
+        rt.feed_line(json.dumps({"op": "command", "id": "c3", "kind": "drive", "value": {}, "deadline_ms": 300,
+                                 "provenance": {"session": 5, "seq": "8", "issued_at_ms": True}}))
+        self.assertEqual(seen, [prov, None, None])
+
+    def test_replay_on_the_same_session_is_refused(self):
+        # Bot sends a command once and never again; if a frame came back anyway, its seq is not above the last one
+        # handled on its session, and the runtime refuses it with no state but that pair.
+        rt, p, out, clock = make()
+        self.hello(rt)
+
+        def cmd(cid, session, seq):
+            rt.feed_line(json.dumps({"op": "command", "id": cid, "kind": "drive", "value": {}, "deadline_ms": 300,
+                                     "provenance": {"session": session, "seq": seq, "issued_at_ms": 1792900000000}}))
+            return lines(out)[-1]
+
+        self.assertEqual(cmd("c1", "sess_A", 5)["op"], "ack")
+        replay = cmd("c1-again", "sess_A", 5)
+        self.assertEqual((replay["op"], replay["fault_code"]), ("nack", "expired"))
+        self.assertIn("replay", replay["message"])
+        self.assertEqual(cmd("c0", "sess_A", 3)["op"], "nack", "an older frame on the same session")
+        self.assertEqual(cmd("c2", "sess_A", 9)["op"], "ack", "seq has gaps")
+        self.assertEqual(cmd("c3", "sess_B", 1)["op"], "ack", "a new connection starts its own count")
+
+    def test_a_halts_epoch_refuses_older_turns(self):
+        rt, p, out, clock = make()
+        self.hello(rt)
+
+        def drive(cid, epoch):
+            rt.feed_line(json.dumps({"op": "command", "id": cid, "kind": "drive", "value": {}, "deadline_ms": 300,
+                                     "turn_epoch": epoch}))
+            return lines(out)[-1]
+
+        self.assertEqual(drive("c1", 100)["op"], "ack")
+        rt.feed_line(json.dumps({"op": "stop", "turn_epoch": 200}))
+        stale = drive("c2", 100)
+        self.assertEqual((stale["op"], stale["fault_code"]), ("nack", "expired"))
+        self.assertEqual(drive("c3", 200)["op"], "ack")
+        rt.feed_line(json.dumps({"op": "command", "id": "h", "kind": "halt", "turn_epoch": 300}))
+        self.assertEqual(drive("c4", 200)["op"], "nack", "a halt command's epoch counts too")
+        rt.feed_line(json.dumps({"op": "stop"}))
+        self.assertEqual(drive("c5", 300)["op"], "ack", "a stop without an epoch changes nothing")
+
     def test_newer_command_extends_deadline(self):
         rt, p, out, clock = make()
         self.hello(rt)

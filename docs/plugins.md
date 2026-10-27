@@ -48,9 +48,9 @@ describes itself and waits for EOF without opening any hardware.
 | op          | fields                                                        | the plugin must                                        |
 |-------------|---------------------------------------------------------------|--------------------------------------------------------|
 | `hello`     | `config` {…}, `probe` bool                                    | answer `describe`; then set up (unless probe)          |
-| `command`   | `id`, `kind`, `value`, `deadline_ms`, `operator`?, `turn_epoch`? | act, answer `ack` or `nack` with the same `id`      |
+| `command`   | `id`, `kind`, `value`, `deadline_ms`, `operator`?, `turn_epoch`?, `provenance`? | act, answer `ack` or `nack` with the same `id` |
 | `heartbeat` | `t` (core clock, ms)                                          | note the time                                          |
-| `stop`      |                                                               | stop every actuator                                    |
+| `stop`      | `turn_epoch`? (a halt's)                                      | stop every actuator                                    |
 | `estop`     |                                                               | stop every actuator and refuse motion until `resume`   |
 | `resume`    |                                                               | accept motion again                                    |
 | `approval`  | `id`, `approved` bool                                         | the owner's answer to an `approval` event it raised    |
@@ -73,7 +73,52 @@ contracts 0.213.0). It rises when a queue turn ends, its holder leaves, or the o
 for that change carries the new value. The core keeps the newest epoch a halt carried per robot and nacks (`expired`) a
 command older than it, so it never reaches a plugin; a driver may keep the newest it saw and refuse older ones too, as
 defence in depth (a desk robot's own controller, for one). Absent from older Bots and on robots without a queue.
-Python: `cmd.turn_epoch` (an int, or `None`).
+A halt's epoch also comes with the `stop` it causes (`{"op": "stop", "turn_epoch": …}`), so a driver knows the newest
+epoch even before the next command. Python: `cmd.turn_epoch` (an int, or `None`); the runtime keeps the newest halt's
+and refuses an older command itself (`expired`).
+
+`provenance` is where the command came from, passed unchanged from Bot (Node 0.16):
+
+| field | meaning |
+|---|---|
+| `session` | the link session it arrived on (Bot's `hello`; a new id on every connection, and ids sort by time) |
+| `seq` | its frame's number on that session: strictly increasing, with gaps (other frames share the count) |
+| `issued_at_ms` | Bot's clock when it sent the command, which is when it minted the id (`cmd_<ULID>`, whose time part is the same) |
+| `expires_at_ms` | the absolute deadline on Bot's clock (motion kinds); `deadline_ms` is what is left of it at receipt |
+
+Python: `cmd.provenance` (a dict, or `None` from an older Node). The runtime refuses (`expired`) a command whose `seq`
+is not above the last one it handled on the same `session`.
+
+#### What a driver can rely on: commands are never redelivered
+
+Asked by the Generic LOOI driver's authors (2026-10-26). From the code of Bot and this Node:
+
+- **Bot sends a command once.** Each send gets a new id (`cmd_<ULID>`, minted at that moment). A command is sent only
+  while the device is online and is never queued: offline, it is refused, not held. One that is not acknowledged by
+  its deadline plus 1.5 s is recorded as `expired` and never sent again. An operator who repeats their own id gets the
+  first result back and causes no second device command. Nothing is replayed after a reconnect, a Bot restart or a turn
+  change. Jobs (`job_…`) do resend after a reconnect, but they are a different frame and never reach a driver as a
+  `command`.
+- **The Node delivers a command at most once.** It remembers command ids for 10 minutes (up to 4096) across
+  reconnects and answers a repeated id with the first result, without passing it on. It refuses a command whose absolute
+  deadline has passed on Bot's clock (`expired`), so a frame delayed or replayed with its original deadline never
+  reaches a driver. Within a connection, commands reach a plugin in the order Bot sent them.
+- **The boundaries.**
+  - A turn change is a halt carrying a new `turn_epoch`. Epochs are milliseconds on Bot's clock, so they rise across
+    Bot restarts. The core and the Python runtime both refuse older commands after it.
+  - A connection is a `session`. The link is authenticated with the device's credential, and a plugin's stdin comes
+    only from the Node that started it, so whatever arrives there is from that Node.
+- **What is not kept.** The Node's id memory and newest-halt epochs start empty when the Node restarts. So does a
+  plugin's state when the plugin restarts. Commands sent before a restart can no longer arrive afterwards: their
+  connection is gone and their deadlines (at most `max_command_ms`, 300 ms on LOOI) have long passed.
+
+So a driver needs no growing replay cache. Refuse a command if any of these is true:
+- `deadline_ms` has run out;
+- `turn_epoch` is older than the newest halt's;
+- `seq` is not above the last on the same `session`.
+
+The runtime does all three. A driver that wants more can also refuse an `issued_at_ms` older than the newest it has
+handled by more than `max_command_ms`.
 
 ### Plugin → core
 

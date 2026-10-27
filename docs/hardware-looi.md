@@ -22,10 +22,15 @@ The e-stop is latched in Bot and only the owner clears it. Each command tells th
 drives (the driver gets `stop`), so commands from the last driver never come after it
 ([plugins.md](plugins.md#core--plugin)). The owner or an operator driving during someone's turn pauses that turn and
 halts the robot first, the same way. Each command also carries `cmd.turn_epoch`: the core already refuses one older
-than the newest halt's, and a driver may check it again against its own record.
+than the newest halt's, and a driver may check it again against its own record. Commands are never redelivered: Bot
+sends each once under a new id, the Node passes it on at most once and never after its deadline, and each carries
+`cmd.provenance` (the link session, the frame's seq, Bot's send time and deadline). The Python runtime refuses a
+replay on a session and a command from an ended turn by itself
+([plugins.md](plugins.md#what-a-driver-can-rely-on-commands-are-never-redelivered)).
 
-To show the panel under a Live stream, bind the robot to the channel on the Live dashboard (the robot card). The
-channel page then shows the robot's panel beside the phone's stream.
+To show the panel under a Live stream, press **Put the buttons under my OpenVibe.Live stream** on the robot's page on
+openvibe.bot: it shows the panel where it is embedded and opens your channel to confirm. The channel page then shows
+the robot's panel beside the phone's stream, and viewers signed in on Live press Drive there.
 
 ## What the driver receives
 

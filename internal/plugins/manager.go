@@ -77,6 +77,13 @@ func (m *Manager) StopAll() {
 	}
 }
 
+// HaltAll stops every plugin for a halt command, telling each the halt's turn_epoch (Plugin.Halt).
+func (m *Manager) HaltAll(turnEpoch int64) {
+	for _, p := range m.plugins {
+		p.Halt(turnEpoch)
+	}
+}
+
 func (m *Manager) EstopAll() {
 	for _, p := range m.plugins {
 		p.Estop()
