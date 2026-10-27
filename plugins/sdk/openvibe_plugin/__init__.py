@@ -21,8 +21,10 @@ import time
 
 __all__ = ["Plugin", "Fault", "Deferred", "Command", "StopInfo", "Runtime", "run", "clamp", "MOTION_KINDS",
            "HEARTBEAT_TIMEOUT_S", "DEFAULT_DEADLINE_MS", "PROTOCOL_VERSION", "STOP_CAUSES", "EMERGENCY_CAUSES",
-           "RUNTIME_CAUSES"]
+           "RUNTIME_CAUSES", "SHARED_CLOCK", "__version__"]
 
+# The Node release this runtime ships with (pyproject.toml carries the same).
+__version__ = "0.18.0"
 PROTOCOL_VERSION = 1
 HEARTBEAT_TIMEOUT_S = 1.0
 DEFAULT_DEADLINE_MS = 300
@@ -34,6 +36,16 @@ MAX_LONG_DEADLINE_MS = 600000
 MOTION_KINDS = frozenset({"drive"})
 # Kinds refused while an e-stop is latched or the heartbeat is lost. halt is always accepted.
 GUARDED_KINDS = frozenset({"drive", "ptz", "actuator"})
+
+
+def _monotonic_ns():
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+
+# The clock this process shares with the core: CLOCK_MONOTONIC, one clock for every process on the machine, which a
+# step of the wall clock does not move. A command's expires_at_mono_ns is an instant on it (Node 0.18). None where
+# there is none to share (Windows): deadline_ms alone then, which the core counts down to the moment it wrote the line.
+SHARED_CLOCK = _monotonic_ns if hasattr(time, "clock_gettime_ns") and hasattr(time, "CLOCK_MONOTONIC") else None
 
 
 class Fault(Exception):
@@ -71,14 +83,18 @@ class Command:
     (the absolute deadline on Bot's clock, motion kinds only), and "clock_uncertainty_ms" (Node v0.17.0: how far the
     core's estimate of Bot's clock may trail it, the connection's fastest round trip; the deadline was already checked
     against estimate + this, and a driver may refuse motion above a cap of its own). Bot sends a command once and never
-    again; the runtime already refuses one whose seq is not above the last on its session (plugins.md, "Provenance")."""
+    again; the runtime already refuses one whose seq is not above the last on its session (plugins.md, "Provenance").
+
+    deadline_ms is the whole milliseconds the command had left when its line was read, and deadline the instant on the
+    runtime's clock it expires: the core counts down to the moment it wrote the line, and the runtime takes off the time
+    the line then sat in the pipe (expires_at_mono_ns, Node 0.18), so no delay on the way gives a command more time."""
     __slots__ = ("id", "kind", "value", "deadline_ms", "deadline", "target", "operator", "turn_epoch", "provenance")
 
     def __init__(self, id, kind, value, deadline_ms, now, target=None, operator=None, turn_epoch=None, provenance=None):
         self.id = id
         self.kind = kind
         self.value = value if value is not None else {}
-        self.deadline_ms = deadline_ms
+        self.deadline_ms = int(deadline_ms)
         self.deadline = now + deadline_ms / 1000.0
         self.target = target
         self.operator = operator if isinstance(operator, dict) else None
@@ -87,6 +103,13 @@ class Command:
 
     def __repr__(self):
         return "Command(id=%r, kind=%r, value=%r, deadline_ms=%r)" % (self.id, self.kind, self.value, self.deadline_ms)
+
+
+def _left_ms(expires_ns, shared_at):
+    """Milliseconds from shared_at to expires_ns (both on the shared clock), or None when either is missing."""
+    if shared_at is None or not isinstance(expires_ns, int) or isinstance(expires_ns, bool):
+        return None
+    return (expires_ns - shared_at) / 1e6
 
 
 def _provenance(p):
@@ -289,12 +312,14 @@ class Runtime:
     """Drives one Plugin from a line-oriented input and output. Tests construct it with in-memory streams."""
 
     def __init__(self, plugin, infile=None, outfile=None, clock=time.monotonic,
-                 heartbeat_timeout_s=HEARTBEAT_TIMEOUT_S):
+                 heartbeat_timeout_s=HEARTBEAT_TIMEOUT_S, shared_clock=SHARED_CLOCK):
         self.plugin = plugin
         plugin.runtime = self
         self.infile = infile if infile is not None else sys.stdin
         self.outfile = outfile if outfile is not None else sys.stdout
         self.clock = clock
+        # The clock shared with the core (SHARED_CLOCK, ns), read with clock when each line arrives; None: not shared.
+        self.shared_clock = shared_clock
         self.heartbeat_timeout_s = heartbeat_timeout_s
         self.lock = threading.RLock()
         self.out_lock = threading.Lock()
@@ -378,10 +403,23 @@ class Runtime:
                 self.send(dict(op="telemetry", **t))
 
     # Input.
-    def dispatch(self, msg, at=None):
+    def shared_now(self):
+        """The shared clock now (ns), or None."""
+        if self.shared_clock is None:
+            return None
+        try:
+            return self.shared_clock()
+        except (OSError, ValueError):
+            return None
+
+    def dispatch(self, msg, at=None, shared_at=None):
         """Handle one message. at is when the line arrived (defaults to now): deadlines and heartbeats count from
-        arrival, so a backlog after a slow handler cannot make stale commands or heartbeats look fresh."""
-        at = self.clock() if at is None else at
+        arrival, so a backlog after a slow handler cannot make stale commands or heartbeats look fresh. shared_at is
+        the shared clock at that moment (read with at when at defaults): a command's expires_at_mono_ns is measured
+        against it, so time in the pipe before arrival counts too."""
+        if at is None:
+            at = self.clock()
+            shared_at = self.shared_now()
         op = msg.get("op")
         if op == "hello":
             self.on_hello(msg)
@@ -390,7 +428,7 @@ class Runtime:
             if self.heartbeat_lost:
                 self.heartbeat_lost = False
         elif op == "command":
-            self.on_command(msg, at)
+            self.on_command(msg, at, shared_at)
         elif op == "stop":
             epoch = _epoch(msg.get("turn_epoch"))
             if epoch and epoch > self.halt_epoch:
@@ -479,16 +517,23 @@ class Runtime:
         if self.plugin.retry_setup_s:
             self.setup_retry_at = self.clock() + float(self.plugin.retry_setup_s)
 
-    def on_command(self, msg, now=None):
+    def on_command(self, msg, now=None, shared_at=None):
         cid = msg.get("id")
         kind = msg.get("kind")
-        now = self.clock() if now is None else now
+        if now is None:
+            now = self.clock()
+            shared_at = self.shared_now()
         try:
             dl = int(msg.get("deadline_ms") or DEFAULT_DEADLINE_MS)
         except (TypeError, ValueError):
             dl = DEFAULT_DEADLINE_MS
         moves = kind in GUARDED_KINDS or kind in self.plugin.motion_kinds
         dl = max(1, min(dl, MAX_DEADLINE_MS if moves else MAX_LONG_DEADLINE_MS))
+        # What the command had left when its line arrived, on the clock shared with the core (Node 0.18): deadline_ms
+        # was counted down to the moment the core wrote the line, so this takes off the time it then sat in the pipe.
+        left = _left_ms(msg.get("expires_at_mono_ns"), shared_at) if moves else None
+        if left is not None and left >= 1:
+            dl = min(dl, left)
         cmd = Command(cid, kind, msg.get("value"), dl, now, msg.get("target"), msg.get("operator"), msg.get("turn_epoch"),
                       msg.get("provenance"))
         if kind == "halt":
@@ -509,8 +554,14 @@ class Runtime:
                            "message": "a replay: seq %d is not above %d on this session" % (prov["seq"], self.last_seq)})
                 return
             self.last_session, self.last_seq = prov["session"], prov["seq"]
-        # A motion command whose time ran out while it waited behind a slow handler (its deadline counts from when its
-        # line arrived) never reaches the driver: the runtime holds nothing past its deadline.
+        # A motion command whose time ran out in the pipe, before its line was read, never reaches the driver.
+        if left is not None and left < 1:
+            self.send({"op": "nack", "id": cid, "fault_code": "expired",
+                       "message": "its deadline passed before the runtime read it (%d ms late, counted on the clock it "
+                                  "shares with the core)" % max(0, round(-left))})
+            return
+        # Nor does one whose time ran out while it waited behind a slow handler (its deadline counts from when its line
+        # arrived): the runtime holds nothing past its deadline.
         if moves and self.clock() >= cmd.deadline:
             self.send({"op": "nack", "id": cid, "fault_code": "expired",
                        "message": "its deadline passed while it waited behind earlier input (%d ms after it arrived)"
@@ -543,7 +594,7 @@ class Runtime:
             self.safe_stop("handler_error")
             self.send({"op": "nack", "id": cid, "fault_code": "hardware", "message": str(e)})
 
-    def feed_line(self, line, at=None):
+    def feed_line(self, line, at=None, shared_at=None):
         line = line.strip()
         if not line:
             return
@@ -553,7 +604,7 @@ class Runtime:
             self.plugin.log("bad json from core: %r", line[:200])
             return
         if isinstance(msg, dict):
-            self.dispatch(msg, at)
+            self.dispatch(msg, at, shared_at)
 
     def shutdown(self, reason="eof"):
         if self.closed:
@@ -569,7 +620,9 @@ class Runtime:
     def _reader(self):
         try:
             for line in self.infile:
-                self.inbox.put((line, self.clock()))
+                # The runtime's clock first, then the shared one: the time left can only come out short.
+                at = self.clock()
+                self.inbox.put((line, at, self.shared_now()))
         except Exception:
             pass
         self.inbox.put(None)
@@ -582,12 +635,12 @@ class Runtime:
                 try:
                     item = self.inbox.get(timeout=0.02)
                 except queue.Empty:
-                    item = ("", None)
+                    item = ("", None, None)
                 if item is None:
                     break
-                line, at = item
+                line, at, shared_at = item
                 if line:
-                    self.feed_line(line, at)
+                    self.feed_line(line, at, shared_at)
                 self.tick()
         finally:
             self.shutdown("eof")

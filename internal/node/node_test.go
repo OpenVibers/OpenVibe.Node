@@ -327,10 +327,11 @@ func TestCommandsClampedAndIdempotent(t *testing.T) {
 	if d := drives[0].DeadlineMS; d < 150 || d > 305 {
 		t.Fatalf("deadline %d", d)
 	}
-	// Deadlines are capped at max_command_ms.
+	// Deadlines are capped at max_command_ms, counted from the Node's receipt: the plugin gets the cap less the time
+	// the command then spent in the Node and its queue (Node 0.18).
 	e.cmd("drive", `{"throttle":0.1}`, 60000)
 	r := e.records()
-	if last := r[len(r)-1]; last.DeadlineMS != 1000 {
+	if last := r[len(r)-1]; last.DeadlineMS > 1000 || last.DeadlineMS < 900 {
 		t.Fatalf("deadline not capped: %d", last.DeadlineMS)
 	}
 	if c := nackCode(e.cmd("drive", `{"throttle":"fast"}`, 300)); c != protocol.FaultBadValue {

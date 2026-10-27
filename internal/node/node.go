@@ -252,11 +252,17 @@ func (n *Node) Run(parent context.Context) error {
 	}
 
 	pctx, cancelPlugins := context.WithCancel(context.Background())
-	n.mgr.Start(pctx)
+	// A stop latched on disk is set on every plugin before any starts: each process's first lines are then hello and
+	// the e-stop replayed (cause latched, first_cause what set it), before it can be routed any command.
 	if st := n.latch.State(); st.Stopped() {
 		n.log.Warn("starting with the stop latched", "remote", st.Remote, "local", st.Local)
-		n.mgr.EstopAll(plugins.EstopLatched, latchReason(st))
+		first := plugins.EstopLocal
+		if st.Remote {
+			first = plugins.EstopRemote
+		}
+		n.mgr.EstopAll(first, latchReason(st))
 	}
+	n.mgr.Start(pctx)
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -457,7 +463,9 @@ func (n *Node) voiceAnswer(a protocol.VoiceAnswer) {
 // command validates and routes one command. The synchronous part (checks, clamping, queueing to the plugin) keeps
 // commands in arrival order; the reply is awaited on its own goroutine. deadline_ms is an absolute instant on the
 // server's clock: it is compared with the link's estimate of that clock at receipt (serverNow), so a command that
-// arrives after its deadline is nacked and never reaches a plugin, and a plugin gets only the time that is left.
+// arrives after its deadline is nacked and never reaches a plugin, and a plugin gets only the time that is left. What is
+// left becomes an instant on this machine (receipt + left): time the command then spends in the Node and in the queue
+// to the plugin counts against it, and the plugin is told the instant on the clock it shares with the Node (plugins.md).
 func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received time.Time) {
 	if c.ID == "" {
 		n.log.Warn("command without id ignored", "kind", c.Kind)
@@ -532,8 +540,10 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 	}
 	deadline := limits.Deadline(0)
 	var uncertainty *int64
+	var unc int64
 	if c.DeadlineMS > 0 {
-		left, unc, synced := n.timeLeft(c.DeadlineMS, sentMS, received)
+		left, u, synced := n.timeLeft(c.DeadlineMS, sentMS, received)
+		unc = u
 		if protocol.GuardedKinds[c.Kind] {
 			// Motion is timed only on a clock Node can bound (Maticus, 2026-10-27): not before the connection's first
 			// round trip, and not on a link whose fastest round trip is slower than MaxClockUncertaintyMS.
@@ -546,11 +556,12 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 				return
 			}
 		}
-		if left <= 0 {
-			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived (counting %d ms of clock uncertainty)", -left, unc))
+		// deadline_ms is whole milliseconds, at least 1: a command with less than that left has none.
+		if left < time.Millisecond {
+			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived (counting %d ms of clock uncertainty)", max(0, ceilMS(-left)), unc))
 			return
 		}
-		deadline = limits.Deadline(int(min(left, int64(limits.MaxCommandMS)+1)))
+		deadline = limits.Deadline(int(min(int64(left/time.Millisecond), int64(limits.MaxCommandMS)+1)))
 		if synced && n.link != nil {
 			uncertainty = &unc
 		}
@@ -580,7 +591,9 @@ func (n *Node) command(c protocol.Command, sentMS int64, seq uint64, received ti
 	}
 	// Where it came from, unchanged, so a driver can check it without keeping old ids (Maticus, 2026-10-26, LOOI).
 	prov := &plugins.Provenance{Session: session, Seq: seq, IssuedAtMS: sentMS, ExpiresAtMS: c.DeadlineMS, ClockUncertaintyMS: uncertainty}
-	wait := p.BeginWith(n.ctx, c.ID, c.Kind, value, deadline, c.Operator, c.TurnEpoch, prov)
+	// The window counts from receipt, not from now: nothing the Node does after the frame arrived extends it.
+	expires := received.Add(time.Duration(deadline) * time.Millisecond)
+	wait := p.BeginWith(n.ctx, c.ID, c.Kind, value, expires, c.Operator, c.TurnEpoch, prov)
 	go func() {
 		r := wait()
 		var msg protocol.Message
@@ -624,12 +637,12 @@ func (n *Node) computer(c protocol.Command, entry *safety.Entry, sentMS int64, r
 	}
 	window := int64(protocol.DefaultComputerMS)
 	if c.DeadlineMS > 0 {
-		window, _, _ = n.timeLeft(c.DeadlineMS, sentMS, received)
-		if window <= 0 {
-			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived", -window))
+		left, _, _ := n.timeLeft(c.DeadlineMS, sentMS, received)
+		if left < time.Millisecond {
+			nack(protocol.FaultExpired, fmt.Sprintf("the deadline passed %d ms before the command arrived", max(0, ceilMS(-left))))
 			return
 		}
-		window = min(window, int64(protocol.MaxComputerMS))
+		window = min(int64(left/time.Millisecond), int64(protocol.MaxComputerMS))
 	}
 	p := n.mgr.Route(c.Kind, c.Target, "")
 	if p == nil {
@@ -692,21 +705,26 @@ func (n *Node) haltEpoch(robotID string) int64 {
 
 // timeLeft is how long a command stamped sentMS and received at received has before its deadline_ms, an instant on the
 // server's clock, counted from the LATEST the server's clock can be at receipt: the link's estimate plus its bound
-// (Link.ClockUncertainty, the connection's fastest round trip). unc is that bound in ms; synced is false while no round
-// trip has been measured on the connection (left then counts from the bare estimate). Without a link (local commands)
-// it is synced with no uncertainty.
-func (n *Node) timeLeft(deadlineMS, sentMS int64, received time.Time) (left, unc int64, synced bool) {
+// (Link.ClockUncertainty: the connection's fastest round trip and the server's ts resolution). Everything is kept in
+// nanoseconds, so no rounding can add time: left is exact, and unc, the bound reported in ms, is rounded up from
+// nanoseconds (Maticus, 2026-10-27: 1,000,001 ns is 2 ms). synced is false while no round trip has been measured on the
+// connection (left then counts from the bare estimate). Without a link (local commands) it is synced with no uncertainty.
+func (n *Node) timeLeft(deadlineMS, sentMS int64, received time.Time) (left time.Duration, unc int64, synced bool) {
+	end := deadlineMS * int64(time.Millisecond)
 	now := n.serverNow(sentMS, received)
 	if n.link == nil {
-		return deadlineMS - now, 0, true
+		return time.Duration(end - now), 0, true
 	}
 	d, ok := n.link.ClockUncertainty()
 	if !ok {
-		return deadlineMS - now, 0, false
+		return time.Duration(end - now), 0, false
 	}
-	// Round up: a 0.4 ms bound is still a bound.
-	unc = (d.Microseconds() + 999) / 1000
-	return deadlineMS - now - unc, unc, true
+	return time.Duration(end-now) - d, ceilMS(d), true
+}
+
+// ceilMS is d in whole milliseconds, rounded up (d ≥ 0): a bound of 1,000,001 ns is 2 ms.
+func ceilMS(d time.Duration) int64 {
+	return int64((d + time.Millisecond - 1) / time.Millisecond)
 }
 
 // latchReason is the reason a latched stop gives a driver: the remote one when the platform set it, else the local one.
@@ -717,18 +735,18 @@ func latchReason(st safety.LatchState) string {
 	return st.LocalReason
 }
 
-// serverNow is the server's clock when a frame stamped sentMS was received: the link's estimate, else the frame's
-// own ts.
+// serverNow is the server's clock (epoch ns) when a frame stamped sentMS was received: the link's estimate, else the
+// frame's own ts.
 func (n *Node) serverNow(sentMS int64, received time.Time) int64 {
 	if n.link != nil {
-		if ms, ok := n.link.ServerNow(received); ok {
-			return ms
+		if ns, ok := n.link.ServerNow(received); ok {
+			return ns
 		}
 	}
 	if sentMS > 0 {
-		return sentMS
+		return sentMS * int64(time.Millisecond)
 	}
-	return received.UnixMilli()
+	return received.UnixNano()
 }
 
 func (n *Node) send(m protocol.Message) {

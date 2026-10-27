@@ -235,17 +235,18 @@ func TestClockUncertaintyIsTheFastestRoundTrip(t *testing.T) {
 		}
 		return l.Stats().RTT
 	}
+	// The bound is the fastest round trip plus the server's ts resolution (it stamps whole milliseconds).
 	slow := ack(80 * time.Millisecond)
 	u, ok := l.ClockUncertainty()
-	if !ok || u != slow || u < 80*time.Millisecond {
+	if !ok || u != slow+TSResolution || u < 80*time.Millisecond {
 		t.Fatalf("after one slow round trip: %v %v (rtt %v)", u, ok, slow)
 	}
 	fast := ack(0)
-	if u, _ := l.ClockUncertainty(); u != fast || fast >= slow {
+	if u, _ := l.ClockUncertainty(); u != fast+TSResolution || fast >= slow {
 		t.Fatalf("the faster round trip did not tighten the bound: %v (fast %v, slow %v)", u, fast, slow)
 	}
 	ack(60 * time.Millisecond)
-	if u, _ := l.ClockUncertainty(); u != fast {
+	if u, _ := l.ClockUncertainty(); u != fast+TSResolution {
 		t.Fatalf("a slower round trip loosened the bound: %v (fast %v)", u, fast)
 	}
 	c.Close()
@@ -495,26 +496,44 @@ func TestServerNow(t *testing.T) {
 	if _, ok := l.ServerNow(time.Now()); ok {
 		t.Fatal("an estimate before any frame")
 	}
+	ms := func(at time.Time) int64 {
+		ns, _ := l.ServerNow(at)
+		return ns / int64(time.Millisecond)
+	}
 	l.observe(10_000, time.UnixMilli(9_900))  // server 100 ms ahead, fast frame
 	l.observe(10_000, time.UnixMilli(10_500)) // a frame that sat 600 ms in a queue
-	if ms, ok := l.ServerNow(time.UnixMilli(20_000)); !ok || ms != 20_100 {
-		t.Fatalf("server now %d %v", ms, ok)
+	if _, ok := l.ServerNow(time.UnixMilli(20_000)); !ok || ms(time.UnixMilli(20_000)) != 20_100 {
+		t.Fatalf("server now %d %v", ms(time.UnixMilli(20_000)), ok)
 	}
 	// A long run of frames that each sat 500 ms on the way never displaces the timely one: an expired deadline must
 	// not read as open again.
 	for i := 0; i < 100; i++ {
 		l.observe(int64(30_000+i*10), time.UnixMilli(int64(30_000+i*10)+400))
 	}
-	if ms, _ := l.ServerNow(time.UnixMilli(40_000)); ms != 40_100 {
-		t.Fatalf("delayed frames moved the estimate: %d", ms)
+	if got := ms(time.UnixMilli(40_000)); got != 40_100 {
+		t.Fatalf("delayed frames moved the estimate: %d", got)
 	}
 	// A new connection starts a new estimate.
 	l.mu.Lock()
 	l.hasSkew = false
 	l.mu.Unlock()
 	l.observe(50_000, time.UnixMilli(50_000))
-	if ms, _ := l.ServerNow(time.UnixMilli(60_000)); ms != 60_000 {
-		t.Fatalf("estimate across connections: %d", ms)
+	if got := ms(time.UnixMilli(60_000)); got != 60_000 {
+		t.Fatalf("estimate across connections: %d", got)
+	}
+}
+
+// The estimate keeps nanoseconds (Maticus, 2026-10-27): a frame received 0.6 ms into a millisecond moves the estimate
+// by those 0.6 ms, not by a whole millisecond either way.
+func TestServerNowKeepsNanoseconds(t *testing.T) {
+	l := New(Options{URL: "ws://127.0.0.1:1/device"}, newRecorder())
+	base := time.Unix(1_000, 0)
+	l.observe(5_000_000, base)
+	// A later frame that left 0.6 ms closer: the server is 0.6 ms further ahead than the first sample said.
+	l.observe(5_000_001, base.Add(400*time.Microsecond))
+	ns, _ := l.ServerNow(base.Add(10 * time.Millisecond))
+	if want := int64(5_000_000)*int64(time.Millisecond) + int64(10*time.Millisecond) + int64(600*time.Microsecond); ns != want {
+		t.Fatalf("server now %d, want %d (off by %v)", ns, want, time.Duration(ns-want))
 	}
 }
 
