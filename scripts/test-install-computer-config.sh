@@ -41,4 +41,21 @@ import json, sys
 c = json.load(open(sys.argv[1]))
 assert [p['config']['level'] for p in c['plugins']] == ['ask'], c['plugins']
 PY
+# --ai (AI on your own machines): the ai plugin, in place of the dry-run plugin and of an earlier ai entry, the rest kept;
+# --ai-endpoint gives the server's base, and a base that is not http(s) is refused. A driver rewrite keeps it.
+ai="$tmp/ai.json"
+printf '{"server": "https://openvibe.bot", "plugins": [{"name": "dryrun"}, {"name": "computer", "config": {"level": "ask"}}]}\n' > "$ai"
+OPENVIBE_INSTALL_AI_CONFIG_ONLY="$ai" sh "$installer" --ai
+OPENVIBE_INSTALL_AI_CONFIG_ONLY="$ai" sh "$installer" --ai-endpoint http://127.0.0.1:8090
+python3 - "$ai" <<'PY' || fail "ai config"
+import json, sys
+c = json.load(open(sys.argv[1]))
+assert c['server'] == 'https://openvibe.bot'
+assert c['plugins'] == [{'name': 'computer', 'config': {'level': 'ask'}}, {'name': 'ai', 'config': {'endpoint': 'http://127.0.0.1:8090'}}], c['plugins']
+PY
+if OPENVIBE_INSTALL_AI_CONFIG_ONLY="$ai" sh "$installer" --ai-endpoint ftp://x 2>/dev/null; then
+	fail "a base that is not http(s) was accepted"
+fi
+grep -q "if p.get('name') in ('computer', 'ai')" "$installer" || fail "a driver rewrite must keep the ai plugin"
 echo "ok: install.sh --computer config"
+echo "ok: install.sh --ai config"
