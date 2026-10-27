@@ -116,7 +116,7 @@ class SharedDeskHostTest(unittest.TestCase):
         self.assertIn(("--egress", "public"), pairs)
         self.assertIn(("--bind", "/opt/google/chrome"), pairs)
         self.assertIn(("--setenv", "HOME=/tmp/desk"), pairs)
-        under_usr = self.plugin._sandbox_argv("/usr/bin/chromium")
+        under_usr = self.plugin._sandbox_argv("/usr/lib/ov-test-browser/chrome")   # (no such file: not a link elsewhere)
         self.assertEqual([b for f, b in zip(under_usr, under_usr[1:]) if f == "--bind" and b != "/etc/fonts"], [],
                          "a browser under /usr binds nothing: /usr is the system's, bound already")
         self.assertEqual(self.plugin._browser_args(), ["--no-sandbox", "--no-zygote", "--disable-dev-shm-usage", "--disable-gpu"],
@@ -193,8 +193,9 @@ class RealSharedDeskTest(unittest.TestCase):
         self.assertEqual(cmd("desk", {"action": "start", "desk": "desk-a", "kind": "browser", "width": 800, "height": 600})["op"], "ack")
         try:
             shot = cmd("screen", {"desk": "desk-a", "max_width": 400})
-            self.assertEqual((shot["op"], shot["data"]["format"]), ("ack", "jpeg"), shot)
-            b = plugin.desk_browsers["desk-a"]
+            b = plugin.desk_browsers.get("desk-a")
+            self.assertEqual(shot["op"], "ack", "%r\nthe sandbox said: %s" % (shot, "\n".join(b.stderr_tail) if b else "(no browser)"))
+            self.assertEqual(shot["data"]["format"], "jpeg")
             self.assertEqual(b.sandbox[1], "desk-sandbox")
             page = cmd("browser", {"action": "read", "desk": "desk-a"})
             self.assertEqual(page["op"], "ack", page)

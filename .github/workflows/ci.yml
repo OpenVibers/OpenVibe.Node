@@ -61,6 +61,7 @@ jobs:
               cg=/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)
               mkdir "$cg/openvibe-node" && echo $$ > "$cg/openvibe-node/cgroup.procs"
               echo "+memory +pids +cpu +io" > "$cg/cgroup.subtree_control"
+              : | "$OPENVIBE_NODE_EXE" desk-sandbox --memory-mb 256 -- /bin/sh -c "echo desk-sandbox runs >&4" 3<&0 4>&1 | cat
               exec python3 plugins/computer/tests/test_shared_desks.py -v RealSharedDeskTest'
 
   build:
