@@ -483,6 +483,7 @@ class DeskPluginTest(unittest.TestCase):
             self.assertEqual(f.read(), "one")
         self.assertFalse(os.path.exists(os.path.join(kept, "Cache")), "caches are never kept")
         self.assertFalse(os.path.exists(a.profile), "the desk's own copy is removed")
+        self.assertFalse(os.path.exists(os.path.join(self.desk_dir, "desk-a")), "and its empty folders")
         self.assertEqual(os.stat(os.path.dirname(kept)).st_mode & 0o777, 0o700)
         # Two desks at once start from the same kept profile; the last to stop wins.
         start("desk-b", profile="agent")
