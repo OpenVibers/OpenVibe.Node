@@ -188,13 +188,17 @@ const (
 	// "status", "width"?, "height"?}, an Xvfb display of its own where an agent works without touching the owner's
 	// screen; screen, screen_stream, input and browser take "desk": "private" to act there. Starting and stopping act.
 	KindDesk = "desk"
+	// KindAI is one chat completion on the person's own model server (contracts 0.219.0, the ai plugin): {"model",
+	// "messages", "max_tokens"?, "temperature"?} → {model, message, usage?}. It reads and changes nothing on the
+	// machine, so it never acts and runs while a stop is latched like a read.
+	KindAI = "ai"
 )
 
 // Kinds lists every command kind the Node understands.
-var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput, KindBrowser, KindScreenStream, KindDesk}
+var Kinds = []string{KindDrive, KindActuator, KindPTZ, KindSay, KindDisplay, KindHalt, KindButton, KindPoint, KindExec, KindFS, KindScreen, KindProbe, KindInput, KindBrowser, KindScreenStream, KindDesk, KindAI}
 
 // ComputerKinds move nothing: they carry long deadlines (DefaultComputerMS, at most MaxComputerMS) and no clamping.
-var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true, KindBrowser: true, KindScreenStream: true, KindDesk: true}
+var ComputerKinds = map[string]bool{KindExec: true, KindFS: true, KindScreen: true, KindProbe: true, KindInput: true, KindBrowser: true, KindScreenStream: true, KindDesk: true, KindAI: true}
 
 const (
 	// DefaultComputerMS is a computer command's reply window when the server sends no deadline; MaxComputerMS caps
