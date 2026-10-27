@@ -4,6 +4,7 @@ machine's level (refused at observe), reports it at every level, and sends scree
 desk: private (refused until it runs), never to the owner's screen. A real desk runs where Xvfb is installed."""
 import base64
 import io
+import json
 import os
 import shutil
 import sys
@@ -181,6 +182,7 @@ class ProfileBrowser:
         self.on, self.graceful = True, None
         path = os.path.join(profile, "Default", "Cookies")
         self.found = open(path).read() if os.path.exists(path) else None   # what the desk started with
+        self.after_start, self.session, self.restored = None, [], None
         ProfileBrowser.made.append(self)
 
     def alive(self):
@@ -194,7 +196,17 @@ class ProfileBrowser:
             f.write(b"x" * (cache_mb * 1024 * 1024 or 10))
 
     def open(self, url):
+        if self.after_start:
+            hook, self.after_start = self.after_start, None
+            hook()
         return {"url": url}
+
+    def session_cookies(self):
+        return self.session
+
+    def restore_cookies(self, cookies):
+        self.restored = cookies
+        return len(cookies)
 
     def close(self, graceful=False):
         self.on, self.graceful = False, graceful
@@ -378,6 +390,7 @@ class DeskPluginTest(unittest.TestCase):
         self.assertEqual((a.headless, a.window), (True, (1000, 500)))
         self.assertTrue(a.profile.endswith("-desk-a"))
         self.assertNotIn("DISPLAY", a.env)
+        self.assertEqual(a.env["DBUS_SESSION_BUS_ADDRESS"], "disabled:", "never the owner's session bus, and none started")
         self.assertTrue(os.path.basename(a.env["TMPDIR"]).startswith("ov-desk-a-"))
         # The mouse and keyboard are the page's: a point in a 100×100 picture lands on the 1000×500 page.
         r = reply(self.out, self.cmd("input", {"action": "click", "x": 50, "y": 50, "width": 100, "height": 100, "desk": "desk-a"}))
@@ -460,7 +473,11 @@ class DeskPluginTest(unittest.TestCase):
         self.assertIsNone(a.found, "nothing kept yet")
         self.assertEqual(a.profile, os.path.join(home, "browser-desk-a"))
         a.sign_in("one")
+        a.session = [{"name": "sid", "value": "s1", "domain": "example.org", "path": "/"}]   # a sign-in that ends with the browser
         self.assertEqual(stop("desk-a")["profile_saved"], True)
+        with open(os.path.join(os.path.dirname(kept), "ov-session-cookies.json")) as f:
+            self.assertEqual(json.load(f)[0]["name"], "sid", "session cookies are kept beside the profile")
+        self.assertEqual(os.stat(os.path.join(os.path.dirname(kept), "ov-session-cookies.json")).st_mode & 0o777, 0o600)
         self.assertTrue(a.graceful, "closed so it writes its cookies down")
         with open(os.path.join(kept, "Cookies")) as f:
             self.assertEqual(f.read(), "one")
@@ -472,6 +489,8 @@ class DeskPluginTest(unittest.TestCase):
         start("desk-c", profile="agent")
         b, c = use("desk-b"), use("desk-c")
         self.assertEqual((b.found, c.found), ("one", "one"), "signed in on both")
+        self.assertEqual([x["name"] for x in b.restored], ["sid"], "the session cookie is back as the browser starts")
+        self.assertFalse(os.path.exists(os.path.join(b.profile, "ov-session-cookies.json")), "read once, not left in the copy")
         c.sign_in("three")
         b.sign_in("two")
         stop("desk-c")

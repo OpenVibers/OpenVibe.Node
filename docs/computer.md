@@ -201,6 +201,9 @@ task's desk from the profile `agent`.
 - **Saved when the desk stops.** The browser is asked to quit first, so it writes its cookies down. The desk's profile
   is then saved back (`profile_saved` in the answer), and the desk's own copy is removed, so a desk per task leaves
   nothing behind. When two desks with the same profile stop, the last one wins.
+- **Session sign-ins too** (Node v0.24.1). Many sites sign people in with a cookie that ends when the browser quits,
+  and Chrome throws those away as it closes. Before the desk's browser quits, its session cookies are kept beside the
+  profile (`ov-session-cookies.json`, 0600), and the next desk's browser gets them back as soon as it starts.
 - **Not kept:** caches, crash reports, locks and the last session's tabs. A profile larger than `desk_profile_max_mb`
   (256 MB) is not saved, and an event `desk_profile_too_big` says so. The kill switch saves nothing.
 - **Where.** `browser_profile` + `-kept-<name>`, 0700, on this machine only. Profiles that move between machines are

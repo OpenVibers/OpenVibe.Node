@@ -27,7 +27,11 @@ STARTUP_S = 45.0
 MAX_LINKS = 60
 MAX_ELEMENTS = 120
 MAX_APPEARED = 8
-MAX_FOLLOWED = 5   # pages opened from pages (a sign-in popup, a new tab) followed at most this deep
+MAX_FOLLOWED = 5
+MAX_SESSION_COOKIES = 3000
+# What Storage.setCookies takes back of what Storage.getCookies gives.
+COOKIE_FIELDS = ("name", "value", "domain", "path", "secure", "httpOnly", "sameSite", "priority", "sourceScheme",
+                 "sourcePort", "partitionKey")   # pages opened from pages (a sign-in popup, a new tab) followed at most this deep
 KEY_CODES = {
     "Enter": (13, "\r"), "Tab": (9, "\t"), "Escape": (27, ""), "Backspace": (8, ""), "Delete": (46, ""),
     "ArrowUp": (38, ""), "ArrowDown": (40, ""), "ArrowLeft": (37, ""), "ArrowRight": (39, ""),
@@ -203,6 +207,7 @@ class Browser:
         self.tab_events = []       # Target.targetCreated / targetDestroyed seen since the last _follow
         self.tab_change = None     # "opened" or "closed" since the last _mark: said in the action's receipt
         self.follow_mu = threading.Lock()
+        self.after_start = None    # called once the browser runs (a kept profile's session cookies go back in)
 
     # ---- the process and the pipe ------------------------------------------------------------------------------------
     def alive(self):
@@ -250,6 +255,9 @@ class Browser:
         self.call("Target.setDiscoverTargets", {"discover": True}, session=False)
         if self.download_dir:
             self.call("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.download_dir}, session=False)
+        if self.after_start:
+            hook, self.after_start = self.after_start, None
+            hook()
 
     def _attach(self, target):
         """Drive that page: a session of its own, its events on, and a browser desk's exact size."""
@@ -609,6 +617,23 @@ class Browser:
         with open(path + ".part", "wb") as f:
             f.write(data)
         os.replace(path + ".part", path)
+
+    # ---- cookies a kept profile carries (Node v0.24.1) ------------------------------------------------------------
+    def session_cookies(self):
+        """The cookies that end with the browser (no expiry): Chrome drops them when it quits, and a sign-in is often
+        one. A kept profile keeps them alongside, for the next desk (restore_cookies)."""
+        if not self.alive():
+            return []
+        got = self.call("Storage.getCookies", {}, session=False).get("cookies") or []
+        return [{k: c[k] for k in COOKIE_FIELDS if k in c} for c in got if c.get("session")][:MAX_SESSION_COOKIES]
+
+    def restore_cookies(self, cookies):
+        """Put session cookies back (from session_cookies, on another run of the browser)."""
+        ok = [c for c in cookies if isinstance(c, dict) and isinstance(c.get("name"), str) and isinstance(c.get("value"), str)
+              and isinstance(c.get("domain"), str)][:MAX_SESSION_COOKIES]
+        if ok:
+            self.call("Storage.setCookies", {"cookies": [{k: c[k] for k in COOKIE_FIELDS if k in c} for c in ok]}, session=False)
+        return len(ok)
 
     def close(self, graceful=False):
         """End the browser. graceful: ask it to quit first (a few seconds), so it writes its cookies and storage to the
