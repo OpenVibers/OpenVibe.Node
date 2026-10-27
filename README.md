@@ -29,6 +29,7 @@ install, Windows and configuration: [docs/install.md](docs/install.md).
 openvibe-node status     # link, plugins, video, battery, stop latch
 openvibe-node stop       # kill switch: stop every motor now and keep it stopped
 openvibe-node resume
+openvibe-node quit       # end the node cleanly (nothing latched), e.g. from a stream launcher
 openvibe-node approvals  # the computer plugin at level ask: what waits; approve <id> / deny <id>
 openvibe-node tray       # the same in your notification area, with Approve/Deny notifications (Linux, Windows)
 ```

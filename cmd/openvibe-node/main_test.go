@@ -125,6 +125,66 @@ func TestStopWithoutRunningNodeLatchesFile(t *testing.T) {
 	}
 }
 
+// TestQuit: `openvibe-node quit` ends a running node cleanly (every actuator stopped, nothing latched) and waits
+// until it has exited; with no node running it says so and succeeds (Maticus, 2026-10-26: `stop` latched, so a
+// script had to kill the process).
+func TestQuit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix only")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not installed")
+	}
+	home := shortHome(t)
+	t.Setenv("PYTHONPATH", pythonPath(t))
+	if out, _, code := cli(t, "quit", "--home", home); code != 0 || !strings.Contains(out, "No node is running") {
+		t.Fatalf("quit with nothing running: %d %s", code, out)
+	}
+	exe, _ := os.Executable()
+	cmd := exec.Command(exe, "run", "--dry-run", "--home", home)
+	cmd.Env = append(os.Environ(), "OPENVIBE_NODE_MAIN=1")
+	var logs bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &logs, &logs
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	defer func() {
+		if cmd.ProcessState == nil {
+			cmd.Process.Kill()
+		}
+	}()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if out, _, code := cli(t, "status", "--home", home); code == 0 && !strings.Contains(out, "not running") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the node never answered\n%s", logs.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	out, errOut, code := cli(t, "quit", "--home", home)
+	if code != 0 || !strings.Contains(out, "exited") {
+		t.Fatalf("quit: %d %s %s\n%s", code, out, errOut, logs.String())
+	}
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("exit: %v\n%s", err, logs.String())
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("still running after quit\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "stopping every actuator") || !strings.Contains(logs.String(), "nothing latched") {
+		t.Fatalf("no clean shutdown in logs:\n%s", logs.String())
+	}
+	if l, _ := safety.OpenLatch(filepath.Join(home, "latch.json")); l != nil && l.State().Stopped() {
+		t.Fatal("quit latched the stop")
+	}
+}
+
 // TestRunDryRun is the acceptance path: `openvibe-node run --dry-run` pairs with the fake server, publishes the test
 // pattern, obeys commands, obeys the local kill switch and stops cleanly on SIGTERM.
 func TestRunDryRun(t *testing.T) {

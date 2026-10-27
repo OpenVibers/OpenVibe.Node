@@ -149,10 +149,23 @@ console window that shows its log; closing the window stops the Node and every a
 | `openvibe-node status [--json]`           | link, stop latch, limits, plugins, video, battery, running jobs            |
 | `openvibe-node stop`                      | **kill switch**: stop every actuator now and hold it stopped              |
 | `openvibe-node resume`                    | release the local stop (and a server e-stop)                               |
+| `openvibe-node quit`                      | end the running Node cleanly: every actuator stops, **nothing is latched**, and it waits until the Node has exited |
 | `openvibe-node plugins [--json]`          | plugins and their capabilities                                             |
 
 `stop` works even when the Node does not answer: it latches `latch.json` in the state directory, which a running Node
 obeys within a quarter second and a starting Node obeys before anything moves. The latch survives restarts.
+
+### Starting and ending it with the rest of your setup
+
+`stop` is a kill switch, not an exit: it holds every actuator stopped, across restarts, until `resume`. To end the Node
+from a script (a stream launcher that starts and stops it with OBS, say), use `quit`. Every actuator stops, the Node
+exits, and nothing is latched, so the next `openvibe-node run` drives as before. `quit` waits until the process has
+gone and succeeds when no Node is running, so a launcher can call it without checking first.
+
+`quit` ends a Node started from a terminal, by a launcher, or at sign-in (`install --user-session`). A Node installed as
+a system service refuses it, because systemd, launchd or Windows would start it again. Stop the service there instead
+(`sudo systemctl stop openvibe-node`, or Services on Windows), or remove it with `openvibe-node uninstall`. A launcher
+that owns the Node's life should run `openvibe-node run --home DIR` itself, with no service and no sign-in start.
 
 ## Files
 
