@@ -54,7 +54,13 @@ type sandboxSpec struct {
 	Env      []string   `json:"env"`
 	// Resolvers are the nameservers of the job's /etc/resolv.conf (worker.dns, for a job with a network); none, none.
 	Resolvers []string `json:"resolvers,omitempty"`
+	// Pipe: a desk's program (RunDesk) talks both ways, as a browser's --remote-debugging-pipe does: it reads on fd 3
+	// and writes on fd 4, which arrives on artifactFD (a desk has no artifact) and takes fd 4 just before execve.
+	Pipe bool `json:"pipe,omitempty"`
 }
+
+// statusOut is where the init reports: statusFD, until a desk's pipe takes fd 4 (enterSandbox).
+var statusOut = statusFD
 
 // bindSpec bind-mounts the host's path at the same path in the private root, read-only unless it is a device node.
 // The bind is made by path in the job's own mount namespace: a mount cannot be bound from another namespace.
@@ -95,7 +101,7 @@ func sandboxMain() {
 	// no_new_privs, the seccomp filter and the capabilities belong to this thread, the one that calls execve.
 	runtime.LockOSThread()
 	err := enterSandbox()
-	status := os.NewFile(statusFD, "status")
+	status := os.NewFile(uintptr(statusOut), "status")
 	_, _ = status.WriteString(err.Error())
 	os.Exit(126)
 }
@@ -209,13 +215,28 @@ func enterSandbox() error {
 	if err := syscall.Chdir(s.Work); err != nil {
 		return err
 	}
-	// Only fds 0-3 reach the function; statusFD closes when execve succeeds.
+	// Only fds 0-3 reach the function (0-4 a desk's); statusFD closes when execve succeeds.
+	keep := 3
+	if s.Pipe {
+		// The status pipe moves out of fd 4's way, close-on-exec as before, so execve still closes it; fd 4 then
+		// becomes the desk's answer pipe.
+		fd, _, e := syscall.RawSyscall(syscall.SYS_FCNTL, statusFD, syscall.F_DUPFD_CLOEXEC, 10)
+		if e != 0 {
+			return fmt.Errorf("moving the status pipe: %w", e)
+		}
+		statusOut = int(fd)
+		if err := syscall.Dup3(artifactFD, 4, 0); err != nil {
+			return fmt.Errorf("placing the desk's pipe on fd 4: %w", err)
+		}
+		syscall.Close(artifactFD)
+		keep = 4
+	}
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		return err
 	}
 	for _, e := range ents {
-		if fd, err := strconv.Atoi(e.Name()); err == nil && fd > 3 {
+		if fd, err := strconv.Atoi(e.Name()); err == nil && fd > keep {
 			syscall.CloseOnExec(fd)
 		}
 	}
@@ -257,7 +278,7 @@ func enterSandbox() error {
 	}
 	runtime.KeepAlive(filter)
 	var b [1]byte
-	if _, err := syscall.Write(statusFD, b[:]); err != nil {
+	if _, err := syscall.Write(statusOut, b[:]); err != nil {
 		return fmt.Errorf("reporting ready: %w", err)
 	}
 	if n, err := syscall.Read(goFD, b[:]); n != 1 {
