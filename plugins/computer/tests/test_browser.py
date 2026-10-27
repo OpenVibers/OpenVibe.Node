@@ -1,10 +1,12 @@
 import http.server
 import io
+import json
 import os
 import shutil
 import socketserver
 import sys
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -205,6 +207,33 @@ class PageKeysTest(unittest.TestCase):
         for bad in ("hyper+a", "Menu"):
             with self.assertRaises(BrowserError):
                 b.keys(bad)
+
+    def test_a_call_to_a_page_that_closed_fails_at_once(self):
+        # A popup that closes itself: Chrome on macOS never answers a call still waiting on its session, which hung the
+        # next read for the whole timeout (2026-10-27, the first macOS CI runs). The detach answers it at once, and
+        # _eval then reads the page in front again.
+        b = Browser("chromium", "/nonexistent", timeout_s=30)
+        b.session = "S-popup"
+        b.out = io.BytesIO()
+        events = [{"method": "Target.detachedFromTarget", "params": {"sessionId": "S-popup", "targetId": "T2"}}]
+        b.inp = io.BytesIO(b"".join(json.dumps(m).encode() + b"\0" for m in events))
+        started = time.monotonic()
+        errors = []
+        caller = threading.Thread(target=lambda: errors.append(self._call_error(b)))
+        caller.start()
+        time.sleep(0.2)          # the call is waiting on the popup's session
+        b._reader()              # then the browser says that page is gone
+        caller.join(5)
+        self.assertLess(time.monotonic() - started, 5, "not the 30 s timeout")
+        self.assertIn("session closed", errors[0].lower())
+
+    @staticmethod
+    def _call_error(b):
+        try:
+            b.call("Runtime.evaluate", {"expression": "1"})
+        except BrowserError as e:
+            return e.message
+        return "answered"
 
     def test_editing_shortcuts_on_a_mac(self):
         # Chrome on a Mac runs select all, copy, paste… only when the key event names the command: ctrl+a then

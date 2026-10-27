@@ -367,6 +367,14 @@ class Browser:
                         slot[0].set()
                 elif "method" in msg:
                     with self.mu:
+                        if msg["method"] == "Target.detachedFromTarget":
+                            # Its page closed (a popup that closes itself): a call still waiting on it is never answered
+                            # (Chrome on macOS stays silent), so it fails at once and _eval reads the page in front again.
+                            gone = (msg.get("params") or {}).get("sessionId")
+                            for waiting in self.waiting.values():
+                                if gone and waiting[2] == gone and waiting[1] is None:
+                                    waiting[1] = {"error": {"message": "Session closed: its page closed"}}
+                                    waiting[0].set()
                         self.events.append(msg["method"])
                         if msg["method"] in ("Target.targetCreated", "Target.targetDestroyed"):
                             self.tab_events = (self.tab_events + [(msg["method"], msg.get("params") or {})])[-50:]
@@ -377,14 +385,15 @@ class Browser:
                 slot[0].set()
 
     def call(self, method, params=None, session=True, timeout_s=None):
+        sid = self.session if session else None
         with self.mu:
             self.next_id += 1
             mid = self.next_id
-            slot = [threading.Event(), None]
+            slot = [threading.Event(), None, sid]   # the page's session it went to: answered at once if that page closes
             self.waiting[mid] = slot
         msg = {"id": mid, "method": method, "params": params or {}}
-        if session and self.session:
-            msg["sessionId"] = self.session
+        if sid:
+            msg["sessionId"] = sid
         try:
             with self.write_mu:
                 self.out.write(json.dumps(msg).encode("utf-8") + b"\0")
