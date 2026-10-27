@@ -235,7 +235,11 @@ class BrowserDesk:
         with self.mu:
             if not self.on:
                 raise Fault("not_ready", "start the desk first (desk start)")
-            return {k: v for k, v in self.base_env.items() if k not in OWNER_SESSION}
+            env = {k: v for k, v in self.base_env.items() if k not in OWNER_SESSION}
+            # No session bus at all, and none started: without an address Chrome tries to auto-launch one, which can
+            # hang its start on a machine with no display (a CI runner, a desk host's service).
+            env["DBUS_SESSION_BUS_ADDRESS"] = "disabled:"
+            return env
 
 
 # A browser desk counts as half a desk against max_desks (a whole desk counts 2 of 2 * max_desks).

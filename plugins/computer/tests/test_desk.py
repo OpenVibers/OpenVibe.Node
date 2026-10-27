@@ -390,6 +390,7 @@ class DeskPluginTest(unittest.TestCase):
         self.assertEqual((a.headless, a.window), (True, (1000, 500)))
         self.assertTrue(a.profile.endswith("-desk-a"))
         self.assertNotIn("DISPLAY", a.env)
+        self.assertEqual(a.env["DBUS_SESSION_BUS_ADDRESS"], "disabled:", "never the owner's session bus, and none started")
         self.assertTrue(os.path.basename(a.env["TMPDIR"]).startswith("ov-desk-a-"))
         # The mouse and keyboard are the page's: a point in a 100×100 picture lands on the 1000×500 page.
         r = reply(self.out, self.cmd("input", {"action": "click", "x": 50, "y": 50, "width": 100, "height": 100, "desk": "desk-a"}))
