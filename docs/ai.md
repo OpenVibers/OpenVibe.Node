@@ -19,7 +19,17 @@ queued. The audit on Bot keeps the model and the token counts, never the text.
 
 ## Set it up
 
-Add the plugin to the Node's config (`config.json`):
+The installer does it with `--ai` (Node v0.28.0), added to the command openvibe.bot/machines gives you or to an
+install you already have. It says which model server answers, or how to get one:
+
+```sh
+curl -fsSL https://openvibe.bot/install | sh -s -- --network … --pairing pair_… --code … --ai
+```
+
+`--ai-endpoint http://127.0.0.1:8090` names a server on another port (it implies `--ai`). `--ai` works with `--worker`,
+`--computer` and `--desk-host` too, and a driver chosen later keeps it.
+
+By hand, add the plugin to the Node's config (`config.json`):
 
 ```json
 { "plugins": [{ "name": "ai" }] }

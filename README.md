@@ -63,7 +63,7 @@ minutes, and `openvibe-node stop` ends it at once ([the live screen](docs/comput
 
 **Your own models for your OpenVibe work:** the `ai` plugin lets OpenVibe use a model you already run at home (Ollama,
 LM Studio or llama.cpp's server) for your own work, at no cost and with no open port, once you turn on "Let my AI use
-this computer's models" on openvibe.bot/machines ([docs/ai.md](docs/ai.md)).
+this computer's models" on openvibe.bot/machines ([docs/ai.md](docs/ai.md)). The installer sets it up with `--ai`.
 
 **A machine that runs your jobs:** add it on openvibe.bot/machines, which prints the same installer with `--worker`: the
 job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.Codes job runner lets you start a coding

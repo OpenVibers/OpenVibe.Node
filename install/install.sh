@@ -45,6 +45,11 @@
 #   --computer LEVEL this machine's terminal, files and screen for its owner's agents (the computer plugin,
 #                    docs/computer.md), at LEVEL observe, ask, trusted or full. The service then runs as YOUR account
 #                    (the one that ran sudo), never root, and its folders are your home. Linux only; not with --worker.
+#   --ai             this machine's own models for its owner's OpenVibe work (docs/ai.md): adds the ai plugin, which
+#                    finds Ollama, LM Studio or llama.cpp's server on this machine and relays its owner's questions to
+#                    it, with no port opened. The installer says which one answers. Works with any of the above; on
+#                    openvibe.bot/machines turn on "Let my AI use this computer's models" for it.
+#   --ai-endpoint URL  the model server's http(s) base when it is not on one of the usual ports (implies --ai).
 #   --no-service     install and pair, but do not install the service.
 #   --no-claim       with no robot and no code: install without pairing (no code is asked for on openvibe.bot).
 #   --setup KEY      the osk_… setup key from card files made on openvibe.bot/setup/sd-card (or OPENVIBE_SETUP_KEY):
@@ -62,6 +67,7 @@
 #   OPENVIBE_CRONTAB_USER=FILE      edit FILE as the invoking user's crontab instead of the real one.
 #   OPENVIBE_RC_LOCAL=FILE          edit FILE as rc.local instead of /etc/rc.local.
 # OPENVIBE_INSTALL_PAIR_ARGS_ONLY=1 prints the `openvibe-node pair` arguments the flags make, one per line, and exits.
+# OPENVIBE_INSTALL_AI_CONFIG_ONLY=<config.json> adds the --ai plugin entry to that file and exits.
 # OPENVIBE_INSTALL_WORKER_CONFIG_ONLY=<config.json> writes the --worker section into that file (OPENVIBE_JOB_UID,
 #   OPENVIBE_JOB_GID, OPENVIBE_NODEJS and OPENVIBE_CODES_DIR stand in for the job user and the runner) and exits.
 set -eu
@@ -79,6 +85,8 @@ TAG="latest"
 WORKER=0
 COMPUTER=""
 DESK_HOST=0
+AI=0
+AI_ENDPOINT=""
 CLAIM_OK=1
 DRIVER_GIVEN=0
 SETUP="${OPENVIBE_SETUP_KEY:-}"
@@ -89,7 +97,8 @@ CODES_DIR=/opt/openvibe-codes
 usage() {
 	echo "usage: install.sh [--robot rob_… | --network URL --pairing pair_…] [--code CODE | CODE] [--name NAME]"
 	echo "                  [--driver adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none] [--worker]"
-	echo "                  [--computer observe|ask|trusted|full] [--desk-host] [--no-service] [--no-claim] [--setup osk_…]"
+	echo "                  [--computer observe|ask|trusted|full] [--desk-host] [--ai] [--ai-endpoint URL]"
+	echo "                  [--no-service] [--no-claim] [--setup osk_…]"
 	echo "                  [--local DIR] [--version TAG]"
 	echo "  curl -fsSL https://openvibe.bot/install | sh      (finds the kit, then shows a code to approve on openvibe.bot/link)"
 	echo "  curl -fsSL https://openvibe.bot/install | sh -s -- --robot rob_… --code ABCD-1234 --driver adeept"
@@ -121,6 +130,9 @@ while [ $# -gt 0 ]; do
 	--pairing=*) PAIRING="${1#*=}"; shift ;;
 	--worker) WORKER=1; shift ;;
 	--desk-host) DESK_HOST=1; shift ;;
+	--ai) AI=1; shift ;;
+	--ai-endpoint) AI=1; AI_ENDPOINT="${2:-}"; shift 2 ;;
+	--ai-endpoint=*) AI=1; AI_ENDPOINT="${1#*=}"; shift ;;
 	--computer) COMPUTER="${2:-}"; shift 2 ;;
 	--computer=*) COMPUTER="${1#*=}"; shift ;;
 	--no-service) SERVICE=0; shift ;;
@@ -137,6 +149,7 @@ done
 
 case "$DRIVER" in adeept|adeept-mecanum|cozmo|looi|ros2|ros2-holonomic|none) ;; *) die "--driver must be adeept, adeept-mecanum, cozmo, looi, ros2, ros2-holonomic or none" ;; esac
 case "$ROBOT_ID" in ""|rob_*) ;; *) die "--robot must be a rob_… id" ;; esac
+case "$AI_ENDPOINT" in ""|http://*|https://*) ;; *) die "--ai-endpoint is the model server's http(s) base, for example http://127.0.0.1:11434" ;; esac
 # --pairing takes the pair_… id; with no --code, anything else there is the code itself.
 case "$PAIRING" in ""|pair_*) ;; *) [ -z "$CODE" ] || die "--pairing must be a pair_… id"; CODE="$PAIRING"; PAIRING="" ;; esac
 if [ -n "$PAIRING" ] && [ -z "$NETWORK" ]; then die "--pairing needs --network, the OpenVibe.Network URL"; fi
@@ -146,11 +159,12 @@ case "$NETWORK" in ""|https://*|http://localhost*|http://127.0.0.1*) ;; *) die "
 if [ -n "$SETUP" ]; then
 	printf '%s' "$SETUP" | grep -Eq '^osk_[A-Za-z0-9_-]{43}$' || die "--setup takes the osk_… key from your card files (openvibe.bot/setup/sd-card)"
 	[ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] || die "--setup is used on its own (no --robot, --code, --network or --pairing)"
-	if [ "$CLAIM_OK" = 0 ] || [ "$WORKER" = 1 ] || [ -n "$COMPUTER" ] || [ "$DESK_HOST" = 1 ]; then die "--setup cannot be used with --no-claim, --worker, --computer or --desk-host"; fi
+	if [ "$CLAIM_OK" = 0 ] || [ "$WORKER" = 1 ] || [ -n "$COMPUTER" ] || [ "$DESK_HOST" = 1 ] || [ "$AI" = 1 ]; then die "--setup cannot be used with --no-claim, --worker, --computer, --desk-host or --ai"; fi
 fi
-# No robot, no code, no Network pairing, not a worker or a computer: the one command (openvibe.bot/link, see the top).
+# No robot, no code, no Network pairing, not a worker, a computer or a model machine: the one command (openvibe.bot/link,
+# see the top).
 CLAIM=0
-if [ "$CLAIM_OK" = 1 ] && [ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ]; then CLAIM=1; fi
+if [ "$CLAIM_OK" = 1 ] && [ -z "$CODE$ROBOT_ID$NETWORK$PAIRING" ] && [ "$WORKER" = 0 ] && [ -z "$COMPUTER" ] && [ "$AI" = 0 ]; then CLAIM=1; fi
 
 # Run "$@" pair … with the pairing the flags gave: through Network with --network, else Bot's legacy code.
 pair_with() {
@@ -171,7 +185,7 @@ if [ "${OPENVIBE_INSTALL_PAIR_ARGS_ONLY:-0}" = 1 ]; then
 fi
 
 # set_driver_config <config.json>: $PLUGINS, $KIND and $VIDEO (driver_setup's) in that config, the rest kept (a computer
-# plugin too). The one command writes the driver the bus suggested, then the one its owner chose, if that differs.
+# or ai plugin too). The one command writes the driver the bus suggested, then the one its owner chose, if that differs.
 set_driver_config() {
 	${SUDO:-} env OV_PLUGINS="$PLUGINS" OV_KIND="$KIND" OV_VIDEO="{$VIDEO}" python3 - "$1" <<'PY'
 import json, os, sys
@@ -181,7 +195,7 @@ try:
         conf = json.load(f)
 except (OSError, ValueError):
     conf = {}
-keep = [p for p in conf.get('plugins') or [] if p.get('name') == 'computer']
+keep = [p for p in conf.get('plugins') or [] if p.get('name') in ('computer', 'ai')]
 conf['plugins'] = json.loads(os.environ['OV_PLUGINS']) + keep
 conf['device_kind'] = os.environ['OV_KIND']
 conf['video'] = {**(conf.get('video') or {}), **json.loads(os.environ['OV_VIDEO'])}
@@ -330,6 +344,49 @@ os.replace(path + '.tmp', path)
 PY
 }
 
+# write_ai_config <config.json> [endpoint]: add the ai plugin (replacing an earlier entry; the dry-run plugin goes), with
+# the model server's base when one was given, else the plugin looks on the usual ports; the rest of the config is kept.
+write_ai_config() {
+	${SUDO:-} python3 - "$@" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+endpoint = sys.argv[2] if len(sys.argv) > 2 else ''
+try:
+    with open(path) as f:
+        conf = json.load(f)
+except FileNotFoundError:
+    conf = {}
+plugins = [p for p in conf.get('plugins') or [] if p.get('name') not in ('ai', 'dryrun')]
+plugins.append({'name': 'ai', 'config': {'endpoint': endpoint}} if endpoint else {'name': 'ai'})
+conf['plugins'] = plugins
+old = os.umask(0o077)
+with open(path + '.tmp', 'w') as f:
+    json.dump(conf, f, indent=2)
+    f.write('\n')
+os.umask(old)
+os.replace(path + '.tmp', path)
+PY
+}
+
+# ai_found [endpoint]: the first model server that answers (the one given, else Ollama, LM Studio, llama.cpp's server) and
+# how many models it offers, as one line; nothing when none answers.
+ai_found() {
+	python3 - "$@" <<'PY' 2>/dev/null || true
+import json, sys, urllib.request
+given = sys.argv[1] if len(sys.argv) > 1 else ''
+servers = [(given, 'the model server')] if given else [('http://127.0.0.1:11434', 'Ollama'), ('http://127.0.0.1:1234', 'LM Studio'), ('http://127.0.0.1:8080', "llama.cpp's server")]
+for base, name in servers:
+    try:
+        with urllib.request.urlopen(base.rstrip('/') + '/v1/models', timeout=3) as r:
+            data = json.load(r).get('data') or []
+    except Exception:
+        continue
+    models = [str(m.get('id')) for m in data if isinstance(m, dict) and m.get('id')]
+    print('%s at %s with %d model%s%s' % (name, base, len(models), '' if len(models) == 1 else 's', (': ' + ', '.join(models[:5]) + (', …' if len(models) > 5 else '')) if models else ''))
+    break
+PY
+}
+
 write_worker_config() {
 	${SUDO:-} python3 - "$@" <<'PY'
 import json, os, sys
@@ -386,6 +443,11 @@ PY
 if [ -n "${OPENVIBE_INSTALL_WORKER_CONFIG_ONLY:-}" ]; then
 	write_worker_config "$OPENVIBE_INSTALL_WORKER_CONFIG_ONLY" "${OPENVIBE_JOB_UID:?}" "${OPENVIBE_JOB_GID:?}" \
 		${OPENVIBE_NODEJS:+"$OPENVIBE_NODEJS"} ${OPENVIBE_CODES_DIR:+"$OPENVIBE_CODES_DIR"}
+	exit 0
+fi
+if [ -n "${OPENVIBE_INSTALL_AI_CONFIG_ONLY:-}" ]; then
+	[ "$AI" = 1 ] || die "OPENVIBE_INSTALL_AI_CONFIG_ONLY needs --ai or --ai-endpoint"
+	write_ai_config "$OPENVIBE_INSTALL_AI_CONFIG_ONLY" ${AI_ENDPOINT:+"$AI_ENDPOINT"}
 	exit 0
 fi
 # OPENVIBE_INSTALL_COMPUTER_CONFIG_ONLY=<config.json> with --computer LEVEL and OPENVIBE_COMPUTER_HOME adds the computer
@@ -795,6 +857,20 @@ elif [ -n "$COMPUTER" ]; then
 		fi
 		say "the tray starts when $SVC_USER signs in (openvibe-node tray; openvibe-node tray --autostart off removes it)"
 	fi
+fi
+
+# ---- your own models (--ai): the ai plugin, and which model server answers now ----
+if [ "$AI" = 1 ]; then
+	write_ai_config "$CONF/config.json" ${AI_ENDPOINT:+"$AI_ENDPOINT"}
+	found="$(ai_found ${AI_ENDPOINT:+"$AI_ENDPOINT"})"
+	if [ -n "$found" ]; then
+		say "your own models: found $found"
+	else
+		say "your own models: no model server answers yet. Install one (Ollama: https://ollama.com, then: ollama pull llama3.1:8b),"
+		say "  or start LM Studio's or llama.cpp's server; the Node finds it on its usual port (--ai-endpoint URL for another)."
+	fi
+	say "on https://openvibe.bot/machines turn on \"Let my AI use this computer's models\" for this machine: OpenVibe then"
+	say "  asks them for your own work only (your Vibe, your AI members), and nobody else's."
 fi
 
 # ---- the job worker (--worker): the job user, the egress tools, the Codes job runner, the worker config ----

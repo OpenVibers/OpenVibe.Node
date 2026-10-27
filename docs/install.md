@@ -70,6 +70,10 @@ Its output is in `journalctl -u openvibe-setup` on the Pi.
    names the device on openvibe.bot (default: the hostname).
 3. Confirm the new device on openvibe.bot.
 
+**Your own models:** add `--ai` to any of these commands. It adds the `ai` plugin, which finds Ollama, LM Studio or
+llama.cpp's server on the machine, and the installer says which one answers. `--ai-endpoint URL` names another port.
+[ai.md](ai.md) has the rest.
+
 **A machine that runs your jobs, not a robot:** openvibe.bot/machines prints the Network form with `--worker` (and no
 `--driver`). It turns the job worker on with a dedicated `openvibe-job` user and the OpenVibe.Codes job runner, so a
 coding task you start on openvibe.codes/run runs on this machine. [worker.md](worker.md#a-machine-that-runs-your-coding-tasks---worker)
