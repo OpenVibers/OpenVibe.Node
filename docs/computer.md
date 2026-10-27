@@ -134,8 +134,21 @@ An agent can work on a desk of its own instead of your screen (plan track K: Vib
   the mouse and keyboard on the desk (points scale to the desk's own size), and the agent's browser shown on the desk
   in a profile of its own (`browser_profile` + `-desk`). Without `desk` (or with `main`) they act on your own screen,
   as before.
+- **Several desks at once** (Node v0.19.0, the Desks plan's step D1). Every `desk` command and every `screen`,
+  `screen_stream`, `input` and `browser` command may name a desk: `"desk": "desk-<name>"` (lower-case letters, digits
+  and dashes, up to 24 after `desk-`; `private` is the first desk, as before). Each desk is a separate computer for
+  its agent:
+  - its own X display and D-Bus;
+  - its own browser in its own profile (`browser_profile` + `-<name>`) and downloads folder;
+  - its own temp folder (`TMPDIR`), so its clipboard, cookies, files and windows never meet another desk's.
+
+  Two agents can work at once without either seeing or driving the other's screen, and two desks' browsers act in
+  parallel. `{"action": "list"}` reports the desks that run. `max_desks` caps how many run at once (by default one per
+  2 GiB of memory, 1 to 8); one more is refused (`not_ready`), never queued. Stopping a desk ends only its processes,
+  and the kill switch stops them all. The desks' own folders are under `desk_dir`
+  (`~/.local/share/openvibe-node/desks`).
 - **Levels.** Starting and stopping a desk are acting commands (refused at `observe`, approved one by one at `ask`);
-  `status` runs at every level. What runs on the desk keeps its own rules: input and the browser still act.
+  `status` and `list` run at every level. What runs on the desk keeps its own rules: input and the browser still act.
 - **Watching and taking over.** Start the live screen with `"desk": "private"` (your desktop is not told, since nothing of
   yours is shown) and drive it the same way.
 - **It ends** on `stop`, and at once on `openvibe-node stop` or an e-stop: every process the desk started is ended by
@@ -158,6 +171,8 @@ An agent can work on a desk of its own instead of your screen (plan track K: Vib
 | `probe`              | `true`         | `false`: no probes (OpenVibe.Watch's `node` source) |
 | `allow_input`        | `true`         | `false`: never use the mouse or keyboard (no `input` capability) |
 | `allow_desk`         | `true`         | `false`: never start a private desk (no `desk` capability) |
+| `max_desks`          | memory / 2 GiB, 1 to 8 | how many desks run at once (1 to 10) |
+| `desk_dir`           | `~/.local/share/openvibe-node/desks` | each desk's own temp and downloads folders |
 | `allow_browser`      | `true`         | `false`: no browser (no `browser` capability) |
 | `allow_screen_stream` | `true`        | `false`: never show the screen live (`screen.stream` is false) |
 | `browser_path`       | found on PATH  | the browser to drive (Chromium, Chrome, Edge or Brave) |

@@ -397,7 +397,7 @@ func TestJobUndecodableBody(t *testing.T) {
 }
 
 func TestComputerActsDesk(t *testing.T) {
-	cases := map[string]bool{"start": true, "stop": true, "status": false}
+	cases := map[string]bool{"start": true, "stop": true, "status": false, "list": false}
 	for action, acts := range cases {
 		if got := ComputerActs(KindDesk, json.RawMessage(`{"action":"`+action+`"}`)); got != acts {
 			t.Errorf("desk %s acts = %v, want %v", action, got, acts)

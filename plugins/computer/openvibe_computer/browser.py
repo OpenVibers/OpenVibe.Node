@@ -109,6 +109,7 @@ class Browser:
         self.mu = threading.Lock()
         self.session = None
         self.used_at = 0.0
+        self.download_dir = None   # a desk's own downloads folder (set before the first action), else the browser's default
 
     # ---- the process and the pipe ------------------------------------------------------------------------------------
     def alive(self):
@@ -149,6 +150,8 @@ class Browser:
         self.session = self.call("Target.attachToTarget", {"targetId": target, "flatten": True}, session=False)["sessionId"]
         self.call("Page.enable")
         self.call("Runtime.enable")
+        if self.download_dir:
+            self.call("Browser.setDownloadBehavior", {"behavior": "allow", "downloadPath": self.download_dir}, session=False)
 
     def _stderr(self, stream):
         """Keep the browser's last lines of stderr: why it closed, when it does."""

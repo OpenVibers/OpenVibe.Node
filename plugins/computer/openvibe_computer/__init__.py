@@ -40,10 +40,14 @@ Command kinds and their answers (the ack's ``data``):
   way; ``screenshot`` → ``{format, width, height, content_b64}``; ``close``. Reading, screenshots and closing run at every
   level; the rest are acting commands. Below level full, ``open`` refuses an address on the machine's own network.
   Config ``allow_browser: false`` turns it off; ``browser_path``, ``browser_headless`` (default true).
-* ``desk`` ``{"action": "start"|"stop"|"status", "width"?, "height"?}``: a private desk (``desk.py``): an Xvfb display with a
+* ``desk`` ``{"action": "start"|"stop"|"status"|"list", "desk"?, "width"?, "height"?}``: a private desk (``desk.py``): an Xvfb display with a
   window manager and a D-Bus session of its own, where the agent works without touching the owner's screen. ``screen``,
   ``screen_stream``, ``input`` and ``browser`` take ``"desk": "private"`` to act there (the browser shown on the desk, in a
-  profile of its own, ``browser_profile`` + ``-desk``); ``main`` (the default) is the owner's screen. Starting and stopping
+  profile of its own, ``browser_profile`` + ``-desk``); ``main`` (the default) is the owner's screen. Several desks run at
+  once (Node v0.19, Desks plan D1): ``"desk": "desk-<name>"`` names one (start it with ``desk`` and that name), each with
+  its own display, bus, browser profile (``browser_profile`` + ``-<name>``), temp folder and downloads folder, so two
+  agents working at once never see or drive each other's screen. ``max_desks`` (default: one per 2 GiB of memory, 1 to
+  8) caps how many run at once; ``list`` reports the running ones. Starting and stopping
   act (refused at observe, approved at ask), ``status`` runs at every level, and the kill switch stops the desk. Linux
   with Xvfb; config ``allow_desk: false`` turns it off.
 * ``probe`` ``{"target", "timeout_s"?}`` → for ``http(s)://…`` one GET, no redirect followed: ``{status, content_type,
@@ -73,7 +77,7 @@ import urllib.parse
 from openvibe_plugin import Deferred, Fault, Plugin
 
 from .browser import KEY_CODES, Browser, BrowserError, find_binary
-from .desk import PrivateDesk
+from .desk import MAX_DESKS_CAP, Desks, PrivateDesk, default_max_desks
 
 LEVELS = ("observe", "ask", "trusted", "full")
 RANK = {name: i for i, name in enumerate(LEVELS)}
@@ -139,12 +143,12 @@ def _int(v, name, lo, hi, default):
 
 class Computer(Plugin):
     driver = "computer"
-    version = "0.8.0"
+    version = "0.9.0"
     motion_kinds = frozenset()
     telemetry_interval_s = 2.0
 
     def __init__(self, which=shutil.which, popen=subprocess.Popen, clock=time.monotonic, env=None, platform=None, screen_size=None,
-                 browser_factory=None, resolve=None, desk=None):
+                 browser_factory=None, resolve=None, desk=None, desk_factory=None):
         self.which = which
         self.popen = popen
         self.screen_size = screen_size or self._screen_size
@@ -182,9 +186,12 @@ class Computer(Plugin):
         self.browser_mu = threading.Lock()
         self.browser_op_mu = threading.Lock()
         self.browser_factory = browser_factory or (lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env))
-        self.desk = desk or PrivateDesk(which=which, popen=popen)
+        self.desk_factory = desk_factory or (lambda: PrivateDesk(which=which, popen=popen))
+        self.desk = desk or self.desk_factory()   # the desk named private (the first one, as before v0.9.0)
+        self.desks = Desks(self.desk_factory, private=self.desk, max_desks=default_max_desks())
         self.allow_desk = True
-        self.desk_browser = None   # the agent's browser on the private desk (its own profile, shown there, not headless)
+        self.desk_browsers = {}    # desk name -> the agent's browser on that desk (its own profile, shown there)
+        self.browser_locks = {}    # "main" or a desk name -> one action at a time in that browser
         self.resolve = resolve or (lambda host: [ai[4][0] for ai in socket.getaddrinfo(host, None)])
 
     # ---- configuration -------------------------------------------------------------------------------------------
@@ -210,6 +217,8 @@ class Computer(Plugin):
         self.allow_browser = config.get("allow_browser", True) is not False
         self.allow_screen_stream = config.get("allow_screen_stream", True) is not False
         self.allow_desk = config.get("allow_desk", True) is not False
+        self.desks.max_desks = _int(config.get("max_desks"), "max_desks", 1, MAX_DESKS_CAP, default_max_desks())
+        self.desks.base_dir = os.path.expanduser(config.get("desk_dir") or "~/.local/share/openvibe-node/desks")
         self.browser_path = config.get("browser_path") or None
         self.browser_profile = os.path.expanduser(config.get("browser_profile") or "~/.local/share/openvibe-node/browser")
         self.browser_headless = config.get("browser_headless", True) is not False
@@ -235,9 +244,9 @@ class Computer(Plugin):
         binary = self._browser_binary()
         if binary:
             caps["browser"] = {"level": self.level, "browser": os.path.basename(binary), "headless": self.browser_headless}
-        if self.allow_desk and self.platform.startswith("linux") and self.desk.available():
-            caps["desk"] = {"level": self.level, "window_manager": self.desk.window_manager(), "input": bool(self.which("xdotool")),
-                            "screen": bool(self._x11_tool())}
+        if self.allow_desk and self.platform.startswith("linux") and self.desks.available():
+            caps["desk"] = {"level": self.level, "window_manager": self.desks.window_manager(), "input": bool(self.which("xdotool")),
+                            "screen": bool(self._x11_tool()), "named": True, "max_desks": self.desks.max_desks}
         return caps
 
     def setup(self, config):
@@ -262,7 +271,8 @@ class Computer(Plugin):
             self._kill(p)
         self._close_browser()
         self._end_stream("stopped on the machine")
-        self.desk.stop()
+        self._close_desk_browsers()
+        self.desks.stop_all()
         for cid in waiting:
             self._close_prompt(cid)
             self.emit_event("approval_done", id=cid, approved=False, reason="stopped")
@@ -296,7 +306,8 @@ class Computer(Plugin):
         # Sensors are what the core forwards to Bot: the machines page shows the level and what waits on the machine.
         streaming = self.stream is not None
         return {"sensors": {"computer_level": self.effective_level(), "computer_waiting": waiting, "computer_running": running,
-                            "computer_screen_stream": "live" if streaming else "off"}}
+                            "computer_screen_stream": "live" if streaming else "off",
+                            "computer_desks": len(self.desks.running_names())}}
 
     # ---- paths -----------------------------------------------------------------------------------------------------
     def _inside(self, path):
@@ -327,6 +338,7 @@ class Computer(Plugin):
         if cmd.kind == "desk":
             return self._desk_op(cmd, v, level)
         desk_env = self._desk_env(v) if cmd.kind in ("screen", "screen_stream", "input", "browser") else None
+        desk_name = v.get("desk") if desk_env else None
         if cmd.kind == "screen":
             tool = self._x11_tool() if desk_env else self._screen_tool()
             if not tool:
@@ -334,7 +346,7 @@ class Computer(Plugin):
             width = _int(v.get("max_width"), "max_width", 320, 3840, 1280)
             return self._start(cmd, lambda: self._screen(tool, width, env=desk_env))
         if cmd.kind == "screen_stream":
-            return self._screen_stream(v, env=desk_env)
+            return self._screen_stream(v, env=desk_env, desk=desk_name)
         if cmd.kind == "fs":
             op = v.get("op")
             if op in READ_OPS:
@@ -357,7 +369,7 @@ class Computer(Plugin):
             run, summary = self._input_op(tool, v, env=desk_env)
             return self._act(cmd, level, self._driving(run), summary, threaded=True)
         if cmd.kind == "browser":
-            run, summary, acting = self._browser_op(v, level, env=desk_env)
+            run, summary, acting = self._browser_op(v, level, env=desk_env, desk=desk_name)
             if acting:
                 return self._act(cmd, level, run, summary, threaded=True)
             return self._start(cmd, run)
@@ -370,40 +382,48 @@ class Computer(Plugin):
 
     # ---- the private desk --------------------------------------------------------------------------------------------
     def _desk_env(self, v):
-        """None for the owner's own screen (desk main, the default); the private desk's environment for desk private."""
+        """None for the owner's own screen (desk main, the default); a desk's environment for private or desk-<name>."""
         where = v.get("desk", "main")
-        if where not in ("main", "private"):
-            raise Fault("bad_value", "desk is main or private")
         if where == "main":
             return None
+        Desks.check(where)
         if not self.allow_desk:
             raise Fault("unsupported", "this machine does not allow a private desk (allow_desk is off)")
-        return self.desk.env()
+        return self.desks.env(where)
 
     def _desk_op(self, cmd, v, level):
         action = v.get("action")
+        name = v.get("desk", "private")
+        if action == "list":
+            return self.desks.list()
+        Desks.check(name)
         if action == "status":
-            return self.desk.status()
+            return self.desks.status(name)
         if action not in ("start", "stop"):
-            raise Fault("bad_value", "action is start, stop or status")
+            raise Fault("bad_value", "action is start, stop, status or list")
         if not self.allow_desk or not self.platform.startswith("linux"):
             raise Fault("unsupported", "this machine does not offer a private desk (Linux with Xvfb, allow_desk on)")
+        what = "a private desk" if name == "private" else "desk %s" % name
         if action == "start":
             width = _int(v.get("width"), "width", 640, 3840, 1280)
             height = _int(v.get("height"), "height", 480, 2160, 800)
-            return self._act(cmd, level, lambda: self.desk.start(width, height),
-                             "start a private desk (%d×%d) where your agent works without touching your screen" % (width, height),
+            return self._act(cmd, level, lambda: self.desks.start(name, width, height),
+                             "start %s (%d×%d) where your agent works without touching your screen" % (what, width, height),
                              threaded=True)
 
         def stop():
-            self._close_desk_browser()
-            return self.desk.stop()
-        return self._act(cmd, level, stop, "stop the private desk (and close what runs on it)", threaded=False)
+            self._close_desk_browser(name)
+            return self.desks.stop(name)
+        return self._act(cmd, level, stop, "stop %s (and close what runs on it)" % what, threaded=False)
 
-    def _close_desk_browser(self):
-        b, self.desk_browser = self.desk_browser, None
+    def _close_desk_browser(self, name):
+        b = self.desk_browsers.pop(name, None)
         if b is not None:
             b.close()
+
+    def _close_desk_browsers(self):
+        for name in list(self.desk_browsers):
+            self._close_desk_browser(name)
 
     def _x11_tool(self):
         """An X11 capture tool for the private desk (it is always X11, whatever the owner's session is)."""
@@ -891,7 +911,7 @@ class Computer(Plugin):
             raise Fault("not_allowed", "%s is on this machine's own network: only at level full" % u.hostname)
         return raw
 
-    def _browser_op(self, v, level, env=None):
+    def _browser_op(self, v, level, env=None, desk=None):
         """(run, summary, acting) for one browser action; nothing is opened or clicked before run()."""
         binary = self._browser_binary()
         if not binary:
@@ -915,23 +935,32 @@ class Computer(Plugin):
             raise Fault("bad_value", "key is one of %s" % ", ".join(sorted(KEY_CODES)))
         width = _int(v.get("max_width"), "max_width", 320, 2560, 1280)
 
+        lock_key = desk if env else "main"
+
         def browser():
             with self.browser_mu:
-                if env:   # on the private desk: shown there (never headless), in a profile of its own
-                    if self.desk_browser is None or not self.desk_browser.alive():
-                        self.desk_browser = self.browser_factory(binary, self.browser_profile + "-desk", False, env=env)
-                    return self.desk_browser
+                if env:   # on a desk: shown there (never headless), in a profile and a downloads folder of its own
+                    b = self.desk_browsers.get(desk)
+                    if b is None or not b.alive():
+                        profile = self.browser_profile + ("-desk" if desk == "private" else "-" + desk)
+                        b = self.desk_browsers[desk] = self.browser_factory(binary, profile, False, env=env)
+                        b.download_dir = self.desks.dir(desk, "downloads")
+                    return b
                 if self.browser is None or not self.browser.alive():
                     self.browser = self.browser_factory(binary, self.browser_profile, self.browser_headless)
                 return self.browser
 
+        def lock():
+            with self.browser_mu:
+                return self.browser_locks.setdefault(lock_key, threading.Lock())
+
         def run():
             if action == "close":
-                self._close_desk_browser() if env else self._close_browser()
+                self._close_desk_browser(desk) if env else self._close_browser()
                 return {"done": True}
             b = browser()
             try:
-                with self.browser_op_mu:   # one action at a time in the one browser
+                with lock():   # one action at a time in each browser; two desks' browsers act in parallel
                     if action == "open":
                         return b.open(url)
                     if action == "read":
@@ -1165,7 +1194,7 @@ class Computer(Plugin):
     def _stream_capable(self, tool):
         return self._have_pillow() or self._native_jpeg(tool, "x.jpg") is not None
 
-    def _screen_stream(self, v, env=None):
+    def _screen_stream(self, v, env=None, desk=None):
         action = v.get("action")
         if action == "stop":
             return {"streaming": False, "stopped": self._end_stream("stopped by its owner")}
@@ -1192,7 +1221,7 @@ class Computer(Plugin):
         if not env:   # the private desk is not the owner's screen: nothing of theirs goes live
             self._notify_stream(seconds)
         return {"streaming": True, "sid": stream["sid"], "seconds": seconds, "fps": fps, "tool": tool[0],
-                "desk": "private" if env else "main"}
+                "desk": (desk or "private") if env else "main"}
 
     def _end_stream(self, reason):
         """End the live screen, if one runs → whether one did."""

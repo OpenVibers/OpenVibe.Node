@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "sdk"))
 
 from openvibe_computer import Computer  # noqa: E402
-from openvibe_computer.desk import PrivateDesk  # noqa: E402
+from openvibe_computer.desk import Desks, PrivateDesk, default_max_desks  # noqa: E402
 from openvibe_plugin import Fault, Runtime  # noqa: E402
 from test_computer import Out, reply  # noqa: E402
 
@@ -90,8 +90,9 @@ class DeskModuleTest(unittest.TestCase):
 
 
 class FakeDesk:
-    def __init__(self):
+    def __init__(self, display=91):
         self.on = False
+        self.display = display
 
     def available(self):
         return True
@@ -111,19 +112,27 @@ class FakeDesk:
         return {"running": False, "stopped": was}
 
     def status(self):
-        return {"running": True, "display": ":91", "width": 1000, "height": 500} if self.on else {"running": False, "available": True}
+        return {"running": True, "display": ":%d" % self.display, "width": 1000, "height": 500} if self.on else {"running": False, "available": True}
 
     def env(self):
         if not self.on:
             raise Fault("not_ready", "start the private desk first (desk start)")
-        return {"DISPLAY": ":91"}
+        return {"DISPLAY": ":%d" % self.display}
 
 
 class DeskPluginTest(unittest.TestCase):
-    def boot(self, level):
+    def boot(self, level, **config):
         self.out = Out()
         self.desk = FakeDesk()
+        self.made_desks = []
         self.calls = []
+
+        def desk_factory():
+            d = FakeDesk(display=92 + len(self.made_desks))
+            self.made_desks.append(d)
+            return d
+        self.desk_dir = tempfile.mkdtemp(prefix="ov-desks-")
+        self.addCleanup(lambda: shutil.rmtree(self.desk_dir, ignore_errors=True))
 
         def popen(argv, **kw):
             self.calls.append((argv, kw.get("env")))
@@ -131,10 +140,11 @@ class DeskPluginTest(unittest.TestCase):
             p.returncode = 0
             p.communicate = lambda timeout=None: (b"", b"")
             return p
-        self.plugin = Computer(env={"DISPLAY": ":0"}, platform="linux", desk=self.desk, popen=popen,
+        self.plugin = Computer(env={"DISPLAY": ":0"}, platform="linux", desk=self.desk, desk_factory=desk_factory, popen=popen,
                                which=lambda n: "/usr/bin/" + n, screen_size=lambda tool: (2000, 1000))
         self.rt = Runtime(self.plugin, infile=io.StringIO(""), outfile=self.out)
-        self.rt.dispatch({"op": "hello", "config": {"level": level, "roots": [tempfile.gettempdir()], "notify": False}})
+        self.rt.dispatch({"op": "hello", "config": {"level": level, "roots": [tempfile.gettempdir()], "notify": False,
+                                                    "desk_dir": self.desk_dir, **config}})
         self.n = 0
         return self.out.msgs()
 
@@ -146,11 +156,12 @@ class DeskPluginTest(unittest.TestCase):
 
     def test_describe_offers_the_desk(self):
         caps = self.boot("trusted")[0]["capabilities"]
-        self.assertEqual(caps["desk"], {"level": "trusted", "window_manager": "metacity", "input": True, "screen": True})
+        self.assertEqual(caps["desk"], {"level": "trusted", "window_manager": "metacity", "input": True, "screen": True,
+                                        "named": True, "max_desks": default_max_desks()})
 
     def test_observe_reports_but_does_not_start(self):
         self.boot("observe")
-        self.assertEqual(reply(self.out, self.cmd("desk", {"action": "status"}))["data"], {"running": False, "available": True})
+        self.assertEqual(reply(self.out, self.cmd("desk", {"action": "status"}))["data"], {"running": False, "available": True, "desk": "private"})
         r = reply(self.out, self.cmd("desk", {"action": "start"}))
         self.assertEqual((r["op"], r["fault_code"]), ("nack", "not_allowed"))
         self.assertFalse(self.desk.on)
@@ -173,7 +184,71 @@ class DeskPluginTest(unittest.TestCase):
         r = reply(self.out, self.cmd("screen", {"desk": "neighbour"}))
         self.assertEqual(r["fault_code"], "bad_value")
         r = reply(self.out, self.cmd("desk", {"action": "stop"}))
-        self.assertEqual(r["data"], {"running": False, "stopped": True})
+        self.assertEqual(r["data"], {"running": False, "stopped": True, "desk": "private"})
+
+    def test_several_desks_each_with_its_own_display_temp_folder_and_browser(self):
+        # Desks plan D1: two agents at once on one machine, each on a desk of its own.
+        self.boot("trusted", max_desks=2)
+        for name in ("desk-a", "desk-b"):
+            r = reply(self.out, self.cmd("desk", {"action": "start", "desk": name, "width": 1000, "height": 500}))
+            self.assertEqual((r["op"], r["data"]["desk"], r["data"]["running"]), ("ack", name, True))
+        self.assertEqual([d.display for d in self.made_desks], [92, 93], "a display each")
+        # A third is refused while two run (max_desks 2), and the private desk counts like any other.
+        r = reply(self.out, self.cmd("desk", {"action": "start", "desk": "private"}))
+        self.assertEqual(r["fault_code"], "not_ready")
+        self.assertIn("max_desks", r["message"])
+        # Input goes to the named desk's own display.
+        reply(self.out, self.cmd("input", {"action": "click", "x": 1, "y": 1, "width": 100, "height": 100, "desk": "desk-a"}))
+        self.assertEqual(self.calls[-1][1]["DISPLAY"], ":92")
+        reply(self.out, self.cmd("input", {"action": "click", "x": 1, "y": 1, "width": 100, "height": 100, "desk": "desk-b"}))
+        self.assertEqual(self.calls[-1][1]["DISPLAY"], ":93")
+        # A temp folder each, inside the desks folder, 0700.
+        tmp_a = self.calls[-2][1]["TMPDIR"]
+        tmp_b = self.calls[-1][1]["TMPDIR"]
+        self.assertNotEqual(tmp_a, tmp_b)
+        self.assertTrue(tmp_a.startswith(self.desk_dir) and os.path.isdir(tmp_a))
+        self.assertEqual(os.stat(tmp_a).st_mode & 0o777, 0o700)
+        # list reports both; a desk that never started is not_ready; names are checked.
+        listed = reply(self.out, self.cmd("desk", {"action": "list"}))["data"]
+        self.assertEqual(([d["desk"] for d in listed["desks"]], listed["max_desks"]), (["desk-a", "desk-b"], 2))
+        self.assertEqual(reply(self.out, self.cmd("screen", {"desk": "desk-c"}))["fault_code"], "not_ready")
+        for bad in ("desk-", "Desk-A", "desk-a/../b", "desk-" + "x" * 30, "other"):
+            self.assertEqual(reply(self.out, self.cmd("screen", {"desk": bad}))["fault_code"], "bad_value", bad)
+        # Stopping one leaves the other running; the kill switch stops every desk.
+        self.assertEqual(reply(self.out, self.cmd("desk", {"action": "stop", "desk": "desk-a"}))["data"]["stopped"], True)
+        self.assertEqual([d.on for d in self.made_desks], [False, True])
+        self.plugin.stop()
+        self.assertEqual([d.on for d in self.made_desks], [False, False])
+
+    def test_each_desk_has_a_browser_profile_and_downloads_of_its_own(self):
+        made = []
+
+        class FakeBrowser:
+            def __init__(self, binary, profile, headless, env=None):
+                self.profile, self.headless, self.env, self.download_dir = profile, headless, env, None
+                made.append(self)
+
+            def alive(self):
+                return True
+
+            def open(self, url):
+                return {"url": url}
+
+            def close(self):
+                pass
+        self.boot("trusted", max_desks=3)
+        self.plugin.browser_factory = FakeBrowser
+        for name in ("private", "desk-a"):
+            reply(self.out, self.cmd("desk", {"action": "start", "desk": name}))
+            r = reply(self.out, self.cmd("browser", {"action": "open", "url": "https://example.org/", "desk": name}))
+            self.assertEqual(r["op"], "ack", r)
+        self.assertEqual(len(made), 2)
+        self.assertTrue(made[0].profile.endswith("-desk"), "the private desk keeps its profile from before v0.9.0")
+        self.assertTrue(made[1].profile.endswith("-desk-a"))
+        self.assertEqual([b.headless for b in made], [False, False], "shown on the desk")
+        self.assertEqual(made[1].download_dir, os.path.join(self.desk_dir, "desk-a", "downloads"))
+        self.assertNotEqual(made[0].download_dir, made[1].download_dir)
+        self.assertNotEqual(made[0].env["DISPLAY"], made[1].env["DISPLAY"])
 
     def test_the_kill_switch_stops_the_desk(self):
         self.boot("trusted")
@@ -183,7 +258,17 @@ class DeskPluginTest(unittest.TestCase):
         self.assertFalse(self.desk.on)
 
 
-@unittest.skipUnless(all(shutil.which(t) for t in ("Xvfb", "import")) and sys.platform.startswith("linux"), "needs Xvfb and ImageMagick")
+def _pillow():
+    try:
+        import PIL  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+# The screen's size comes from Pillow (without it a capture is a bare PNG): the real-desk tests need it like CI has it.
+@unittest.skipUnless(all(shutil.which(t) for t in ("Xvfb", "import")) and sys.platform.startswith("linux") and _pillow(),
+                     "needs Xvfb, ImageMagick and Pillow")
 class RealDeskTest(unittest.TestCase):
     def test_a_real_desk_shows_its_own_screen(self):
         out = Out()
@@ -205,6 +290,95 @@ class RealDeskTest(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    def test_two_real_desks_have_their_own_screens(self):
+        # Desks plan D1 for real: two desks at once, each its own X display at its own size; stopping one ends only its
+        # processes.
+        out = Out()
+        plugin = Computer(platform="linux")
+        rt = Runtime(plugin, infile=io.StringIO(""), outfile=out)
+        rt.dispatch({"op": "hello", "config": {"level": "trusted", "roots": [tempfile.gettempdir()], "notify": False, "max_desks": 2}})
+        self.addCleanup(plugin.desks.stop_all)
+        sizes = {"desk-one": (800, 600), "desk-two": (1024, 640)}
+        n = 0
+        for name, (w, h) in sizes.items():
+            n += 1
+            rt.dispatch({"op": "command", "id": "s%d" % n, "kind": "desk", "value": {"action": "start", "desk": name, "width": w, "height": h}, "deadline_ms": 30000})
+            self.assertTrue(reply(out, "s%d" % n)["data"]["running"])
+        displays = {d["desk"]: d["display"] for d in plugin.desks.list()["desks"]}
+        self.assertEqual(len(set(displays.values())), 2, displays)
+        for name, (w, h) in sizes.items():
+            n += 1
+            rt.dispatch({"op": "command", "id": "s%d" % n, "kind": "screen", "value": {"desk": name, "max_width": 1280}, "deadline_ms": 30000})
+            shot = reply(out, "s%d" % n)["data"]
+            self.assertEqual((shot["width"], shot["height"]), (w, h), name)
+        one = [p.pid for _, p in plugin.desks.desks["desk-one"].procs]
+        rt.dispatch({"op": "command", "id": "end", "kind": "desk", "value": {"action": "stop", "desk": "desk-one"}, "deadline_ms": 30000})
+        self.assertTrue(reply(out, "end")["data"]["stopped"])
+        for pid in one:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        self.assertEqual([d["desk"] for d in plugin.desks.list()["desks"]], ["desk-two"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _a_browser():
+    from openvibe_computer.browser import find_binary
+    return find_binary(shutil.which, sys.platform)
+
+
+@unittest.skipUnless(shutil.which("Xvfb") and sys.platform.startswith("linux") and _a_browser(), "needs Xvfb and a Chromium-family browser")
+class RealDeskBrowsersTest(unittest.TestCase):
+    def test_two_desks_never_share_cookies(self):
+        # Desks plan D1's proof: two agents signed in to the same site at once, on two desks of one machine, each with
+        # its own cookie; neither browser ever sends the other's.
+        import http.server
+        import threading
+
+        class Site(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = "cookie=[%s]" % (self.headers.get("Cookie") or "")
+                self.send_response(200)
+                if self.path.startswith("/set/"):
+                    self.send_header("Set-Cookie", "who=%s; Path=/" % self.path[len("/set/"):])
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(body.encode())
+
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        profiles = tempfile.mkdtemp(prefix="ov-desk-browsers-")
+        self.addCleanup(lambda: shutil.rmtree(profiles, ignore_errors=True))
+        out = Out()
+        plugin = Computer(platform="linux")
+        # CI runners' Chrome crashes inside their user-namespace policy unless its sandbox is off (as RealBrowserTest).
+        from openvibe_computer.browser import Browser
+        extra = ["--no-sandbox"] if os.environ.get("CI") else []
+        plugin.browser_factory = lambda binary, profile, headless, env=None: Browser(binary, profile, headless, env=env, extra_args=extra)
+        rt = Runtime(plugin, infile=io.StringIO(""), outfile=out)
+        # Level full: the test site is on this machine (lower levels refuse the machine's own network).
+        rt.dispatch({"op": "hello", "config": {"level": "full", "roots": [tempfile.gettempdir()], "notify": False, "max_desks": 2,
+                                               "browser_profile": os.path.join(profiles, "browser"), "desk_dir": os.path.join(profiles, "desks")}})
+        self.addCleanup(plugin.stop)
+        n = [0]
+
+        def cmd(kind, value):
+            n[0] += 1
+            cid = "b%d" % n[0]
+            rt.dispatch({"op": "command", "id": cid, "kind": kind, "value": value, "deadline_ms": 60000})
+            r = out.wait_for(lambda m: m.get("id") == cid and m.get("op") in ("ack", "nack"), timeout=60)
+            self.assertEqual(r["op"], "ack", r)
+            return r.get("data")
+        for name, who in (("desk-alpha", "alpha"), ("desk-beta", "beta")):
+            cmd("desk", {"action": "start", "desk": name})
+            cmd("browser", {"action": "open", "url": base + "/set/" + who, "desk": name})
+        for name, who, other in (("desk-alpha", "alpha", "beta"), ("desk-beta", "beta", "alpha")):
+            text = cmd("browser", {"action": "open", "url": base + "/show", "desk": name})["text"]
+            self.assertIn("who=" + who, text, name)
+            self.assertNotIn("who=" + other, text, name)
