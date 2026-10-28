@@ -97,8 +97,9 @@ AI_ENDPOINT=""
 CLAIM_OK=1
 DRIVER_GIVEN=0
 SETUP="${OPENVIBE_SETUP_KEY:-}"
-# The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0).
-CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.3.1}"
+# The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0; v0.4.0 prints job
+# lines 1.1: each step's input, output while it runs and result, so the task page on openvibe.codes shows the session).
+CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.4.0}"
 CODES_DIR=/opt/openvibe-codes
 
 usage() {
