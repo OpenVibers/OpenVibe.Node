@@ -272,17 +272,18 @@ func TestRouting(t *testing.T) {
 	}
 }
 
-// A desk host offers no screen or input of its own, only its desks': screen, screen_stream and input still reach the
-// plugin with desks (it acts on the desk named, or refuses the machine's own screen); other kinds are not routed there.
+// A desk host offers no screen, input or browser of its own, only its desks': screen, screen_stream, input and browser
+// still reach the plugin with desks (it acts on the desk named, or refuses the machine's own); other kinds are not routed
+// there.
 func TestRoutingOnADeskHost(t *testing.T) {
 	fx := start(t, "deskhost")
 	fx.waitState(StateReady)
-	for _, kind := range []string{"screen", "screen_stream", "input", "desk", "fs"} {
+	for _, kind := range []string{"screen", "screen_stream", "input", "browser", "desk", "fs"} {
 		if fx.m.Route(kind, "", "") == nil {
 			t.Fatalf("%s not routed on a desk host", kind)
 		}
 	}
-	for _, kind := range []string{"exec", "browser", "drive"} {
+	for _, kind := range []string{"exec", "drive"} {
 		if fx.m.Route(kind, "", "") != nil {
 			t.Fatalf("%s routed to a plugin that does not offer it", kind)
 		}
