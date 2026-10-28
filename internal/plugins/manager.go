@@ -31,7 +31,9 @@ var capabilityFor = map[string]string{
 // deskKinds are the kinds a plugin's desks take too. A desk host (install.sh --desk-host) has no screen, mouse or
 // keyboard of its own, only its desks', so its computer plugin offers no "screen" or "input": these kinds then reach
 // the plugin that offers "desk", which acts on the desk a command names and refuses the machine's own screen itself.
-var deskKinds = map[string]bool{protocol.KindScreen: true, protocol.KindScreenStream: true, protocol.KindInput: true}
+// A desk host for other people (desk_isolation sandbox, v0.32) offers no browser of its own either: "browser" on one
+// of its desks reaches the plugin the same way.
+var deskKinds = map[string]bool{protocol.KindScreen: true, protocol.KindScreenStream: true, protocol.KindInput: true, protocol.KindBrowser: true}
 
 // Manager supervises every configured plugin.
 type Manager struct {
