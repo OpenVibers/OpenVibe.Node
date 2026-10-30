@@ -1,0 +1,11 @@
+---
+description: Database rules
+globs:
+  - "**/*.sql"
+alwaysApply: false
+---
+
+# Database
+
+- Every migration is reversible
+- No table without an index
