@@ -60,8 +60,11 @@ func TestPlanLoginsAreCopiedReadOnly(t *testing.T) {
 	if st.Mode().Perm()&0o222 != 0 {
 		t.Fatalf("the staged copy is writable (%v)", st.Mode().Perm())
 	}
-	if err := os.WriteFile(staged, []byte("x"), 0o600); err == nil {
-		t.Fatal("the staged copy could be written")
+	// Root may write a read-only file, so the write is only a check where the mode is what keeps the job out.
+	if os.Geteuid() != 0 {
+		if err := os.WriteFile(staged, []byte("x"), 0o600); err == nil {
+			t.Fatal("the staged copy could be written")
+		}
 	}
 }
 
