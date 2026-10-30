@@ -55,7 +55,7 @@ func (r *recorder) Disconnected(err error) {
 	r.gotDown <- err
 }
 
-func setup(t *testing.T, hb time.Duration) (*fakebot.Server, *Link, *recorder, *lockedWriter, context.CancelFunc) {
+func setup(t *testing.T, hb time.Duration, tweak ...func(*Options)) (*fakebot.Server, *Link, *recorder, *lockedWriter, context.CancelFunc) {
 	t.Helper()
 	srv := fakebot.New()
 	t.Cleanup(srv.Close)
@@ -67,8 +67,12 @@ func setup(t *testing.T, hb time.Duration) (*fakebot.Server, *Link, *recorder, *
 	}
 	logs := &lockedWriter{&bytes.Buffer{}, &sync.Mutex{}}
 	rec := newRecorder()
-	l := New(Options{URL: u, Credential: credentials.NewSecret(cred), HeartbeatInterval: hb, BackoffMin: 20 * time.Millisecond,
-		BackoffMax: 100 * time.Millisecond, Log: slog.New(slog.NewTextHandler(logs, nil))}, rec)
+	opt := Options{URL: u, Credential: credentials.NewSecret(cred), HeartbeatInterval: hb, BackoffMin: 20 * time.Millisecond,
+		BackoffMax: 100 * time.Millisecond, Log: slog.New(slog.NewTextHandler(logs, nil))}
+	for _, f := range tweak {
+		f(&opt)
+	}
+	l := New(opt, rec)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { l.Run(ctx); close(done) }()
@@ -144,6 +148,65 @@ func TestConnectHelloConfigHeartbeat(t *testing.T) {
 		}
 		last = f.Seq
 	}
+}
+
+// The heartbeat carries what this machine's coding agents have left (Codes C9c). Options.Fleet is read once per beat,
+// so a new reading is on the next one; a machine with no reading sends no fleet rather than an empty one.
+func TestHeartbeatCarriesTheFleet(t *testing.T) {
+	var mu sync.Mutex
+	var fleet []protocol.FleetAgent
+	set := func(f []protocol.FleetAgent) {
+		mu.Lock()
+		fleet = f
+		mu.Unlock()
+	}
+	used, limit := 100.0, 100.0
+	set([]protocol.FleetAgent{{Agent: "codex", Installed: true, SignedIn: true, Windows: []protocol.FleetWindow{
+		{Name: "week", Used: &used, Limit: &limit, ResetsAt: "2026-11-04T00:00:00Z"},
+	}}})
+	// 100 ms heartbeats (a 200 ms deadman), as above: this test is about the beat's contents, not the deadman.
+	srv, _, rec, _, _ := setup(t, 100*time.Millisecond, func(o *Options) {
+		o.Fleet = func() []protocol.FleetAgent {
+			mu.Lock()
+			defer mu.Unlock()
+			return fleet
+		}
+	})
+	c, err := srv.NextConn(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFrame(t, rec, protocol.TypeHello)
+	waitFrame(t, rec, protocol.TypeConfig)
+	beat := func(match func([]protocol.FleetAgent) bool) protocol.Heartbeat {
+		t.Helper()
+		f, err := c.Expect(protocol.TypeHeartbeat, 2*time.Second, func(m protocol.Message) bool {
+			hb, ok := m.(protocol.Heartbeat)
+			return ok && match(hb.Fleet)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f.Msg.(protocol.Heartbeat)
+	}
+	hb := beat(func(f []protocol.FleetAgent) bool { return len(f) > 0 })
+	if len(hb.Fleet) != 1 || hb.Fleet[0].Agent != "codex" || !hb.Fleet[0].Installed || !hb.Fleet[0].SignedIn ||
+		len(hb.Fleet[0].Windows) != 1 || hb.Fleet[0].Windows[0].Name != "week" ||
+		hb.Fleet[0].Windows[0].Used == nil || *hb.Fleet[0].Windows[0].Used != 100 ||
+		hb.Fleet[0].Windows[0].ResetsAt != "2026-11-04T00:00:00Z" {
+		t.Fatalf("fleet on the beat: %+v", hb.Fleet)
+	}
+
+	// The next beat carries the next reading.
+	set([]protocol.FleetAgent{{Agent: "opencode", Installed: true}})
+	hb = beat(func(f []protocol.FleetAgent) bool { return len(f) == 1 && f[0].Agent == "opencode" })
+	if hb.Fleet[0].SignedIn || len(hb.Fleet[0].Windows) != 0 {
+		t.Fatalf("the reading that replaced it: %+v", hb.Fleet)
+	}
+
+	// No reading (never probed, or the CLI gone) is silence, not "nothing installed".
+	set(nil)
+	beat(func(f []protocol.FleetAgent) bool { return f == nil })
 }
 
 // Bot's heartbeat_ack echoes the device's send time (echo/t) over its own envelope seq, so the Node measures the

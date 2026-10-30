@@ -27,6 +27,7 @@ import (
 
 	"github.com/OpenVibers/OpenVibe.Node/internal/config"
 	"github.com/OpenVibers/OpenVibe.Node/internal/credentials"
+	"github.com/OpenVibers/OpenVibe.Node/internal/fleet"
 	"github.com/OpenVibers/OpenVibe.Node/internal/link"
 	"github.com/OpenVibers/OpenVibe.Node/internal/localctl"
 	"github.com/OpenVibers/OpenVibe.Node/internal/mono"
@@ -69,9 +70,12 @@ type Node struct {
 	jobs  *jobs
 	// worker runs function jobs; nil unless config.worker is enabled on Linux and its boot-time probe passed.
 	worker *worker.Worker
-	mgr    *plugins.Manager
-	link   *link.Link
-	pub    *video.Publisher
+	// fleet is what this machine's coding agents have left (Codes C9c): the Codes runner's own logins probe, sent
+	// with every heartbeat. Nil when the machine has no OpenVibe.Codes runner declared.
+	fleet *fleet.Prober
+	mgr   *plugins.Manager
+	link  *link.Link
+	pub   *video.Publisher
 	// screen is the owner's live view of the machine's screen (screen.go), apart from a robot's camera.
 	screen screenState
 
@@ -181,6 +185,11 @@ func New(opt Options) (*Node, error) {
 	}
 	n.mgr = plugins.NewManager(specs, opt.Log)
 
+	// Codes C9c: the same Codes runner the worker runs, asked for its logins instead of a job. The probe runs as the
+	// Node's user, the home worker.plan_logins names are under, and only its answer (labels, numbers, times) leaves.
+	if cmd := codesProbeCommand(opt.Config.Worker.Functions); cmd != nil {
+		n.fleet = fleet.New(fleet.Options{Command: cmd, Log: opt.Log})
+	}
 	if opt.Creds != nil {
 		u := opt.Creds.DeviceURL
 		if u == "" {
@@ -194,6 +203,9 @@ func New(opt Options) (*Node, error) {
 		}
 		lo := link.Options{URL: u, Credential: opt.Creds.Credential, UserAgent: "openvibe-node/" + opt.Version,
 			Log: opt.Log, HeartbeatInterval: opt.HeartbeatInterval, BackoffMin: opt.LinkBackoffMin, ReauthInterval: opt.ReauthInterval}
+		if n.fleet != nil {
+			lo.Fleet = n.fleet.Latest
+		}
 		if opt.Creds.NetworkPaired() {
 			// A Network-paired machine authenticates with node tokens, never a Bot credential.
 			lo.Credential = credentials.Secret{}
@@ -274,6 +286,10 @@ func (n *Node) Run(parent context.Context) error {
 	go func() { defer wg.Done(); n.pump(ctx) }()
 	go func() { defer wg.Done(); n.pollLatch(ctx) }()
 	go func() { defer wg.Done(); n.startVideo(ctx) }()
+	if n.fleet != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); n.fleet.Run(ctx) }()
+	}
 	if n.link != nil {
 		wg.Add(1)
 		go func() {

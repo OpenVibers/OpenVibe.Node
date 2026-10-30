@@ -146,7 +146,8 @@ Every frame is one JSON object in one text message with the envelope fields at t
 | `type` | string | message type                                                           |
 
 Unknown `type`s are ignored (a newer server may send more). Frames are at most 1 MiB. A `heartbeat` carries the
-device's send time in `t` (Unix ms) and the last measured `rtt_ms`; the server echoes `t` back in `heartbeat_ack` as
+device's send time in `t` (Unix ms), the last measured `rtt_ms` and, on a machine that runs coding agents, the `fleet`
+its logins probe last read (below); the server echoes `t` back in `heartbeat_ack` as
 `echo` (and `t`), so the Node measures the round trip against its own clock. A `heartbeat_ack`'s envelope `seq` is the
 server's own counter, never the heartbeat's.
 
@@ -175,7 +176,7 @@ applied the Node runs nothing but `halt` (`nack not_ready`), so that latch is in
 | `telemetry`   | `battery` (0..1), `voltage` (V), `rssi`, `sensors` {…}; Node extra: `events` [{`name`, `driver`, `ts`, `fields`}] |
 | `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack); `data` on a computer command (its answer, ≤ 512 KB) |
 | `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
-| `heartbeat`   | `t` (send time, Unix ms), `rtt_ms` (the last measured round trip, once there is one; 0 is a real measurement) |
+| `heartbeat`   | `t` (send time, Unix ms), `rtt_ms` (the last measured round trip, once there is one; 0 is a real measurement); Node extra: `fleet` [{`agent`, `installed`, `signed_in`, `windows` [{`name`, `used`, `limit`, `resets_at`}]}] — what the machine's coding agents have left (Codes C9c) |
 | `reauth`      | `token`: a fresh node token for the same principal (a Network-paired machine only; refused → `error` `bot.reauth_refused`) |
 | `estop_state` | `latched` (the device is stopped: remote e-stop or local kill switch), `by` (`device`), `at`; Node extras: `robot_id` (when `hello` named exactly one robot), `local_stop` (local kill switch), `reason` |
 
@@ -185,6 +186,13 @@ upgrade or `hello`; then `status` whenever a plugin changes state or faults and 
 clears that); `latched:false` is a report only. Plugin events (`cliff`, `picked_up`,
 `low_battery`, `heartbeat_lost`, …) travel in `telemetry.events` and are sent within 100 ms; sensor telemetry is sent
 at most every 500 ms (≤ 2 Hz, Bot's cap). There is no separate `event` message type.
+
+`fleet` is the OpenVibe.Codes runner's own probe (`openvibe-codes logins --json`) read as the Node's own user, once a
+minute and once per heartbeat when read: each agent's id, whether it is installed and signed in, and each limit
+window's label, used and limit numbers and when it frees. Nothing else leaves the machine — no key, token or account
+name — and a reading is bounded (16 agents, 10 windows each, short labels). Absent means the machine has no reading
+(no Codes runner, or its probe has not answered yet), never "nothing installed"; a probe that fails keeps the last
+reading until the next one.
 
 ### Commands
 

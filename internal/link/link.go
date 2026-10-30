@@ -67,6 +67,9 @@ type Options struct {
 	Deadman           time.Duration // default 2 × heartbeat
 	BackoffMin        time.Duration // default 500 ms
 	BackoffMax        time.Duration // default 30 s
+	// Fleet, when set, is read once per heartbeat and sent with it: what this machine's coding agents have left
+	// (Codes C9c). It returns the last reading the prober took, never blocks, and is bounded by its caller.
+	Fleet func() []protocol.FleetAgent
 }
 
 // Tokens supplies node tokens; *TokenSource is the real one.
@@ -467,7 +470,11 @@ func (l *Link) session(ctx context.Context) error {
 				}
 				if !now.Before(next) {
 					next = now.Add(hb)
-					_ = l.Send(protocol.Heartbeat{})
+					beat := protocol.Heartbeat{}
+					if l.opt.Fleet != nil {
+						beat.Fleet = l.opt.Fleet()
+					}
+					_ = l.Send(beat)
 				}
 				if now.Sub(time.Unix(0, lastRx.Load())) > deadman {
 					end(fmt.Errorf("heartbeat lost: nothing from the server for %s", deadman))

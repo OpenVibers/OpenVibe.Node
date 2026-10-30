@@ -419,3 +419,36 @@ func TestComputerActsBrowser(t *testing.T) {
 		t.Error("browser is a computer kind")
 	}
 }
+
+// A heartbeat carries the machine's fleet (Codes C9c) without changing any existing field, and a heartbeat with no
+// fleet encodes exactly as before (the field is absent).
+func TestHeartbeatCarriesTheFleet(t *testing.T) {
+	used, limit := 96.0, 100.0
+	h := Heartbeat{Seq: 42, Fleet: []FleetAgent{
+		{Agent: "codex", Installed: true, SignedIn: true, Windows: []FleetWindow{
+			{Name: "week", Used: &used, Limit: &limit, ResetsAt: "2026-11-04T00:00:00Z"},
+		}},
+		{Agent: "opencode", Installed: true, SignedIn: false},
+	}}
+	b, err := Encode(42, 1738065600500, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := Decode(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := f.Msg.(Heartbeat)
+	if got.Seq != 42 || len(got.Fleet) != 2 || got.Fleet[0].Agent != "codex" || !got.Fleet[0].SignedIn ||
+		len(got.Fleet[0].Windows) != 1 || *got.Fleet[0].Windows[0].Used != 96 || got.Fleet[0].Windows[0].ResetsAt != "2026-11-04T00:00:00Z" ||
+		got.Fleet[1].Agent != "opencode" || got.Fleet[1].SignedIn {
+		t.Fatalf("heartbeat with fleet: %+v", got)
+	}
+	plain, err := Encode(7, 1, Heartbeat{Seq: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), `"fleet"`) {
+		t.Fatalf("an empty fleet is absent, not []: %s", plain)
+	}
+}
