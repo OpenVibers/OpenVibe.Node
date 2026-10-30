@@ -156,9 +156,9 @@ func (p *Prober) probe(parent context.Context) {
 // agents, at most MaxWindows windows each, a short label and reset time, and two finite numbers.
 func Parse(raw []byte) ([]protocol.FleetAgent, error) {
 	var rows []struct {
-		ID        string  `json:"id"`
-		Installed bool    `json:"installed"`
-		SignedIn  bool    `json:"signed_in"`
+		ID        string `json:"id"`
+		Installed bool   `json:"installed"`
+		SignedIn  bool   `json:"signed_in"`
 		Windows   []struct {
 			Name     string   `json:"name"`
 			Used     *float64 `json:"used"`
