@@ -151,6 +151,12 @@ type WorkerConfig struct {
 	// Media is where a job's inputs come from and a result over 256 KiB is uploaded to. Off (the default), a job
 	// naming inputs is refused and a result over 256 KiB ends the job limit.
 	Media MediaConfig `json:"media,omitzero"`
+	// PlanLogins are the owner's own coding-CLI login files (for example ~/.claude/.credentials.json,
+	// ~/.codex/auth.json, ~/.local/share/opencode/auth.json), copied read-only into a job's private home so a job may
+	// use the plan the owner signed in for. Off (the default): a job sees no credential of any kind until the owner
+	// names them here. Each is a path under the Node user's home; the copies live in that one job's home and go with
+	// it, and their content is never sent anywhere.
+	PlanLogins []string `json:"plan_logins,omitempty"`
 	// NodeDirs are the Node's own directories (config, credential, state, control socket), which no job may see; the
 	// Node sets them, the config file does not.
 	NodeDirs []string `json:"-"`
@@ -482,6 +488,9 @@ func (w WorkerConfig) validate() error {
 	default:
 		return fmt.Errorf("config: worker.egress %q is not none, public or openvibe-only", w.Egress)
 	}
+	if err := w.validatePlanLogins(); err != nil {
+		return err
+	}
 	for key, cidrs := range map[string][]string{"egress_allow": w.EgressAllow, "egress_deny": w.EgressDeny} {
 		for _, c := range cidrs {
 			if p, err := netip.ParsePrefix(c); err != nil || !p.Addr().Is4() || p != p.Masked() {
@@ -537,6 +546,32 @@ func (c *Config) PythonPath(paths Paths) string {
 
 // validateDNS checks worker.dns: at most three IPv4 resolvers (the most a resolv.conf is read for), only with a policy
 // that gives jobs a network, each public, and under openvibe-only inside egress_allow.
+// validatePlanLogins refuses a plan login that is not a plain path under the Node user's home: a job's copy is made
+// from it, so it must be a file the owner meant to share with their own jobs and nothing else.
+func (w WorkerConfig) validatePlanLogins() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		if len(w.PlanLogins) > 0 {
+			return fmt.Errorf("config: worker.plan_logins: the Node user's home is unknown: %w", err)
+		}
+		return nil
+	}
+	for _, p := range w.PlanLogins {
+		clean := filepath.Clean(p)
+		if !filepath.IsAbs(clean) {
+			return fmt.Errorf("config: worker.plan_logins %q must be an absolute path", p)
+		}
+		rel, err := filepath.Rel(home, clean)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("config: worker.plan_logins %q must be under the Node user's home (%s)", p, home)
+		}
+		if rel == "." {
+			return fmt.Errorf("config: worker.plan_logins %q must be a file, not the home itself", p)
+		}
+	}
+	return nil
+}
+
 func (w WorkerConfig) validateDNS() error {
 	if len(w.DNS) == 0 {
 		return nil

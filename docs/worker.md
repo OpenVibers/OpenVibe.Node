@@ -46,6 +46,7 @@ summary, the changed files and the patch; it never pushes to the branch it start
   "allow_same_user": false,
   "egress": "none",
   "dns": [],
+  "plan_logins": [],
   "media": {
     "enabled": false,
     "endpoint": "",
@@ -315,6 +316,24 @@ How `public` and `openvibe-only` are enforced (`internal/worker/egress_linux.go`
 - **`openvibe-only` is configured, not guessed.** No authoritative list of the OpenVibe network's ranges exists in
   this repository or OpenVibe.Contracts, so `egress_allow` must name them; without it the config does not load.
 
+### Plan logins (`worker.plan_logins`)
+
+A coding CLI signs in with a file in the owner's home: `~/.claude/.credentials.json`, `~/.codex/auth.json`,
+`~/.local/share/opencode/auth.json` and the like. A job that runs on the owner's machine wants the plan the owner
+signed in for, but a job is code from a task, so it may not read the owner's files, and the Node may not send a
+credential anywhere.
+
+So the owner names the files (`worker.plan_logins`, **off by default**: a job sees no credential of any kind until they
+do), and the Node copies each one into that one job's private home, **read-only** (mode `0400`: the job may read it,
+never change it), at the same path it has under the owner's home. The copy goes with the job: it is made in the job's
+own directory and disappears when the job ends. Its content is never logged, never uploaded and never part of a result.
+
+- **What may be named.** An absolute path under the Node user's home, and a plain file. A path outside the home, a
+  directory or a symlink is refused when the config loads.
+- **A file that is not there is skipped**, not an error: the CLI it belongs to is simply not signed in. A file that is
+  there but cannot be read, or is not a plain file, ends the job: a half-copied credential is worse than none.
+- **What the job sees.** `openvibe-codes logins` (the Codes job runner) reports each CLI as installed, signed in, and
+  with the limit windows its login file carries, and nothing else: no key, no token, no account name.
 ### Desks in the sandbox (`openvibe-node desk-sandbox`, Node v0.32.0)
 
 A desk host for other people (docs/computer.md, "Desk hosts for other people") runs each desk's browser in this same
