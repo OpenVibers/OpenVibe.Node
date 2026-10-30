@@ -11,6 +11,8 @@
 //	openvibe-node resume          release the local kill switch (and a server e-stop)
 //	openvibe-node quit            end the running node cleanly: every actuator stops, nothing is latched
 //	openvibe-node plugins         list plugins and their capabilities
+//	openvibe-node memory scan [--tools a,b] [--project DIR …] [--json]
+//	                              read the memory files of the coding tools (read-only, local)
 //	openvibe-node version
 package main
 
@@ -72,6 +74,9 @@ Usage:
   openvibe-node desk-sandbox [--memory-mb N] [--cpu-millis N] [--bind PATH]... [--egress public] -- PROGRAM [ARG]...
                     run one desk's browser confined (a desk host that serves other people; the computer plugin
                     calls it, with --remote-debugging-pipe on fds 3 and 4)
+  openvibe-node memory scan [--tools a,b] [--project DIR …] [--json]
+                    read the memory files of the coding tools on this machine
+                    (read-only, local, secrets removed)
   openvibe-node version
 
 Global flags (before or after the command):
@@ -101,6 +106,10 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		return 0
 	}
 	cmd, rest := args[0], args[1:]
+	if cmd == "memory" {
+		// The memory scan has its own flags, so it parses its own arguments.
+		return cmdMemory(rest, stdout, stderr)
+	}
 	if cmd == "desk-sandbox" { // its own flags, up to "--": a browser's flags after it are never the Node's
 		return cmdDeskSandbox(rest, stderr)
 	}

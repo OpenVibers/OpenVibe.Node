@@ -32,6 +32,7 @@ openvibe-node resume
 openvibe-node quit       # end the node cleanly (nothing latched), e.g. from a stream launcher
 openvibe-node approvals  # the computer plugin at level ask: what waits; approve <id> / deny <id>
 openvibe-node tray       # the same in your notification area, with Approve/Deny notifications (Linux, Windows)
+openvibe-node memory scan  # what your coding tools remember: read-only, local, secrets removed
 ```
 
 ## What is in here
@@ -70,7 +71,8 @@ job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.
 task on openvibe.codes/run from any browser and have this machine do it ([docs/worker.md](docs/worker.md)).
 
 Docs: [protocol](docs/protocol.md) (the wire format with OpenVibe.Bot), [plugins](docs/plugins.md) (the driver
-protocol, the bundled drivers, and where Actor's computer-control plugin attaches), [install](docs/install.md).
+protocol, the bundled drivers, and where Actor's computer-control plugin attaches), [install](docs/install.md),
+[memory](docs/memory.md) (what the coding tools on a machine remember, and how the Node reads it).
 Decisions: [ADR-043](docs/ADR-043-bot-devices-and-control.md).
 
 ## Development

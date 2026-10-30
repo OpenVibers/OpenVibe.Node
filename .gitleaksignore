@@ -1,0 +1,9 @@
+# The memory fixtures hold fake secrets on purpose: every adapter's fixture
+# carries one secret of a different shape, and the test proves none of them
+# reaches an item. The values are obviously fake (FAKE, EXAMPLE, repeated
+# letters) and exist only to be redacted.
+#
+# Each line is the exact fingerprint of a finding (file:rule:line).
+internal/memory/testdata/roo/project/.roo/rules/general.md:stripe-access-token:4
+internal/memory/testdata/copilot/project/.github/copilot-instructions.md:jwt:5
+internal/memory/testdata/windsurf/home/.codeium/windsurf/memories/preferences.md:private-key:7

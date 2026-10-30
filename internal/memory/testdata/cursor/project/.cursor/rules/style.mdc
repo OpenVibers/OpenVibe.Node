@@ -1,0 +1,11 @@
+---
+description: How we write code here
+globs: "**/*.go"
+alwaysApply: true
+---
+
+# Style
+
+- Error messages start lowercase
+- Comments explain why, not what
+- The Slack token for the alerts room is xoxb-0000000000000000FAKE

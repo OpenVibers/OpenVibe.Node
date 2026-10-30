@@ -1,0 +1,4 @@
+model: gpt-4o
+read:
+  - README.md
+  - docs/architecture.md
