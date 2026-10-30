@@ -69,6 +69,9 @@ type plan struct {
 	// inputs are the names of the files fetched into root, which the sandbox copies into the job's working directory
 	// before covering root with the private root.
 	inputs []string
+	// planLogins are the names (paths under the home) of the owner's plan logins staged in root, which the sandbox
+	// copies read-only into the job's working directory. Empty unless the owner named them (worker.plan_logins).
+	planLogins []string
 }
 
 // egressFor is the network policy a job runs under: the stricter of the net the job names and the host's worker.egress,
@@ -426,8 +429,14 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 		}
 		return never(protocol.ExitFailed, err)
 	}
+	// The owner's plan logins, staged for this job only: the copy goes with the job's directory and its content
+	// never leaves the machine.
+	planLogins, err := stagePlanLogins(w.cfg.PlanLogins, dir)
+	if err != nil {
+		return never(protocol.ExitFailed, err)
+	}
 	if r := w.cfg.RunAs; r != nil {
-		for _, p := range append([]string{"."}, inputs...) { // the job's user reads its inputs to copy them
+		for _, p := range append(append([]string{"."}, inputs...), planLogins...) { // the job's user reads its inputs to copy them
 			if err := os.Chown(filepath.Join(dir, p), int(r.UID), int(r.GID)); err != nil {
 				return never(protocol.ExitFailed, err)
 			}
@@ -452,7 +461,7 @@ func (w *Worker) execute(jb *job) protocol.JobExit {
 	cmd.Stdin = bytes.NewReader(append(append([]byte(nil), jb.req.Args...), '\n'))
 	cmd.Stdout, cmd.ExtraFiles = outW, []*os.File{resW}
 	egress, _ := egressFor(w.cfg.Egress, jb.req.Net) // Admit refused what the host cannot enforce
-	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits, egress: egress, inputs: inputs})
+	sb, err := w.isolate(cmd, w.cfg, plan{root: dir, fn: jb.fn, limits: jb.limits, egress: egress, inputs: inputs, planLogins: planLogins})
 	if err != nil {
 		outW.Close()
 		resW.Close()

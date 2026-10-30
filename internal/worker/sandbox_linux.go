@@ -45,6 +45,8 @@ type sandboxSpec struct {
 	Disk int64  `json:"disk"` // the size of the job's /tmp, and the most its artifact's copy may take
 	// Inputs are the files the Node fetched into Root, copied into Work before the private root covers them.
 	Inputs []string   `json:"inputs,omitempty"`
+	// PlanLogins are the owner's plan logins staged in Root (paths under the home), copied read-only into Work.
+	PlanLogins []string `json:"plan_logins,omitempty"`
 	Binds  []bindSpec `json:"binds"`
 	// Artifact is where the copy of the artifact directory open on artifactFD goes (its host path); "" for none.
 	Artifact string     `json:"artifact,omitempty"`
@@ -133,7 +135,7 @@ func enterSandbox() error {
 	r := s.Root
 	// Root itself, before the private root is mounted on it: the job's inputs lie there.
 	var inputs *os.File
-	if len(s.Inputs) > 0 {
+	if len(s.Inputs) > 0 || len(s.PlanLogins) > 0 {
 		if inputs, err = os.Open(r); err != nil {
 			return step("opening the job's inputs", err)
 		}
@@ -157,6 +159,9 @@ func enterSandbox() error {
 		return err
 	}
 	if err := step("copying the job's inputs", copyInputs(inputs, r+s.Work, s.Inputs)); err != nil {
+		return err
+	}
+	if err := step("copying the plan logins", copyPlanLogins(inputs, r+s.Work, s.PlanLogins)); err != nil {
 		return err
 	}
 	for _, b := range s.Binds {
