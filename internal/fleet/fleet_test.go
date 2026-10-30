@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -66,13 +67,48 @@ func TestParseIsBounded(t *testing.T) {
 	}
 }
 
-func TestProberReadsTheRunnerAndKeepsItsLastAnswer(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "probe.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho '[{\"id\":\"codex\",\"installed\":true,\"signed_in\":true,\"windows\":[{\"name\":\"week\",\"used\":10,\"limit\":100,\"resets_at\":\"2026-11-04T00:00:00Z\"}]}]'\n"), 0o755); err != nil {
-		t.Fatal(err)
+// The probe runs a command; the tests run the test binary itself with a mode in the environment, the way the Go
+// standard library does it, so the test says the same thing on every platform (a shell script is no Windows).
+const helperEnv = "CODES_FLEET_HELPER"
+const helperCountEnv = "CODES_FLEET_HELPER_COUNT"
+
+// TestFleetHelperProcess is the probe the tests below run: it is not a test of its own.
+func TestFleetHelperProcess(t *testing.T) {
+	mode := os.Getenv(helperEnv)
+	if mode == "" {
+		return
 	}
-	p := New(Options{Command: []string{"/bin/sh", script}, Log: quiet()})
+	switch mode {
+	case "ok":
+		fmt.Fprint(os.Stdout, `[{"id":"codex","installed":true,"signed_in":true,"windows":[{"name":"week","used":10,"limit":100,"resets_at":"2026-11-04T00:00:00Z"}]}]`)
+	case "empty":
+		fmt.Fprint(os.Stdout, `[]`)
+	case "bad":
+		fmt.Fprint(os.Stdout, "not json")
+	case "count":
+		if path := os.Getenv(helperCountEnv); path != "" {
+			if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+				fmt.Fprintln(f, "x")
+				f.Close()
+			}
+		}
+		fmt.Fprint(os.Stdout, `[]`)
+	}
+	os.Exit(0)
+}
+
+// The probe command: this test binary, asked for the helper.
+func helperCommand() []string { return []string{os.Args[0], "-test.run=TestFleetHelperProcess"} }
+
+// withHelper sets the mode the helper answers with, for the time of one test.
+func withHelper(t *testing.T, mode string) {
+	t.Helper()
+	t.Setenv(helperEnv, mode)
+}
+
+func TestProberReadsTheRunnerAndKeepsItsLastAnswer(t *testing.T) {
+	withHelper(t, "ok")
+	p := New(Options{Command: helperCommand(), Log: quiet()})
 	if got := p.Latest(); got != nil {
 		t.Fatalf("nothing is reported before the first probe: %+v", got)
 	}
@@ -85,16 +121,16 @@ func TestProberReadsTheRunnerAndKeepsItsLastAnswer(t *testing.T) {
 		t.Fatal("the reading has a time")
 	}
 
-	// A probe that fails keeps the last reading rather than reporting an empty machine.
-	broken := New(Options{Command: []string{"/bin/sh", "-c", "exit 3"}, Log: quiet()})
-	if err := os.WriteFile(filepath.Join(dir, "bad.sh"), []byte("#!/bin/sh\necho 'not json'\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	p.opt.Command = []string{"/bin/sh", filepath.Join(dir, "bad.sh")}
+	// A probe that answers something else keeps the last reading rather than reporting an empty machine.
+	withHelper(t, "bad")
 	p.probe(context.Background())
 	if got := p.Latest(); len(got) != 1 {
 		t.Fatalf("the last reading stands: %+v", got)
 	}
+
+	// A machine that never answered reports nothing.
+	withHelper(t, "bad")
+	broken := New(Options{Command: helperCommand(), Log: quiet()})
 	broken.probe(context.Background())
 	if got := broken.Latest(); got != nil {
 		t.Fatalf("a machine that never answered reports nothing: %+v", got)
@@ -102,14 +138,10 @@ func TestProberReadsTheRunnerAndKeepsItsLastAnswer(t *testing.T) {
 }
 
 func TestRunProbesAgainOnItsInterval(t *testing.T) {
-	dir := t.TempDir()
-	count := filepath.Join(dir, "count")
-	script := filepath.Join(dir, "probe.sh")
-	src := "#!/bin/sh\necho x >> " + count + "\necho '[]'\n"
-	if err := os.WriteFile(script, []byte(src), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	p := New(Options{Command: []string{"/bin/sh", script}, Interval: 20 * time.Millisecond, Log: quiet()})
+	count := filepath.Join(t.TempDir(), "count")
+	t.Setenv(helperCountEnv, count)
+	withHelper(t, "count")
+	p := New(Options{Command: helperCommand(), Interval: 20 * time.Millisecond, Log: quiet()})
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	p.Run(ctx)
