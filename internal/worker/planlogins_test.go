@@ -40,7 +40,8 @@ func TestPlanLoginsAreCopiedReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("staging: %v", err)
 	}
-	if len(names) != 1 || names[0] != ".claude/.credentials.json" {
+	// The name is the path under the home, so it is written the way this platform writes paths.
+	if len(names) != 1 || names[0] != filepath.Join(".claude", ".credentials.json") {
 		t.Fatalf("staged %v", names)
 	}
 	staged := filepath.Join(root, names[0])
