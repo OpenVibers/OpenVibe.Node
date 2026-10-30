@@ -44,10 +44,10 @@ type sandboxSpec struct {
 	Work string `json:"work"` // the working directory, inside the private root
 	Disk int64  `json:"disk"` // the size of the job's /tmp, and the most its artifact's copy may take
 	// Inputs are the files the Node fetched into Root, copied into Work before the private root covers them.
-	Inputs []string   `json:"inputs,omitempty"`
+	Inputs []string `json:"inputs,omitempty"`
 	// PlanLogins are the owner's plan logins staged in Root (paths under the home), copied read-only into Work.
-	PlanLogins []string `json:"plan_logins,omitempty"`
-	Binds  []bindSpec `json:"binds"`
+	PlanLogins []string   `json:"plan_logins,omitempty"`
+	Binds      []bindSpec `json:"binds"`
 	// Artifact is where the copy of the artifact directory open on artifactFD goes (its host path); "" for none.
 	Artifact string     `json:"artifact,omitempty"`
 	Links    []linkSpec `json:"links"`
