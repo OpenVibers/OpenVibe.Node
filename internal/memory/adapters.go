@@ -56,6 +56,18 @@ func parseMarkdown(opts parseOptions, path string, data []byte) []Item {
 			return nil
 		}
 	}
+	// The frontmatter is read, not turned into items, but its values may hold
+	// a secret: they are scrubbed before any of them is used. The sentinel
+	// marker is used here too, so that a secret in the frontmatter is still
+	// counted on the item that carries it.
+	for k, v := range fm {
+		fm[k], _ = redactWith(v, secretMark)
+	}
+	// The whole body is scrubbed before it is split into items. A secret that
+	// spans two items (a key in a fenced block, an .env block) is only seen
+	// here. The marker is a sentinel, so that each item can still say how
+	// many secrets it holds.
+	body, _ = redactWith(body, secretMark)
 	var fileKind Kind
 	if opts.kindFromType {
 		fileKind = kindFromType(fm)
@@ -70,12 +82,21 @@ func parseMarkdown(opts parseOptions, path string, data []byte) []Item {
 			// person wrote for the tool.
 			heading = fm["description"]
 		}
-		text, count := Redact(text)
-		if count > 0 && onlySecret(stripListMarker(text)) {
+		// The body was scrubbed before it was split, so the secrets it held
+		// are already marked: the item counts them.
+		count := strings.Count(text, secretMark) + strings.Count(heading, secretMark)
+		text = strings.ReplaceAll(text, secretMark, Redacted)
+		heading = strings.ReplaceAll(heading, secretMark, Redacted)
+		// The item is scrubbed again on its own: cheap, and it catches a
+		// secret that only appears once the body is split.
+		var more int
+		text, more = Redact(text)
+		heading, hmore := Redact(heading)
+		count += more + hmore
+		if onlySecret(stripListMarker(text)) {
 			// The item was nothing but a secret: it is dropped.
 			continue
 		}
-		heading, _ = Redact(heading)
 		kind := fileKind
 		if kind == "" {
 			// The heading of the section gives the kind; when it says

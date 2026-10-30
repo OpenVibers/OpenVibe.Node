@@ -101,25 +101,57 @@ project's rules.
 
 ## The secrets
 
-Every item is scrubbed before it leaves the parser. The patterns are the ones
-of OpenVibe.Codes' harness (`harness/events.js`, `SECRET_PATTERNS`) plus the
-common gitleaks shapes:
+Nothing leaves the parser without being scrubbed first. The scrubbing runs over
+the **whole file body before it is split into items**, and again over every
+item. A secret that spans two items — a key block whose BEGIN and END lines
+land in different items, an `.env` block in a fence — is only seen by the
+whole-file pass. The frontmatter is scrubbed too, before any of its values is
+used: a `description` becomes the heading of the item.
+
+The patterns are the ones of OpenVibe.Codes' harness (`harness/events.js`,
+`SECRET_PATTERNS`) plus the common gitleaks shapes and the shapes that turn up
+in a person's own files:
 
 - OpenAI- and Anthropic-style keys (`sk-…`), Stripe keys (`sk_live_…`);
-- GitHub tokens (`ghp_…`, `gho_…`, `github_pat_…`);
+- GitHub tokens (`ghp_…`, `gho_…`, `github_pat_…`), GitLab (`glpat-…`);
 - AWS keys (`AKIA…`, `ASIA…`) and `aws_secret_access_key`;
-- Slack tokens (`xoxb-…`);
+- Slack tokens (`xoxb-…`) and Slack app tokens (`xapp-…`);
+- Google (`AIza…`), npm (`npm_…`), Hugging Face (`hf_…`), SendGrid
+  (`SG.….…`), Telegram and Discord bot tokens, Twilio keys;
 - JWTs;
-- PEM private keys;
-- `password=`, `token=`, `secret=`, `api_key=` assignments;
+- **every PEM private key form** — RSA, EC, DSA, OPENSSH, PGP and ENCRYPTED —
+  from `-----BEGIN … PRIVATE KEY …-----` to its END line. A key block with
+  **no END line** (a truncated file, a cut paste) is redacted from its BEGIN
+  line to the end of its fenced block, or to the end of the text when it is
+  not in a fence;
+- **env-style assignments**: a name of `[A-Za-z0-9_.-]*` that ends in
+  `password`, `passwd`, `pwd`, `passphrase`, `secret`, `token`, `api_key`,
+  `apikey`, `api-key`, `access_key`, `private_key`, `client_secret`, `auth`,
+  `credential`, `credentials`, `cookie` or `session`, followed by `=`, `:` or
+  `=>` and a value. The name and the separator stay, the value goes; a quoted
+  value keeps its quotes;
+- **prose**: "the password is …", "the passphrase was …";
+- **headers**: `Authorization: Bearer …`, `Authorization: Basic …`,
+  `x-api-key: …`, and a bare `Bearer …`;
+- **webhook URLs** of Slack and Discord, whole;
+- **card numbers**: 13 to 19 digits, with spaces or dashes, that pass the Luhn
+  check. A long number that does not pass it stays: an order number is not a
+  card;
 - connection strings that carry a password.
 
 Each match becomes `[redacted]`. The item is marked `redacted` and keeps a
 count of how many secrets were removed; the values are never kept. An item
 that held nothing but a secret is dropped.
 
+Over-redaction is preferred over a leak: a harmless `max_tokens: 100000` is
+redacted too. It stays bounded — "use 4 spaces for indentation", "the build
+takes 12 minutes" and a 10-digit number that fails the Luhn check are left
+alone.
+
 Every adapter's fixture in `internal/memory/testdata` holds one secret of a
-different shape, and the test proves that none of them reaches an item.
+different shape, and the test proves that none of them reaches an item. The
+Claude Code fixture holds more: a key block split over two items, a key block
+with no END line, and an `.env` block.
 
 ## The JSON
 
