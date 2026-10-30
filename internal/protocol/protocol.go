@@ -654,10 +654,32 @@ type Nack struct {
 // Heartbeat is sent every config.heartbeat_ms. Seq mirrors the envelope seq for older servers that echo it; T is the
 // device's send time (unix ms), which Bot echoes back as heartbeat_ack.t/echo and the Node measures RTT from. RTTMS is
 // the last measured round trip, absent until one has been measured (a measured 0 ms is still sent, hence the pointer).
+//
+// Fleet is what this machine's coding agents report (Codes C9c): installed, signed in, and their plan windows. It is
+// sent with the heartbeat — refreshed every fleet.Interval, not every second — so Bot keeps the last reading per machine
+// and Codes can route a task away from an agent whose window is full. Labels, numbers and times only: never a key, a
+// token or an account name (the Codes runner's own `logins` probe).
 type Heartbeat struct {
-	Seq   uint64 `json:"seq"`
-	T     int64  `json:"t,omitempty"`
-	RTTMS *int64 `json:"rtt_ms,omitempty"`
+	Seq   uint64       `json:"seq"`
+	T     int64        `json:"t,omitempty"`
+	RTTMS *int64       `json:"rtt_ms,omitempty"`
+	Fleet []FleetAgent `json:"fleet,omitempty"`
+}
+
+// FleetAgent is one coding agent on the machine, as its CLI's own login file reports it.
+type FleetAgent struct {
+	Agent     string        `json:"agent"` // the OpenVibe.Codes harness id (codex, opencode, command-code, …)
+	Installed bool          `json:"installed"`
+	SignedIn  bool          `json:"signed_in"`
+	Windows   []FleetWindow `json:"windows,omitempty"`
+}
+
+// FleetWindow is one limit window: a label, what it has used of its limit, and when it frees.
+type FleetWindow struct {
+	Name     string   `json:"name"`
+	Used     *float64 `json:"used,omitempty"`
+	Limit    *float64 `json:"limit,omitempty"`
+	ResetsAt string   `json:"resets_at,omitempty"` // RFC 3339, as the provider's login file carries it
 }
 
 // Reauth carries a fresh node token for the same principal; Bot closes the socket with 4002 when none arrives within
