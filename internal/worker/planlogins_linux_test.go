@@ -12,7 +12,7 @@ import (
 
 func TestPlanLoginsAreCopiedIntoTheJobHome(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	src := filepath.Join(home, ".codex", "auth.json")
 	if err := os.MkdirAll(filepath.Dir(src), 0o700); err != nil {
 		t.Fatal(err)

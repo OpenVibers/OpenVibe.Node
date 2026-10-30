@@ -13,6 +13,8 @@ func TestWorkerPlanLogins(t *testing.T) {
 	if err != nil {
 		t.Skip("no home directory")
 	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	ok := []WorkerConfig{{}, {PlanLogins: []string{filepath.Join(home, ".claude", ".credentials.json")}},
 		{PlanLogins: []string{filepath.Join(home, ".codex", "auth.json"), filepath.Join(home, ".local", "share", "opencode", "auth.json")}}}
 	for _, w := range ok {

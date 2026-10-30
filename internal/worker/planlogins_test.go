@@ -8,6 +8,12 @@ import (
 
 // The plan logins: the copy, the read-only mode, the cleanup and the opt-in.
 
+// setHome points the Node user's home at dir: os.UserHomeDir reads HOME on Linux and macOS, USERPROFILE on Windows.
+func setHome(t *testing.T, dir string) {
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+}
+
 func TestPlanLoginsAreOptIn(t *testing.T) {
 	// Off by default: nothing is staged, so a job sees no credential of any kind.
 	names, err := stagePlanLogins(nil, t.TempDir())
@@ -21,7 +27,7 @@ func TestPlanLoginsAreOptIn(t *testing.T) {
 
 func TestPlanLoginsAreCopiedReadOnly(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	src := filepath.Join(home, ".claude", ".credentials.json")
 	if err := os.MkdirAll(filepath.Dir(src), 0o700); err != nil {
 		t.Fatal(err)
@@ -60,7 +66,7 @@ func TestPlanLoginsAreCopiedReadOnly(t *testing.T) {
 
 func TestPlanLoginMissingIsSkipped(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	root := t.TempDir()
 	// A CLI that is not signed in has no file: that is not an error, the job simply is not signed in.
 	names, err := stagePlanLogins([]string{filepath.Join(home, ".codex", "auth.json")}, root)
@@ -74,7 +80,7 @@ func TestPlanLoginMissingIsSkipped(t *testing.T) {
 
 func TestPlanLoginOutsideHomeIsRefused(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	root := t.TempDir()
 	outside := filepath.Join(t.TempDir(), "auth.json")
 	if err := os.WriteFile(outside, []byte("{}"), 0o600); err != nil {
