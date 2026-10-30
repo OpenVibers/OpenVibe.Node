@@ -100,8 +100,9 @@ SETUP="${OPENVIBE_SETUP_KEY:-}"
 # The OpenVibe.Codes release whose `openvibe-codes job` the worker runs (protocol openvibe-codes@1.0.0; v0.5.0 prints job
 # lines 1.1: each step's input, output while it runs and result, so the task page on openvibe.codes shows the session;
 # and it runs every harness the private portal runs, with the argv and the environment the portal learned. v0.5.1 adds
-# the portal's limits and turn-cap continuation, the single continuation, and the Know store's lessons).
-CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.5.1}"
+# the portal's limits and turn-cap continuation, the single continuation, and the Know store's lessons. v0.5.2 adds the
+# conductor's turn: the `conductor` job kind, and the `openvibe-codes mcp` server it starts with the person's folder).
+CODES_VERSION="${OPENVIBE_CODES_VERSION:-v0.5.2}"
 CODES_DIR=/opt/openvibe-codes
 
 usage() {
