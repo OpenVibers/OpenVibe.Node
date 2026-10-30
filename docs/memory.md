@@ -39,7 +39,7 @@ No project given: only the user-level files were read.
 Claude Code (claude-code) — 3 items
   docs: https://code.claude.com/docs/en/memory
   - /home/you/.claude/CLAUDE.md: 3 items
-  - /home/you/.claude/rules: not there
+  - /home/you/.claude/rules/**/*.md: not there
 ...
 ```
 
@@ -139,7 +139,7 @@ different shape, and the test proves that none of them reaches an item.
           "items": 3
         },
         {
-          "path": "/home/you/.claude/rules",
+          "path": "/home/you/.claude/rules/**/*.md",
           "found": false
         }
       ],
