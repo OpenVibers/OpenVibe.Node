@@ -5,8 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -15,16 +13,25 @@ import (
 
 // memoryUsage is what "openvibe-node memory" prints.
 const memoryUsage = "openvibe-node memory scan [--tools a,b] [--project DIR] [--json]\n" +
+	"openvibe-node memory upload [--tools a,b] [--project DIR …] [--dry-run] [--yes]\n" +
+	"openvibe-node memory status [--show]\n" +
 	"\n" +
-	"  Reads the memory files of the coding tools on this machine and prints what it\n" +
-	"  found. It is read-only and local: nothing is written and nothing is sent\n" +
-	"  anywhere. Secrets are removed before anything is printed.\n" +
+	"  scan    reads the memory files of the coding tools on this machine and\n" +
+	"          prints what it found. It is read-only and local: nothing is written\n" +
+	"          and nothing is sent anywhere. Secrets are removed before anything is\n" +
+	"          printed.\n" +
+	"  upload  sends the items to your own memory store (OpenVibe.AI). It shows\n" +
+	"          what would leave the machine and asks before it sends anything.\n" +
+	"  status  shows what your own memory store holds.\n" +
 	"\n" +
 	"  --tools a,b      only these adapters (claude-code, agents, gemini, cursor,\n" +
 	"                   copilot, windsurf, cline, roo, kiro, continue, aider,\n" +
 	"                   command-code, opencode)\n" +
 	"  --project DIR    read this project as well; may be given more than once\n" +
-	"  --json           print the items as JSON\n" +
+	"  --json           print the items as JSON (scan)\n" +
+	"  --dry-run        print the summary and send nothing (upload)\n" +
+	"  --yes            do not ask before sending (upload)\n" +
+	"  --show           print the items themselves (status)\n" +
 	"  --user-home DIR  read this directory as the person's home (default: yours)\n"
 
 // stringList is a flag that may be given more than once.
@@ -43,8 +50,18 @@ func (s *stringList) Set(v string) error {
 }
 
 // cmdMemory runs the memory commands.
-func cmdMemory(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "scan" {
+func cmdMemory(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, memoryUsage)
+		return 2
+	}
+	switch args[0] {
+	case "upload":
+		return cmdMemoryUpload(args[1:], stdin, stdout, stderr)
+	case "status":
+		return cmdMemoryStatus(args[1:], stdout, stderr)
+	case "scan":
+	default:
 		fmt.Fprint(stderr, memoryUsage)
 		return 2
 	}
@@ -65,22 +82,12 @@ func cmdMemory(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, memoryUsage)
 		return 2
 	}
-	home := *userHome
-	if home == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintln(stderr, "error: cannot find your home directory; pass --user-home")
-			return 1
-		}
-		home = h
-	}
-	abs, err := filepath.Abs(home)
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
+	home, code := memoryHome(*userHome, stderr)
+	if code != 0 {
+		return code
 	}
 	res := memory.Scan(memory.Options{
-		Home:     abs,
+		Home:     home,
 		Projects: projects,
 		Tools:    tools,
 	})

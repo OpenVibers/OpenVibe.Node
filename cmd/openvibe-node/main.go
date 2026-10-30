@@ -108,7 +108,7 @@ func runWithStdin(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	cmd, rest := args[0], args[1:]
 	if cmd == "memory" {
 		// The memory scan has its own flags, so it parses its own arguments.
-		return cmdMemory(rest, stdout, stderr)
+		return cmdMemory(rest, stdin, stdout, stderr)
 	}
 	if cmd == "desk-sandbox" { // its own flags, up to "--": a browser's flags after it are never the Node's
 		return cmdDeskSandbox(rest, stderr)
