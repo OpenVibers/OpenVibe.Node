@@ -44,7 +44,7 @@ func memoryFixture(t *testing.T) string {
 func TestMemoryScanPrintsEveryAdapter(t *testing.T) {
 	home := memoryFixture(t)
 	var stdout, stderr bytes.Buffer
-	code := cmdMemory([]string{"scan", "--user-home", home}, &stdout, &stderr)
+	code := cmdMemory([]string{"scan", "--user-home", home}, strings.NewReader(""), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("the scan failed with %d: %s", code, stderr.String())
 	}
@@ -79,7 +79,7 @@ func TestMemoryScanPrintsEveryAdapter(t *testing.T) {
 func TestMemoryScanJSON(t *testing.T) {
 	home := memoryFixture(t)
 	var stdout, stderr bytes.Buffer
-	code := cmdMemory([]string{"scan", "--user-home", home, "--json"}, &stdout, &stderr)
+	code := cmdMemory([]string{"scan", "--user-home", home, "--json"}, strings.NewReader(""), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("the scan failed with %d: %s", code, stderr.String())
 	}
@@ -112,7 +112,7 @@ func TestMemoryScanJSON(t *testing.T) {
 func TestMemoryScanToolsFilter(t *testing.T) {
 	home := memoryFixture(t)
 	var stdout, stderr bytes.Buffer
-	code := cmdMemory([]string{"scan", "--user-home", home, "--tools", "cursor", "--json"}, &stdout, &stderr)
+	code := cmdMemory([]string{"scan", "--user-home", home, "--tools", "cursor", "--json"}, strings.NewReader(""), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("the scan failed with %d: %s", code, stderr.String())
 	}
@@ -124,7 +124,7 @@ func TestMemoryScanToolsFilter(t *testing.T) {
 // TestMemoryScanUsage checks that a wrong use says how to use it.
 func TestMemoryScanUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := cmdMemory([]string{"list"}, &stdout, &stderr); code != 2 {
+	if code := cmdMemory([]string{"list"}, strings.NewReader(""), &stdout, &stderr); code != 2 {
 		t.Errorf("the command returned %d, want 2", code)
 	}
 	if !strings.Contains(stderr.String(), "memory scan") {
@@ -137,7 +137,7 @@ func TestMemoryScanIsReadOnly(t *testing.T) {
 	home := memoryFixture(t)
 	before := fixtureState(t, home)
 	var stdout, stderr bytes.Buffer
-	if code := cmdMemory([]string{"scan", "--user-home", home}, &stdout, &stderr); code != 0 {
+	if code := cmdMemory([]string{"scan", "--user-home", home}, strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("the scan failed with %d: %s", code, stderr.String())
 	}
 	after := fixtureState(t, home)
