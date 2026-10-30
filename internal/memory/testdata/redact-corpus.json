@@ -1,0 +1,550 @@
+{
+  "from": "openvibe-sdk v0.75.0",
+  "cases": [
+    {
+      "name": "pem rsa",
+      "in": "the deploy key is\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtESTKEYONLYFAKEFIXTURE\n-----END RSA PRIVATE KEY-----\nand the deploy works",
+      "mustNotContain": [
+        "PRIVATE KEY",
+        "MIIEowIBAAKCAQEAtESTKEYONLYFAKEFIXTURE"
+      ],
+      "mustContain": [
+        "the deploy key is",
+        "and the deploy works"
+      ]
+    },
+    {
+      "name": "pem ec",
+      "in": "the key is -----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n-----END EC PRIVATE KEY-----\nin the vault",
+      "mustNotContain": [
+        "PRIVATE KEY",
+        "MHcCAQEEIBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+      ],
+      "mustContain": [
+        "the key is",
+        "in the vault"
+      ]
+    },
+    {
+      "name": "pem openssh",
+      "in": "the key is -----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n-----END OPENSSH PRIVATE KEY-----\nin the vault",
+      "mustNotContain": [
+        "PRIVATE KEY",
+        "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"
+      ],
+      "mustContain": [
+        "the key is",
+        "in the vault"
+      ]
+    },
+    {
+      "name": "pem pgp",
+      "in": "the key is -----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBFc0OaJBCFAVvJ0lhbXVsC\n-----END PGP PRIVATE KEY BLOCK-----\nin the vault",
+      "mustNotContain": [
+        "PRIVATE KEY",
+        "lQOYBFc0OaJBCFAVvJ0lhbXVsC"
+      ],
+      "mustContain": [
+        "the key is",
+        "in the vault"
+      ]
+    },
+    {
+      "name": "pem encrypted",
+      "in": "the key is -----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIEowIBAAKCAQEAtESTKEYONLYFAKEFIXTURE\n-----END ENCRYPTED PRIVATE KEY-----\nin the vault",
+      "mustNotContain": [
+        "PRIVATE KEY",
+        "MIIEowIBAAKCAQEAtESTKEYONLYFAKEFIXTURE"
+      ],
+      "mustContain": [
+        "the key is",
+        "in the vault"
+      ]
+    },
+    {
+      "name": "env assignment",
+      "in": "the line is DATABASE_PASSWORD=hunter2xyz in the file",
+      "mustNotContain": [
+        "hunter2xyz"
+      ],
+      "mustContain": [
+        "DATABASE_PASSWORD=",
+        "in the file"
+      ]
+    },
+    {
+      "name": "env assignment with a dot in the name",
+      "in": "the line is MY.SECRET=abcdefghijkl in the file",
+      "mustNotContain": [
+        "abcdefghijkl"
+      ],
+      "mustContain": [
+        "MY.SECRET=",
+        "in the file"
+      ]
+    },
+    {
+      "name": "env assignment with a colon",
+      "in": "the line is api_key: abcdefghijklmnop in the file",
+      "mustNotContain": [
+        "abcdefghijklmnop"
+      ],
+      "mustContain": [
+        "api_key:",
+        "in the file"
+      ]
+    },
+    {
+      "name": "env assignment with an arrow",
+      "in": "the line is access_key => abcdefghijklmnop in the file",
+      "mustNotContain": [
+        "abcdefghijklmnop"
+      ],
+      "mustContain": [
+        "access_key =>",
+        "in the file"
+      ]
+    },
+    {
+      "name": "env assignment quoted",
+      "in": "the line is password: \"correct horse battery staple\" in the file",
+      "mustNotContain": [
+        "correct horse battery staple"
+      ],
+      "mustContain": [
+        "password:",
+        "in the file"
+      ]
+    },
+    {
+      "name": "env assignment single quoted",
+      "in": "the line is client_secret: 'correct horse battery staple' in the file",
+      "mustNotContain": [
+        "correct horse battery staple"
+      ],
+      "mustContain": [
+        "client_secret:",
+        "in the file"
+      ]
+    },
+    {
+      "name": "env assignment with a plural name",
+      "in": "the line is max_tokens: 100000 in the file",
+      "mustNotContain": [
+        "100000"
+      ],
+      "mustContain": [
+        "max_tokens:",
+        "in the file"
+      ]
+    },
+    {
+      "name": "prose",
+      "in": "the password is hunter2xyz and it must not be shown",
+      "mustNotContain": [
+        "hunter2xyz"
+      ],
+      "mustContain": [
+        "the password is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "prose with was",
+      "in": "the passphrase was correcthorsebattery and it must not be shown",
+      "mustNotContain": [
+        "correcthorsebattery"
+      ],
+      "mustContain": [
+        "the passphrase was",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "authorization bearer",
+      "in": "the header is Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345 and it must not be shown",
+      "mustNotContain": [
+        "abcdefghijklmnopqrstuvwxyz012345"
+      ],
+      "mustContain": [
+        "Authorization: Bearer",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "authorization basic",
+      "in": "the header is Authorization: Basic ZGVtbzpwYXNzd29yZA== and it must not be shown",
+      "mustNotContain": [
+        "ZGVtbzpwYXNzd29yZA=="
+      ],
+      "mustContain": [
+        "Authorization: Basic",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "x api key",
+      "in": "the header is x-api-key: abcdefghijklmnopqrst and it must not be shown",
+      "mustNotContain": [
+        "abcdefghijklmnopqrst"
+      ],
+      "mustContain": [
+        "x-api-key:",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "bare bearer",
+      "in": "the header is Bearer abcdefghijklmnopqrstuvwxyz012345 and it must not be shown",
+      "mustNotContain": [
+        "abcdefghijklmnopqrstuvwxyz012345"
+      ],
+      "mustContain": [
+        "Bearer",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "google api key",
+      "in": "the key is AIzaBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB and it must not be shown",
+      "mustNotContain": [
+        "AIzaBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "gitlab token",
+      "in": "the token is glpat-cccccccccccccccccccc and it must not be shown",
+      "mustNotContain": [
+        "glpat-cccccccccccccccccccc"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "npm token",
+      "in": "the token is npm_dddddddddddddddddddddddddddddddddddd and it must not be shown",
+      "mustNotContain": [
+        "npm_dddddddddddddddddddddddddddddddddddd"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "hugging face token",
+      "in": "the token is hf_eeeeeeeeeeeeeeeeeeeeeeeeeeeeee and it must not be shown",
+      "mustNotContain": [
+        "hf_eeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "sendgrid key",
+      "in": "the key is SG.ffffffffffffffffffff.gggggggggggggggggggg and it must not be shown",
+      "mustNotContain": [
+        "SG.ffffffffffffffffffff.gggggggggggggggggggg"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "telegram bot token",
+      "in": "the token is 123456789:hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh and it must not be shown",
+      "mustNotContain": [
+        "123456789:hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "discord bot token",
+      "in": "the token is Miiiiiiiiiiiiiiiiiiiiiii.jjjjjj.kkkkkkkkkkkkkkkkkkkkkkkkkkk and it must not be shown",
+      "mustNotContain": [
+        "Miiiiiiiiiiiiiiiiiiiiiii.jjjjjj.kkkkkkkkkkkkkkkkkkkkkkkkkkk"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "twilio key",
+      "in": "the key is SK1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a and it must not be shown",
+      "mustNotContain": [
+        "SK1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "slack app token",
+      "in": "the token is xapp-llllllllll and it must not be shown",
+      "mustNotContain": [
+        "xapp-llllllllll"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "openvibe token",
+      "in": "the token is hbt_mmmmmmmmmmmmmmmm and it must not be shown",
+      "mustNotContain": [
+        "hbt_mmmmmmmmmmmmmmmm"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "phoenix grove key",
+      "in": "the key is pgsk_nnnnnnnnnnnnnnnn and it must not be shown",
+      "mustNotContain": [
+        "pgsk_nnnnnnnnnnnnnnnn"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "slack webhook",
+      "in": "the hook is https://hooks.slack.com/services/T0000/B0000/XXXXXXXXXXXXXXXXXXXXXXXX and it must not be shown",
+      "mustNotContain": [
+        "https://hooks.slack.com/services/T0000/B0000/XXXXXXXXXXXXXXXXXXXXXXXX"
+      ],
+      "mustContain": [
+        "the hook is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "discord webhook",
+      "in": "the hook is https://discord.com/api/webhooks/1234/abcdefghijklmnop and it must not be shown",
+      "mustNotContain": [
+        "https://discord.com/api/webhooks/1234/abcdefghijklmnop"
+      ],
+      "mustContain": [
+        "the hook is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "card number",
+      "in": "the card is 4111111111111111 and it must not be shown",
+      "mustNotContain": [
+        "4111111111111111"
+      ],
+      "mustContain": [
+        "the card is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "card number with spaces",
+      "in": "the card is 4111 1111 1111 1111 and it must not be shown",
+      "mustNotContain": [
+        "4111 1111 1111 1111"
+      ],
+      "mustContain": [
+        "the card is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "aws key",
+      "in": "the key is AKIAIOSFODNN7EXAMPLE and it must not be shown",
+      "mustNotContain": [
+        "AKIAIOSFODNN7EXAMPLE"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "github token",
+      "in": "the token is ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA and it must not be shown",
+      "mustNotContain": [
+        "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "github fine grained token",
+      "in": "the token is github_pat_11AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA and it must not be shown",
+      "mustNotContain": [
+        "github_pat_11AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "jwt",
+      "in": "the token is eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U and it must not be shown",
+      "mustNotContain": [
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "openai key",
+      "in": "the key is sk-proj-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 and it must not be shown",
+      "mustNotContain": [
+        "sk-proj-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "anthropic key",
+      "in": "the key is sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB and it must not be shown",
+      "mustNotContain": [
+        "sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "stripe key",
+      "in": "the key is sk_live_000000000000000FAKE and it must not be shown",
+      "mustNotContain": [
+        "sk_live_000000000000000FAKE"
+      ],
+      "mustContain": [
+        "the key is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "slack token",
+      "in": "the token is xoxb-0000000000000000FAKE and it must not be shown",
+      "mustNotContain": [
+        "xoxb-0000000000000000FAKE"
+      ],
+      "mustContain": [
+        "the token is",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "connection string",
+      "in": "the url is postgres://dbuser:hunter2fake@db.internal:5432/app and it must not be shown",
+      "mustNotContain": [
+        "hunter2fake"
+      ],
+      "mustContain": [
+        "postgres://dbuser:",
+        "@db.internal:5432/app",
+        "and it must not be shown"
+      ]
+    },
+    {
+      "name": "split key block",
+      "in": "the deploy key:\n\n```text\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtESTKEYONLYFAKEFIXTURE\n\nMIIEowIBAAKCAQEAtESTKEYONLYFAKEFIXTURE2\n-----END RSA PRIVATE KEY-----\n```\n",
+      "mustNotContain": [
+        "PRIVATE KEY",
+        "MIIEow"
+      ],
+      "mustContain": [
+        "the deploy key:"
+      ]
+    },
+    {
+      "name": "unterminated key block",
+      "in": "the vault key:\n\n```text\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtESTKEYONLYFAKEFIXTURE\n```\n\nthe notes after the block stay\n",
+      "mustNotContain": [
+        "PRIVATE KEY",
+        "MIIEow"
+      ],
+      "mustContain": [
+        "the vault key:",
+        "the notes after the block stay"
+      ]
+    },
+    {
+      "name": "env block in a fence",
+      "in": "the environment:\n\n```env\nDATABASE_PASSWORD=\"correct horse battery staple\"\nSTRIPE_SECRET=sk_live_000000000000000FAKE\nSESSION_TOKEN=hunter2xyz\n```\n",
+      "mustNotContain": [
+        "hunter2xyz",
+        "sk_live_000000000000000FAKE",
+        "correct horse battery staple"
+      ],
+      "mustContain": [
+        "DATABASE_PASSWORD=",
+        "STRIPE_SECRET=",
+        "SESSION_TOKEN="
+      ]
+    },
+    {
+      "name": "over-redaction: use 4 spaces for indentation",
+      "in": "use 4 spaces for indentation",
+      "mustNotContain": [],
+      "mustContain": [
+        "use 4 spaces for indentation"
+      ]
+    },
+    {
+      "name": "over-redaction: the build takes 12 minutes",
+      "in": "the build takes 12 minutes",
+      "mustNotContain": [],
+      "mustContain": [
+        "the build takes 12 minutes"
+      ]
+    },
+    {
+      "name": "over-redaction: 5551234567",
+      "in": "5551234567",
+      "mustNotContain": [],
+      "mustContain": [
+        "5551234567"
+      ]
+    },
+    {
+      "name": "over-redaction: the port is 4321 and the timeout is 30 seconds",
+      "in": "the port is 4321 and the timeout is 30 seconds",
+      "mustNotContain": [],
+      "mustContain": [
+        "the port is 4321 and the timeout is 30 seconds"
+      ]
+    },
+    {
+      "name": "over-redaction: the release is 1.24.0 and the build number is 1234",
+      "in": "the release is 1.24.0 and the build number is 1234",
+      "mustNotContain": [],
+      "mustContain": [
+        "the release is 1.24.0 and the build number is 1234"
+      ]
+    }
+  ]
+}

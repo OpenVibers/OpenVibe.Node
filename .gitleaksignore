@@ -10,3 +10,15 @@ internal/memory/testdata/roo/project/.roo/rules/general.md:stripe-access-token:4
 internal/memory/testdata/copilot/project/.github/copilot-instructions.md:jwt:5
 internal/memory/testdata/windsurf/home/.codeium/windsurf/memories/preferences.md:private-key:7
 internal/memory/testdata/claude-code/home/.claude/rules/sandbox.md:private-key:6
+# The shared redaction corpus (Memory M2a) holds fake secrets on purpose: each case proves the Go scrubber removes a
+# shape. The values are obviously fake and exist only to be redacted; the same file is OpenVibe.SDK's test corpus.
+internal/memory/testdata/redact-corpus.json:stripe-access-token:440
+internal/memory/testdata/redact-corpus.json:stripe-access-token:442
+internal/memory/testdata/redact-corpus.json:stripe-access-token:497
+internal/memory/testdata/redact-corpus.json:stripe-access-token:500
+internal/memory/testdata/redact-corpus.json:jwt:407
+internal/memory/testdata/redact-corpus.json:jwt:409
+internal/memory/testdata/redact-corpus.json:private-key:6
+internal/memory/testdata/redact-corpus.json:private-key:30
+internal/memory/testdata/redact-corpus.json:private-key:42
+internal/memory/testdata/redact-corpus.json:private-key:474
