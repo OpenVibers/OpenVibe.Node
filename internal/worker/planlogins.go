@@ -6,16 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
-
-// ioCopy copies src into dst.
-func ioCopy(dst io.Writer, src io.Reader) (int64, error) { return io.Copy(dst, src) }
-
-// openAt opens a file relative to a directory, without following a symlink out of it.
-func openAt(dirfd uintptr, name string) (int, error) {
-	return syscall.Openat(int(dirfd), name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-}
 
 // The plan logins: the owner's own coding-CLI sign-in files, copied read-only into a job's private home.
 //
@@ -93,7 +84,7 @@ func copyFile(dst string, src *os.File) error {
 	if err != nil {
 		return err
 	}
-	if _, err := ioCopy(out, src); err != nil {
+	if _, err := io.Copy(out, src); err != nil {
 		out.Close()
 		return err
 	}
@@ -101,48 +92,4 @@ func copyFile(dst string, src *os.File) error {
 		return err
 	}
 	return os.Chmod(dst, 0o400)
-}
-
-// copyPlanLogins copies the staged plan logins from the job's root into its working directory (its home), read-only.
-//
-// The names are paths under the home: they may hold a directory (~/.claude/.credentials.json), so they are not the flat
-// names the job's inputs use. A name that would leave the home is refused.
-func copyPlanLogins(from *os.File, work string, names []string) error {
-	for _, name := range names {
-		clean := filepath.Clean(name)
-		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("plan login name %q", name)
-		}
-		fd, err := openAt(from.Fd(), clean)
-		if err != nil {
-			return fmt.Errorf("%s: %w", clean, err)
-		}
-		src := os.NewFile(uintptr(fd), clean)
-		err = func() error {
-			defer src.Close()
-			if st, err := src.Stat(); err != nil || !st.Mode().IsRegular() {
-				return fmt.Errorf("%s is not a plain file (%v)", clean, err)
-			}
-			dst := filepath.Join(work, clean)
-			if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-				return err
-			}
-			out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o400)
-			if err != nil {
-				return err
-			}
-			if _, err := ioCopy(out, src); err != nil {
-				out.Close()
-				return err
-			}
-			if err := out.Close(); err != nil {
-				return err
-			}
-			return os.Chmod(dst, 0o400)
-		}()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
