@@ -61,7 +61,7 @@ type Result struct {
 // It never writes a file, never opens a network connection and never follows
 // a symlink out of the home directory or the project directories it was given.
 func Scan(opts Options) Result {
-	res := Result{Home: opts.Home}
+	res := Result{Home: opts.Home, Adapters: []AdapterReport{}, Items: []Item{}}
 	projects := make([]string, 0, len(opts.Projects))
 	for _, p := range opts.Projects {
 		abs, err := filepath.Abs(p)
@@ -82,7 +82,7 @@ func Scan(opts Options) Result {
 		if len(want) > 0 && !want[ad.ID] {
 			continue
 		}
-		report := AdapterReport{ID: ad.ID, Name: ad.Name, Docs: ad.Docs}
+		report := AdapterReport{ID: ad.ID, Name: ad.Name, Docs: ad.Docs, Files: []FileReport{}}
 		for _, loc := range ad.Locations(opts.Home, projects) {
 			paths := resolveLocation(loc, opts.Home, projects)
 			if len(paths) == 0 && strings.ContainsAny(loc, "*?[") {
