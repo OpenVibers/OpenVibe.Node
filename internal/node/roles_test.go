@@ -1,3 +1,5 @@
+//go:build !windows
+
 package node
 
 import (
@@ -29,7 +31,7 @@ func TestRolesAtCheckIn(t *testing.T) {
 	bot := fakebot.New()
 	t.Cleanup(bot.Close)
 	bot.Config = protocol.Config{HeartbeatMS: 100,
-		Limits:         protocol.Limits{MaxSpeed: f64(0.5), MaxTurn: f64(0.4), MaxCommandMS: 1000},
+		Limits:          protocol.Limits{MaxSpeed: f64(0.5), MaxTurn: f64(0.4), MaxCommandMS: 1000},
 		AllowedCommands: append([]string(nil), protocol.Kinds...),
 		Roles:           []string{"codes.worker", "desks.host", "nope.nope"}}
 	bot.AddCode("TEST2345")

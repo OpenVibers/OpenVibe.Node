@@ -98,13 +98,13 @@ type Node struct {
 	voiceAskedBy map[string]string
 	// roles are what the machine does for the network, as the owner set them on the hub (plan L34): the ids of the
 	// catalogue (codes.worker, desks.host, ai.host, bot.robot). They arrive in the config frame at check-in.
-	roles []string
-	telemMS      int
-	jpeg         *video.JPEGSource
-	jpegFrom     string
-	videoSrc     string
-	lastTelem    time.Time
-	started      time.Time
+	roles     []string
+	telemMS   int
+	jpeg      *video.JPEGSource
+	jpegFrom  string
+	videoSrc  string
+	lastTelem time.Time
+	started   time.Time
 
 	// configured is set by the first config on a connection; until then only halt runs, so a latch the owner set
 	// while the link was down is applied before any motion.
