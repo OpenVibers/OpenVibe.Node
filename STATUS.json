@@ -19,6 +19,7 @@
     "the computer plugin for OpenVibe.Actor: terminal, files, screen, input and its own browser, at the level the owner sets on the machine (observe, ask, trusted, full); approvals in the tray (Linux, Windows), a notification or openvibe-node approve",
     "the live screen: the machine's screen on openvibe.bot for its owner only, up to 30 minutes",
     "the job worker (--worker): sandboxed function, code and linux jobs, and the OpenVibe.Codes job runner",
+    "the machine's roles from the network's hub (codes.worker, desks.host, ai.host, bot.robot): read at check-in, kept, and applied to what the machine was installed for; the local configuration always wins",
     "one-command install on a Raspberry Pi or other Linux robot (I2C, SPI, camera tools, kit detection)",
     "system service on systemd, launchd and Windows (or a Windows sign-in start)",
     "ESP32 library (OpenVibeNode): pairing, control link, drive and actuator commands, telemetry, heartbeat, deadman and e-stop"

@@ -71,6 +71,12 @@ this computer's models" on openvibe.bot/machines ([docs/ai.md](docs/ai.md)). The
 job worker runs each job as an unprivileged user in a sandbox, and the OpenVibe.Codes job runner lets you start a coding
 task on openvibe.codes/run from any browser and have this machine do it ([docs/worker.md](docs/worker.md)).
 
+**What the machine does for the network:** the owner sets the machine's roles on openvibe.network/machines
+(`codes.worker`, `desks.host`, `ai.host`, `bot.robot`). The Node reads them at its check-in, keeps them, and applies
+the ones this machine was installed for: the job worker starts if the local configuration has it, and the machine says
+plainly which role it could not honour. The local configuration always wins: a role never installs anything and never
+turns on a feature you turned off here.
+
 Docs: [protocol](docs/protocol.md) (the wire format with OpenVibe.Bot), [plugins](docs/plugins.md) (the driver
 protocol, the bundled drivers, and where Actor's computer-control plugin attaches), [install](docs/install.md),
 [memory](docs/memory.md) (what the coding tools on a machine remember, how the Node reads it and how it is uploaded to
