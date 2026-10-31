@@ -323,6 +323,11 @@ type Config struct {
 	// CallWord only while it is true.
 	Voice    bool   `json:"voice,omitempty"`
 	CallWord string `json:"call_word,omitempty"`
+	// Roles are what the machine does for the network, as the owner set them on the hub (plan L34; the catalogue is
+	// Contracts 0.257.0's network.machine-roles@1): codes.worker, desks.host, ai.host, bot.robot. The Node reads them
+	// at its check-in and applies the ones this machine has; a role it does not know, or a feature it was not
+	// installed for, is left alone. The local configuration always wins (ADR-045).
+	Roles []string `json:"roles,omitempty"`
 }
 
 // VoiceAsk is the owner's question after the machine's call word (device → server).

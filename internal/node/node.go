@@ -96,12 +96,15 @@ type Node struct {
 	voiceOn      bool
 	callWord     string
 	voiceAskedBy map[string]string
-	telemMS      int
-	jpeg         *video.JPEGSource
-	jpegFrom     string
-	videoSrc     string
-	lastTelem    time.Time
-	started      time.Time
+	// roles are what the machine does for the network, as the owner set them on the hub (plan L34): the ids of the
+	// catalogue (codes.worker, desks.host, ai.host, bot.robot). They arrive in the config frame at check-in.
+	roles     []string
+	telemMS   int
+	jpeg      *video.JPEGSource
+	jpegFrom  string
+	videoSrc  string
+	lastTelem time.Time
+	started   time.Time
 
 	// configured is set by the first config on a connection; until then only halt runs, so a latch the owner set
 	// while the link was down is applied before any motion.
@@ -230,20 +233,9 @@ func New(opt Options) (*Node, error) {
 		}
 	}
 	if opt.Config.Worker.Enabled {
-		wcfg := opt.Config.Worker
-		// No job may see the Node's config, credential, state or control socket (they all lie in these).
-		wcfg.NodeDirs = []string{opt.Paths.ConfigDir, opt.Paths.StateDir}
-		w := worker.New(wcfg, n.sendJobFrame, opt.Log)
-		if err := w.Probe(); err != nil {
-			opt.Log.Error("worker off: jobs cannot run isolated here, every job is refused", "err", err)
-		} else {
-			n.worker = w
-			w.SetStopped(stopFault(n.latch.State()))
-			n.jobs.admit = w.Admit
-			// Advertise a class only when an entry implements it, and only here, after the sandbox probe passed.
-			n.jobs.classes = w.Classes()
-			opt.Log.Info("worker on", "functions", len(opt.Config.Worker.Functions))
-		}
+		// The worker starts when the local configuration has it; the hub's role codes.worker asks for it again at
+		// check-in (startWorker), which never turns on what the local configuration turned off.
+		n.startWorker("the local configuration")
 	}
 	n.latch.OnChange(n.onLatch)
 	return n, nil
@@ -422,8 +414,112 @@ func (n *Node) applyConfig(c protocol.Config) {
 		"allowed", c.AllowedCommands, "estop_latched", c.EstopLatched)
 	n.mu.Lock()
 	n.voiceOn, n.callWord = c.Voice, c.CallWord
+	n.roles = append([]string(nil), c.Roles...)
 	n.mu.Unlock()
 	n.tellVoice(nil)
+	n.applyRoles(c.Roles)
+}
+
+// The machine roles of the network's hub (plan L34; Contracts 0.257.0 network.machine-roles@1): what the machine does
+// for the network, as the owner set them. The catalogue is the products' own (each declares the roles it installs).
+const (
+	RoleCodesWorker = "codes.worker" // the Codes job runner: this machine runs its owner's coding jobs
+	RoleDesksHost   = "desks.host"   // the desk sandbox: this machine hosts desks for agents
+	RoleAIHost      = "ai.host"      // the local model server, as OpenVibe Node's ai plugin
+	RoleBotRobot    = "bot.robot"    // the robot drivers the profile asks for
+)
+
+// applyRoles turns on the features the roles name that this machine has.
+//
+// The local configuration always wins (ADR-045): a role never installs anything, never starts a plugin the machine
+// was not installed for, and never turns on a feature the owner turned off here. What it does is start what the
+// machine was installed for and has not started yet (the job worker), and say plainly which role it could not
+// honour, so the owner sees it on the machine as well as on the hub.
+func (n *Node) applyRoles(roles []string) {
+	if len(roles) == 0 {
+		return
+	}
+	for _, role := range roles {
+		switch role {
+		case RoleCodesWorker:
+			if n.startWorker("the role codes.worker") {
+				n.log.Info("role applied: the job worker runs", "role", role)
+			}
+		case RoleDesksHost:
+			if n.hasDeskHost() {
+				n.log.Info("role applied: this machine hosts desks", "role", role)
+			} else {
+				n.log.Info("role not applied: this machine has no desk host installed", "role", role)
+			}
+		case RoleAIHost:
+			if n.hasAIHost() {
+				n.log.Info("role applied: this machine serves its own models", "role", role)
+			} else {
+				n.log.Info("role not applied: this machine has no model server installed", "role", role)
+			}
+		case RoleBotRobot:
+			// The robot drivers are the machine's own job: the profile asked for them at install time.
+			n.log.Info("role applied: this machine drives its robot", "role", role)
+		default:
+			n.log.Info("role not known here: ignored", "role", role)
+		}
+	}
+}
+
+// startWorker starts the job worker when the local configuration has it and it is not running yet. It is the work the
+// boot does; the role codes.worker asks for it again at check-in, so a machine whose worker was configured but not
+// running starts it. → whether it is running afterwards.
+func (n *Node) startWorker(why string) bool {
+	n.mu.Lock()
+	running := n.worker != nil
+	n.mu.Unlock()
+	if running {
+		return true
+	}
+	if !n.opt.Config.Worker.Enabled {
+		n.log.Info("worker off: the local configuration has it off, and the local configuration wins", "why", why)
+		return false
+	}
+	wcfg := n.opt.Config.Worker
+	// No job may see the Node's config, credential, state or control socket (they all lie in these).
+	wcfg.NodeDirs = []string{n.opt.Paths.ConfigDir, n.opt.Paths.StateDir}
+	w := worker.New(wcfg, n.sendJobFrame, n.log)
+	if err := w.Probe(); err != nil {
+		n.log.Error("worker off: jobs cannot run isolated here, every job is refused", "err", err)
+		return false
+	}
+	n.mu.Lock()
+	n.worker = w
+	n.mu.Unlock()
+	w.SetStopped(stopFault(n.latch.State()))
+	n.jobs.admit = w.Admit
+	// Advertise a class only when an entry implements it, and only here, after the sandbox probe passed.
+	n.jobs.classes = w.Classes()
+	n.log.Info("worker on", "functions", len(wcfg.Functions), "why", why)
+	return true
+}
+
+// hasDeskHost says whether this machine was installed as a desk host: the computer plugin with a desk of its own.
+func (n *Node) hasDeskHost() bool {
+	for _, p := range n.opt.Config.Plugins {
+		if p.Name != "computer" && p.Name != "computer.py" {
+			continue
+		}
+		if d, ok := p.Config["desk"].(map[string]any); ok && len(d) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAIHost says whether this machine was installed with the ai plugin (the local model server).
+func (n *Node) hasAIHost() bool {
+	for _, p := range n.opt.Config.Plugins {
+		if p.Name == "ai" || p.Name == "ai.py" {
+			return true
+		}
+	}
+	return false
 }
 
 // tellVoice gives the voice plugins (or just p) the owner's voice setting: they listen for the call word only while on.
@@ -1105,6 +1201,9 @@ type Status struct {
 	Telemetry protocol.Telemetry `json:"telemetry"`
 	// Jobs are the worker's jobs not ended yet; empty when the worker is off.
 	Jobs []worker.JobInfo `json:"jobs"`
+	// Roles are what the machine does for the network, as the owner set them on the hub (plan L34): the ids of the
+	// catalogue. Empty when the owner set none.
+	Roles []string `json:"roles,omitempty"`
 }
 
 type LinkStatus struct {
@@ -1142,6 +1241,7 @@ func (n *Node) Status() Status {
 	s.Limits = n.limits
 	s.Video.Source = n.videoSrc
 	s.Telemetry = mergeTelemetry(n.telemetry, nil)
+	s.Roles = append([]string(nil), n.roles...)
 	n.mu.Unlock()
 	if n.link != nil {
 		st := n.link.Stats()

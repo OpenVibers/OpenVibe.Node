@@ -156,7 +156,7 @@ server's own counter, never the heartbeat's.
 | type            | fields                                                                                           |
 |-----------------|--------------------------------------------------------------------------------------------------|
 | `hello`         | `session_id`, `device_id`, `robot_ids` [], `server_time` (RFC 3339) — on every authenticated connection |
-| `config`        | `heartbeat_ms`, `limits` {`max_speed` 0..1, `max_turn` 0..1, `max_command_ms`, `heartbeat_ms`}, `allowed_commands` [kinds], `estop_latched` — right after `hello` |
+| `config`        | `heartbeat_ms`, `limits` {`max_speed` 0..1, `max_turn` 0..1, `max_command_ms`, `heartbeat_ms`}, `allowed_commands` [kinds], `estop_latched`, `roles` [ids] — right after `hello` |
 | `command`       | `id` (server-minted: the idempotency and ack key), `ref` (the operator's own id, logs only), `kind`, `value`, `deadline_ms` (absolute, motion kinds only), `operator` {`subject`, `role`}, `robot_id`; Node only: `target` (plugin name) |
 | `estop`         | `latched` (true: the e-stop latched; false: the owner cleared it), `by`, `at`                    |
 | `heartbeat_ack` | `echo` (the heartbeat's `t`, or null), `t` (the same send time when the server has it), `server_time` (RFC 3339); the Node measures RTT from the echoed send time |
@@ -166,13 +166,17 @@ server's own counter, never the heartbeat's.
 latches the Node on reconnect, and a clear made while offline releases it. Until a connection's `config` has been
 applied the Node runs nothing but `halt` (`nack not_ready`), so that latch is in force before any motion.
 `config.allowed_commands` absent allows every kind; present (Bot always sends it, `halt` included) it is the list.
+`config.roles` are the machine's roles for the network, as its owner set them on the hub (`codes.worker`,
+`desks.host`, `ai.host`, `bot.robot`): what the machine does for the network. The Node keeps them and applies the ones
+this machine was installed for; the local configuration always wins (a role never installs anything and never turns on
+a feature the owner turned off here), and a role the Node does not know is ignored.
 `estop` `latched:false` is the owner's clear: it clears the remote latch only, never the local kill switch.
 
 ### Device → server
 
 | type          | fields                                                                                              |
 |---------------|-----------------------------------------------------------------------------------------------------|
-| `status`      | `firmware` (`openvibe-node-<version>`), `capabilities` {per plugin}, `faults` [{`code`, `driver`, `message`}], `estop_latched`; Node extras: `agent_version`, `device_kind`, `os`, `arch`, `drivers` [{`name`, `driver`, `version`, `state`, `capabilities`}], `local_stop`, `video` |
+| `status`      | `firmware` (`openvibe-node-<version>`), `capabilities` {per plugin}, `faults` [{`code`, `driver`, `message`}], `estop_latched`; Node extras: `agent_version`, `device_kind`, `os`, `arch`, `drivers` [{`name`, `driver`, `version`, `state`, `capabilities`}], `local_stop`, `video`, `roles` [ids] (the roles the machine applies) |
 | `telemetry`   | `battery` (0..1), `voltage` (V), `rssi`, `sensors` {…}; Node extra: `events` [{`name`, `driver`, `ts`, `fields`}] |
 | `ack`         | `id`; Node extra: `latency_ms` (receipt → plugin ack); `data` on a computer command (its answer, ≤ 512 KB) |
 | `nack`        | `id`, `fault_code`; Node extra: `message`                                                           |
